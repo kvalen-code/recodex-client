@@ -38,6 +38,8 @@
     #recodex-panel button.rcx-act.sec{background:#2c313a;color:#e6e9ef}
     #recodex-panel .rcx-muted{color:#7c8598;font-size:12px}
     #recodex-panel .rcx-err{color:#ff6b5e}
+    #recodex-panel .rcx-toggle{display:flex;justify-content:space-between;align-items:center;padding:5px 0}
+    #recodex-panel .rcx-toggle input{width:34px;height:18px;cursor:pointer}
   `;
   document.documentElement.appendChild(style);
 
@@ -48,7 +50,10 @@
   fab.title = "ReCodex";
   const panel = document.createElement("div");
   panel.id = "recodex-panel";
-  panel.innerHTML = `<h3>🟢 ReCodex</h3><div id="recodex-body"><div class="rcx-muted">加载中…</div></div>`;
+  panel.innerHTML = `<h3>🟢 ReCodex</h3><div id="recodex-body"><div class="rcx-muted">加载中…</div></div>`
+    + `<div style="margin-top:14px;border-top:1px solid #23272f;padding-top:10px">`
+    + `<div class="rcx-k" style="margin-bottom:4px">增强功能</div>`
+    + `<div id="recodex-enh"><div class="rcx-muted">加载中…</div></div></div>`;
   document.documentElement.appendChild(fab);
   document.documentElement.appendChild(panel);
 
@@ -125,8 +130,42 @@
     setTimeout(tick, 5000);
   }
 
+  // ── 增强开关(Codex++ 增强,经 /settings 桥,与 recodex 登录无关)──
+  const ENH = [
+    ["codex_app_session_delete", "会话删除"],
+    ["codex_app_markdown_export", "Markdown 导出"],
+    ["codex_app_conversation_view", "会话项目移动"],
+    ["codex_app_thread_id_badge", "会话 ID 标识"],
+    ["codex_app_paste_fix", "粘贴修复"],
+    ["codex_app_fast_startup", "Fast 按钮"],
+    ["codex_app_model_whitelist_unlock", "模型白名单解锁"],
+    ["codex_app_plugin_marketplace_unlock", "插件市场解锁"],
+    ["codex_app_pet_real_mouse_look", "桌宠跟随真实鼠标"],
+    ["codex_app_stepwise_enabled", "Stepwise"],
+    ["codex_app_dream_skin_enabled", "皮肤"],
+  ];
+  async function renderEnhancements() {
+    const c = panel.querySelector("#recodex-enh");
+    if (!c) return;
+    const s = await bridge("/settings/get", {});
+    const settings = s && typeof s === "object" && !s.error ? s : {};
+    c.innerHTML = ENH.map(
+      ([k, label]) =>
+        `<label class="rcx-toggle"><span>${esc(label)}</span>` +
+        `<input type="checkbox" data-k="${esc(k)}" ${settings[k] ? "checked" : ""}></label>`
+    ).join("");
+    c.querySelectorAll("input[data-k]").forEach((inp) => {
+      inp.onchange = () => {
+        bridge("/settings/set", { [inp.dataset.k]: inp.checked });
+      };
+    });
+  }
+
   fab.onclick = () => {
     const open = panel.classList.toggle("open");
-    if (open) render();
+    if (open) {
+      render();
+      renderEnhancements();
+    }
   };
 })();
