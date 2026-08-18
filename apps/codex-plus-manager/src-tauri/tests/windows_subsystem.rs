@@ -118,7 +118,7 @@ fn windows_binaries_request_administrator_privileges() {
 
     assert!(manager_build.contains("windows-app-manifest.xml"));
     assert!(launcher_build.contains("windows-app-manifest.xml"));
-    assert!(windows_manifest.contains("requireAdministrator"));
+    assert!(windows_manifest.contains("asInvoker")); // recodex-overlay:least-privilege-test
     assert!(windows_manifest.contains("Microsoft.Windows.Common-Controls"));
     assert!(windows_installer.contains("RequestExecutionLevel admin"));
 }

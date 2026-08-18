@@ -1,0 +1,19 @@
+[package]
+name = "recodex-integration"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "The single ReCodex adapter board for the Codex++ desktop upstream"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+# native-certs: trust the OS certificate store (like curl and the Go CLI) instead
+# of only ureq's bundled webpki-roots, so TLS to the API works behind corporate /
+# regional root CAs and TLS-inspecting proxies where webpki-roots alone fails.
+ureq = { version = "2.12", default-features = true, features = ["json", "native-certs"] }
+getrandom = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Credentials"] }

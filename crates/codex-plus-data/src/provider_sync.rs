@@ -1931,7 +1931,7 @@ fn replace_session_text_if_unchanged(
     next_text: &str,
 ) -> std::io::Result<bool> {
     let mut file = open_session_file_for_update(path)?;
-    file.try_lock()?;
+    fs2::FileExt::try_lock_exclusive(&file)?; // recodex-overlay:lock-compat
     let mut current_text = String::new();
     file.read_to_string(&mut current_text)?;
     if current_text != expected_text {

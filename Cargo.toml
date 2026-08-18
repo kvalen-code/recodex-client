@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/codex-plus-core",
+  "crates/recodex-integration", # recodex-overlay:workspace-member
   "crates/codex-plus-data",
   "apps/codex-plus-launcher",
   "apps/codex-plus-manager/src-tauri",

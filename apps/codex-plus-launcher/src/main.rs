@@ -12,12 +12,24 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+// recodex-overlay: ReCodex 桥 launcher 侧薄接线;逻辑在 recodex-integration crate 的 desktop 模块。
+struct LauncherRecodexBridge {
+    state: recodex_integration::desktop::ReCodexState,
+}
+
+impl codex_plus_core::routes::RecodexBridge for LauncherRecodexBridge {
+    fn handle(&self, path: &str, payload: &Value) -> Value {
+        recodex_integration::desktop::handle_bridge(&self.state, path, payload)
+    }
+}
+
 #[derive(Clone)]
 struct LauncherHooks {
     core: Arc<DefaultLaunchHooks>,
     data: Arc<LauncherDataService>,
     runtime: Arc<LauncherRuntimeService>,
     bridge_context: Arc<Mutex<Option<BridgeContext>>>,
+    recodex: Arc<LauncherRecodexBridge>, // recodex-overlay:field
 }
 
 impl Default for LauncherHooks {
@@ -30,6 +42,10 @@ impl Default for LauncherHooks {
                 default_user_script_manager(),
             )),
             bridge_context: Arc::new(Mutex::new(None)),
+            // recodex-overlay: ReCodexState 只建一次(load 保存的凭据),跨重注入共享,不丢登录态。
+            recodex: Arc::new(LauncherRecodexBridge {
+                state: recodex_integration::desktop::ReCodexState::from_env(),
+            }),
         }
     }
 }
@@ -501,7 +517,8 @@ impl LaunchHooks for LauncherHooks {
             self.runtime.clone(),
             self.data.clone(),
             app_dir.to_path_buf(),
-        );
+        )
+        .with_recodex(self.recodex.clone()); // recodex-overlay:wire
         *self
             .bridge_context
             .lock()

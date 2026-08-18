@@ -15,11 +15,18 @@ use crate::user_scripts::UserScriptManager;
 pub type UserScriptEvaluator = Arc<dyn Fn(&str, &str) -> anyhow::Result<Value> + Send + Sync>;
 pub type DevtoolsOpener = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
 
+// recodex-overlay: ReCodex 命令桥(账号/额度/网关/登录/登出)。同步实现(阻塞网络 I/O),
+// async handler 用 spawn_blocking 调用。impl 由 launcher 注入,逻辑在 recodex-integration crate。
+pub trait RecodexBridge: Send + Sync {
+    fn handle(&self, path: &str, payload: &Value) -> Value;
+}
+
 #[derive(Clone)]
 pub struct BridgeContext {
     settings: Arc<dyn BridgeSettingsService>,
     runtime: Arc<dyn BridgeRuntimeService>,
     data: Arc<dyn BridgeDataService>,
+    recodex: Option<Arc<dyn RecodexBridge>>, // recodex-overlay:field
 }
 
 impl BridgeContext {
@@ -32,7 +39,14 @@ impl BridgeContext {
             settings,
             runtime,
             data,
+            recodex: None, // recodex-overlay:field-init
         }
+    }
+
+    // recodex-overlay: launcher 注入 ReCodex 桥;其余构造保持 None。
+    pub fn with_recodex(mut self, recodex: Arc<dyn RecodexBridge>) -> Self {
+        self.recodex = Some(recodex);
+        self
     }
 
     pub fn core(runtime: Arc<dyn BridgeRuntimeService>) -> Self {
@@ -134,6 +148,14 @@ pub async fn handle_bridge_request(
                 .unwrap_or_default()
         }),
     );
+    // recodex-overlay:hook — /recodex/* 委托给 launcher 注入的 ReCodex 桥。
+    // TODO(perf): 命令是阻塞网络 I/O,后续包一层 spawn_blocking 避免占用 async 执行线程。
+    if path.starts_with("/recodex/") {
+        return match ctx.recodex.as_ref() {
+            Some(recodex) => recodex.handle(path, &payload),
+            None => json!({"status":"error","error":{"code":"unavailable","message":"recodex bridge not configured"}}),
+        };
+    }
     let result = match path {
         "/settings/get" => settings_value(&ctx, ctx.settings.get_settings().await).await,
         "/settings/set" => {
