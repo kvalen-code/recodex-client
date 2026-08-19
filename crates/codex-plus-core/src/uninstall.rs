@@ -25,6 +25,33 @@ fn remove_codex_owned_dir() -> std::io::Result<()> {
     Ok(())
 }
 
+/// 删除我们在 `%LOCALAPPDATA%` / `%APPDATA%` 下建的 `ReCodex` 目录。
+///
+/// `remove_owned_data()` 只清 `~/.recodex`,这两个目录一直漏在外面:
+///   - `%LOCALAPPDATA%\ReCodex\device-id` —— **这个留着最要命**:
+///     卸载时服务端已经把该设备吊销了,重装后却还拿同一个 ID 去登录;
+///   - `%LOCALAPPDATA%\ReCodex\official-mode.json` —— 官方模式快照;
+///   - `%APPDATA%\ReCodex\user_scripts` —— 用户脚本。
+///
+/// 返回被删掉的目录数,供卸载结果里给用户一句交代。
+fn remove_appdata_dirs(warnings: &mut Vec<String>) -> usize {
+    let mut removed = 0;
+    for key in ["LOCALAPPDATA", "APPDATA"] {
+        let Some(base) = std::env::var_os(key) else {
+            continue;
+        };
+        let dir = PathBuf::from(base).join("ReCodex");
+        if !dir.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => removed += 1,
+            Err(error) => warnings.push(format!("删除 {} 失败:{error}", dir.display())),
+        }
+    }
+    removed
+}
+
 /// 安排一个分离的清理进程:等本进程退出后删掉 exe 及其所在目录里的残留。
 ///
 /// 运行中的 exe 无法删除自身,所以只能交给外部进程。用 `cmd /c` 起一个隐藏窗口,
@@ -103,6 +130,10 @@ where
     if result.status != "ok" {
         warnings.push(format!("卸载快捷方式:{}", result.message));
     }
+    // 设备 ID 必须删掉:服务端刚把这台设备吊销了,留着它重装后会拿一个已吊销的身份去登录
+    if remove_appdata_dirs(&mut warnings) > 0 {
+        warnings.push("已删除设备标识与用户脚本目录".to_string());
+    }
 
     // 3) 清理指向本 exe 的开机自启项,再安排 exe 自删
     let exe: Option<PathBuf> = std::env::current_exe().ok();
@@ -174,6 +205,49 @@ mod tests {
     ///
     /// 用户可能还单独装着 Codex++,那是别人的自启项 —— 卸我们的东西不该顺手删它。
     /// 这里用一个绝不可能出现在真实 Run 值里的路径,断言我们不会误伤。
+    /// 设备 ID 留在磁盘上,重装后会拿一个**已被服务端吊销**的身份去登录。
+    /// 这条断言把两个一直漏掉的目录钉住。
+    #[test]
+    fn appdata_dirs_including_device_id_are_removed() {
+        let sandbox = std::env::temp_dir().join(format!("recodex-appdata-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let local = sandbox.join("local");
+        let roaming = sandbox.join("roaming");
+        std::fs::create_dir_all(local.join("ReCodex")).unwrap();
+        std::fs::create_dir_all(roaming.join("ReCodex").join("user_scripts")).unwrap();
+        std::fs::write(local.join("ReCodex").join("device-id"), b"rcd_test").unwrap();
+        std::fs::write(local.join("ReCodex").join("official-mode.json"), b"{}").unwrap();
+
+        // SAFETY:改的是进程环境,本测试用完立刻恢复。
+        let saved_local = std::env::var_os("LOCALAPPDATA");
+        let saved_roaming = std::env::var_os("APPDATA");
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &local);
+            std::env::set_var("APPDATA", &roaming);
+        }
+
+        let mut warnings = Vec::new();
+        let removed = remove_appdata_dirs(&mut warnings);
+
+        unsafe {
+            match saved_local {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+            match saved_roaming {
+                Some(value) => std::env::set_var("APPDATA", value),
+                None => std::env::remove_var("APPDATA"),
+            }
+        }
+
+        assert_eq!(removed, 2, "两个目录都应被删除:{warnings:?}");
+        assert!(!local.join("ReCodex").exists(), "设备 ID 目录应已删除");
+        assert!(!roaming.join("ReCodex").exists(), "用户脚本目录应已删除");
+        assert!(warnings.is_empty(), "不该有失败:{warnings:?}");
+
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
     #[cfg(windows)]
     #[test]
     fn autostart_cleanup_only_touches_entries_pointing_at_us() {
