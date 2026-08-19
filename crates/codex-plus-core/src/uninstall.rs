@@ -29,21 +29,42 @@ fn remove_codex_owned_dir() -> std::io::Result<()> {
 ///
 /// 运行中的 exe 无法删除自身,所以只能交给外部进程。用 `cmd /c` 起一个隐藏窗口,
 /// 先轮询等待进程退出(而不是死等固定秒数),再删文件。
+/// 安排一个分离进程,等 exe 不再被占用后删除它。
+///
+/// 这段实现踩了四个坑,逐条记下来免得后人重蹈:
+///
+/// 1. **不能轮询 PID**。原本用 `tasklist /fi "PID eq N" | find "N"` 判断主进程是否退出,
+///    实测对活着的进程也返回「未找到」,于是文件在主进程还在跑时就被删了。
+///    改成直接删:Windows 会锁住运行中的 exe 映像,**删不掉本身就说明进程还在**。
+/// 2. **不能用 `timeout` 延时**。它依赖控制台,而清理进程是分离启动的(无控制台),
+///    会立刻报错返回,导致循环瞬间跑完。用 `ping -n 2 127.0.0.1` 代替。
+/// 3. **不能把长脚本塞进 `cmd /c "…"`**。脚本里含引号路径时,cmd 的 /c 引号剥离规则
+///    会把命令解析坏 —— 实测整个循环一次都没执行(心跳文件为空)。
+///    改成**先写 .bat 再执行**,彻底避开引号歧义。
+/// 4. **`DETACHED_PROCESS` 会让 cmd 直接退出**。只用 `CREATE_NO_WINDOW` 即可隐藏窗口,
+///    进程能正常存活到删除完成。
 #[cfg(windows)]
 fn schedule_self_delete(exe: &Path) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-    let pid = std::process::id();
     let exe_str = exe.to_string_lossy().to_string();
-    // 最多等 30 次 × 1s;进程还在就继续等,退出后再删,避免删不掉又静默失败。
+    let bat = exe.with_extension("cleanup.bat");
+    // 最多重试 60 次(约 60 秒);删成功就跳出,最后把 .bat 自己也删掉
     let script = format!(
-        "for /l %i in (1,1,30) do (tasklist /fi \"PID eq {pid}\" | find \"{pid}\" >nul || (del /f /q \"{exe_str}\" & exit)) & timeout /t 1 /nobreak >nul"
+        "@echo off\r\n\
+         for /l %%i in (1,1,60) do (\r\n\
+         \x20 del /f /q \"{exe_str}\" >nul 2>&1\r\n\
+         \x20 if not exist \"{exe_str}\" goto done\r\n\
+         \x20 ping -n 2 127.0.0.1 >nul\r\n\
+         )\r\n\
+         :done\r\n\
+         del /f /q \"%~f0\" >nul 2>&1\r\n"
     );
+    std::fs::write(&bat, script)?;
     std::process::Command::new("cmd")
-        .args(["/c", &script])
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .args(["/c", &bat.to_string_lossy()])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
 }
@@ -114,5 +135,43 @@ mod tests {
             value["message"].as_str().unwrap_or_default().contains("boom"),
             "错误原因要透传给用户,而不是吞掉"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn self_delete_retries_until_the_running_binary_exits() {
+        // 注意:Rust 的 File 句柄默认允许 delete 共享,**不能**用来模拟 exe 锁。
+        // 真实的锁来自映像加载器,所以这里必须跑一个真的 exe。
+        let dir = std::env::temp_dir().join(format!("recodex-selfdel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.exe");
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        std::fs::copy(format!(r"{system_root}\System32\cmd.exe"), &victim).unwrap();
+
+        let mut child = std::process::Command::new(&victim)
+            .args(["/c", "ping -n 5 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        schedule_self_delete(&victim).unwrap();
+
+        // 进程在跑 -> 映像被锁 -> 删不掉
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        assert!(victim.exists(), "程序还在运行时不应被删除");
+
+        child.wait().unwrap();
+        let mut gone = false;
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if !victim.exists() {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "程序退出后应被清理");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
