@@ -93,6 +93,32 @@ fn switching_to_official_and_back_keeps_the_user_logged_in() {
         "快照文件应已删除"
     );
 
+    // 6) 官方模式下换网关:只能改快照,不能碰活配置
+    officialmode::switch_to_official().unwrap();
+    let new_block = codexcfg::render_sub2api_block("https://jp.gw.example.dev/backend-api/codex");
+    assert!(
+        officialmode::stage_config_for_return(&new_block).unwrap(),
+        "官方模式下应写进快照"
+    );
+    let during_official = std::fs::read_to_string(codex_config()).unwrap_or_default();
+    assert!(
+        !during_official.contains("model_providers.recodex"),
+        "官方模式下换网关**不能**把托管块写进活配置 —— 那会让面板显示官方模式而 Codex 已走回 ReCodex:{during_official}"
+    );
+
+    officialmode::switch_to_recodex().unwrap();
+    let after_return = std::fs::read_to_string(codex_config()).unwrap();
+    assert!(
+        after_return.contains("jp.gw.example.dev"),
+        "切回来时应用的是官方模式期间选的新网关:{after_return}"
+    );
+
+    // 不在官方模式时该函数不接管,交回给调用方写活配置
+    assert!(
+        !officialmode::stage_config_for_return(&new_block).unwrap(),
+        "非官方模式下不该接管写入"
+    );
+
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 

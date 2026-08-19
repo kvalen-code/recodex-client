@@ -104,6 +104,17 @@ fn route_codex_through_gateway(endpoint: &str) -> Option<String> {
         return None;
     }
     let base = format!("{endpoint}/backend-api/codex");
+    // 官方模式下不能碰活配置 —— 否则「用最快网关」会把官方模式悄悄破坏掉:
+    // 面板还显示官方模式,Codex 下次启动却已经走回 ReCodex 网关。
+    // 记进快照,切回 ReCodex 时自动生效。
+    let block = crate::codexcfg::render_sub2api_block(&base);
+    match crate::officialmode::stage_config_for_return(&block) {
+        Ok(true) => {
+            return Some("当前是官方模式,新网关已记下,切回 ReCodex 后生效".to_string());
+        }
+        Ok(false) => {}
+        Err(io_error) => return Some(io_error.to_string()),
+    }
     crate::codexcfg::route_through_gateway(&base)
         .err()
         .map(|adapter_error| adapter_error.to_string())

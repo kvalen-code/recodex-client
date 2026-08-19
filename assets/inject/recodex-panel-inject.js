@@ -359,7 +359,20 @@
     html += `<button class="rcx-act sec" id="rcx-refresh">${t("刷新额度")}</button>`;
     html += `<button class="rcx-act sec" id="rcx-logout">${t("登出")}</button>`;
     body().innerHTML = html;
-    body().querySelector("#rcx-fastest").onclick = async () => { await bridge("/recodex/gateway/fastest", {}); render(); };
+    // 桥可能带回 warning(例如官方模式下网关只记进快照、切回后才生效)。
+    // 原先直接丢掉,用户点完只看到界面刷新一下,不知道到底生没生效。
+    body().querySelector("#rcx-fastest").onclick = async () => {
+      const r = await bridge("/recodex/gateway/fastest", {});
+      await render();
+      const note = r && r.warning && r.warning.message;
+      if (note) {
+        const line = document.createElement("div");
+        line.className = "rcx-err";
+        line.style.cssText = "font-size:12px;margin-top:6px";
+        line.textContent = note;
+        body().appendChild(line);
+      }
+    };
     body().querySelector("#rcx-refresh").onclick = async () => { await bridge("/recodex/refresh-usage", {}); render(); };
     body().querySelector("#rcx-logout").onclick = async () => { await bridge("/recodex/logout", {}); render(); };
   }

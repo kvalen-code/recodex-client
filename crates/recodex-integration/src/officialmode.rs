@@ -133,6 +133,23 @@ pub fn switch_to_official() -> io::Result<()> {
     Ok(())
 }
 
+/// 官方模式期间改了网关:把新的托管块记进**快照**,不碰 `~/.codex`。
+///
+/// 用户在官方模式下点「用最快网关」是很自然的动作(按钮就摆在账号页)。
+/// 直接写活配置会**悄悄把官方模式破坏掉** —— 面板还显示「官方模式」,
+/// Codex 下次启动却已经走回 ReCodex 网关了。
+/// 写进快照则三方一致:官方模式保持、服务端的选择被记住、切回来时自动生效。
+///
+/// 不在官方模式时返回 `Ok(false)`,由调用方照常写活配置。
+pub fn stage_config_for_return(config_body: &str) -> io::Result<bool> {
+    let Some(mut snapshot) = load_snapshot()? else {
+        return Ok(false);
+    };
+    snapshot.config_body = config_body.to_string();
+    save_snapshot(&snapshot)?;
+    Ok(true)
+}
+
 /// 丢弃快照,**不写回任何东西**。
 ///
 /// 与 `switch_to_recodex()` 的区别是决定性的:那个会把托管块和 `RECODEX_KEY`
