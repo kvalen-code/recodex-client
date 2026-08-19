@@ -1,0 +1,138 @@
+# ReCodex 客户端发布:打 tag → 云端构建 → 传 OSS → 自更新渠道就绪。
+#
+# 触发:推 client-v1.2.51 这样的 tag(或手动 workflow_dispatch 填版本号)。
+# 版本号必须与 Cargo.toml 的 workspace.package.version 一致 —— 不一致就意味着
+# 装完之后客户端仍自报旧版本,会永远提示"有更新"陷入死循环,所以这里硬校验。
+#
+# 产物两份,用途不同,不要混:
+#   codex-plus-plus.exe            自更新用。客户端下载后校验 sha256 再替换自身。
+#   ReCodex-<版本>-windows-x64-setup.exe   首次安装用。放到官网下载页。
+#
+# 只有 Windows。这个客户端靠注入官方 ChatGPT 桌面版工作:
+#   - Linux 没有官方 ChatGPT 桌面版,注入对象不存在;
+#   - macOS 上游支持,但 ReCodex 自己的凭据存储在非 Windows 是永远返回
+#     StoreUnavailable 的桩(crates/recodex-integration/src/credential.rs),
+#     登录状态存不下来。要加 macOS,先把 Keychain 那层真正实现,再往矩阵里加。
+
+name: ReCodex release
+
+on:
+  push:
+    tags: ["client-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号,例如 1.2.51(须与 Cargo.toml 一致)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析并校验版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $input = "${{ github.event.inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($input)) {
+            $input = "${{ github.ref_name }}" -replace '^client-v', ''
+          }
+          # 客户端的规则比 semver 严:正好三段纯数字、无前导零
+          if ($input -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "版本号不合法:「$input」"
+          }
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($cargo -ne $input) {
+            throw "tag 版本「$input」与 Cargo.toml 的「$cargo」不一致 —— 装完客户端会自报旧版本,永远提示有更新"
+          }
+          "version=$input" >> $env:GITHUB_OUTPUT
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建
+        run: cargo build --release -p codex-plus-launcher
+
+      - name: 自检 —— exe 自报版本必须等于发布版本
+        shell: pwsh
+        run: |
+          $v = (Get-Item target/release/codex-plus-plus.exe).VersionInfo.FileVersion
+          if ($v -ne "${{ steps.ver.outputs.version }}") {
+            throw "exe 自报 $v,与发布版本 ${{ steps.ver.outputs.version }} 不一致"
+          }
+
+      - name: 装 NSIS
+        run: choco install nsis -y --no-progress
+
+      - name: 打安装包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
+          Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { $makensis = "makensis" }
+          Push-Location scripts/installer/windows
+          & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=${{ steps.ver.outputs.version }}" ReCodex.nsi
+          if ($LASTEXITCODE -ne 0) { throw "NSIS 失败" }
+          Pop-Location
+
+      - name: 生成 manifest(自更新用)
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $exe = "target/release/codex-plus-plus.exe"
+          $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            version = $v
+            url     = "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/codex-plus-plus.exe"
+            sha256  = $sha
+          }
+          New-Item -ItemType Directory -Force "dist/upload/$v" | Out-Null
+          # UTF8 无 BOM:BOM 会让部分 JSON 解析器把首字符当非法字符
+          [System.IO.File]::WriteAllText(
+            "dist/upload/$v/manifest.json",
+            ($manifest | ConvertTo-Json -Depth 3),
+            (New-Object System.Text.UTF8Encoding($false)))
+          Copy-Item $exe "dist/upload/$v/"
+          Copy-Item "dist/windows/ReCodex-$v-windows-x64-setup.exe" "dist/upload/$v/"
+          Get-Content "dist/upload/$v/manifest.json"
+
+      - name: 上传到 OSS
+        shell: pwsh
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_REGION: ${{ vars.OSS_REGION }}
+          OSS_ENDPOINT: ${{ vars.OSS_ENDPOINT }}
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          Invoke-WebRequest -Uri "https://gosspublic.alicdn.com/ossutil/v2/2.1.2/ossutil-2.1.2-windows-amd64.zip" -OutFile ossutil.zip -UseBasicParsing
+          Expand-Archive ossutil.zip -DestinationPath ossutil -Force
+          $oss = (Get-ChildItem ossutil -Recurse -Filter ossutil.exe | Select-Object -First 1).FullName
+          # 对象级 public-read:桶本身保持私有,只有这些文件可公开下载
+          foreach ($f in Get-ChildItem "dist/upload/$v") {
+            & $oss cp $f.FullName "${{ vars.OSS_TARGET }}/$v/$($f.Name)" --acl public-read
+            if ($LASTEXITCODE -ne 0) { throw "上传失败:$($f.Name)" }
+          }
+
+      - name: 回读校验 —— 公网真的取得到,且哈希与本地一致
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $m = Invoke-RestMethod -Uri "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/manifest.json" -TimeoutSec 30
+          $local = (Get-FileHash "dist/upload/$v/codex-plus-plus.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($m.sha256 -ne $local) { throw "线上 manifest 的 sha256 与本地包体不一致" }
+          if ($m.version -ne $v) { throw "线上 manifest 版本号不对:$($m.version)" }
+          Invoke-WebRequest -Uri $m.url -Method Head -UseBasicParsing -TimeoutSec 30 | Out-Null
+          Invoke-WebRequest -Uri "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/ReCodex-$v-windows-x64-setup.exe" -Method Head -UseBasicParsing -TimeoutSec 30 | Out-Null
+          Write-Host "回读校验通过:manifest 与两个包体公网可取"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recodex-${{ steps.ver.outputs.version }}-windows
+          path: dist/upload/${{ steps.ver.outputs.version }}/
