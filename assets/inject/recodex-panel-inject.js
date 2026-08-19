@@ -355,8 +355,12 @@
     rcxStatus = computeStatus(res);
     applyStatus();
     if (res.status === "signed_out") {
-      body().innerHTML = `<div class="rcx-muted">${t("未登录 ReCodex。")}</div>
-        <button class="rcx-act" id="rcx-login">${t("登录 ReCodex")}</button>`;
+      // 后端可能带回"为什么没登录上"(凭据读不出来 / token 用不了)。
+      // 少了这一句,用户看到的就是「明明登录过,重启后变成未登录」且毫无解释 ——
+      // 而如果原因是凭据存储坏了,他重新登录多少次都会再掉出来。
+      body().innerHTML = `<div class="rcx-muted">${t("未登录 ReCodex。")}</div>` +
+        (res.notice ? `<div class="rcx-err" style="font-size:12px;margin-top:6px">${esc(res.notice)}</div>` : "") +
+        `<button class="rcx-act" id="rcx-login">${t("登录 ReCodex")}</button>`;
       body().querySelector("#rcx-login").onclick = doLogin;
       return;
     }

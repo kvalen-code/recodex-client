@@ -20,6 +20,13 @@ pub struct ReCodexState {
     pending_device_code: Mutex<Option<String>>,
     auth_epoch: AtomicU64,
     init_error: Option<String>,
+    /// 启动时凭据存在、却没能用起来的原因。
+    ///
+    /// 原先这两步的失败都被 `let _ =` 吞掉:凭据读取报错当成"没有凭据",
+    /// token 校验不过也无声跳过。用户看到的是「明明登录过,重启后变成未登录」,
+    /// 而且**没有任何解释**,只能重新登录一次 —— 如果原因是凭据存储本身坏了,
+    /// 重新登录也白搭,他会一直循环。
+    credential_notice: Option<String>,
 }
 
 fn parallel_snapshot_requests<UsageResult, AccountResult, GatewayResult>(
@@ -65,9 +72,15 @@ impl ReCodexState {
             });
         match result {
             Ok((mut adapter, credentials)) => {
-                if let Ok(Some(saved)) = credentials.load() {
-                    let _ = adapter.set_access_token(saved.access_token.expose().to_owned());
-                }
+                // 两处失败都要留下线索,不能再当作"本来就没登录"
+                let credential_notice = match credentials.load() {
+                    Ok(Some(saved)) => adapter
+                        .set_access_token(saved.access_token.expose().to_owned())
+                        .err()
+                        .map(|error| format!("已保存的登录凭据无法使用({error}),请重新登录")),
+                    Ok(None) => None,
+                    Err(error) => Some(format!("读取已保存的登录凭据失败:{error}")),
+                };
                 Self {
                     adapter: Mutex::new(Some(adapter)),
                     credentials: Some(credentials),
@@ -76,6 +89,7 @@ impl ReCodexState {
                     pending_device_code: Mutex::new(None),
                     auth_epoch: AtomicU64::new(0),
                     init_error: None,
+                    credential_notice,
                 }
             }
             Err(error) => Self {
@@ -86,6 +100,7 @@ impl ReCodexState {
                 pending_device_code: Mutex::new(None),
                 auth_epoch: AtomicU64::new(0),
                 init_error: Some(error.to_string()),
+                credential_notice: None,
             },
         }
     }
@@ -186,7 +201,11 @@ fn snapshot(state: &ReCodexState, refresh: bool) -> Value {
         Err(_) => return error("state_unavailable", "ReCodex state is unavailable"),
     };
     if !worker.is_authenticated() {
-        return json!({"status":"signed_out"});
+        // 带上"为什么没登录上"。没有 notice 时就是普通的未登录。
+        return match state.credential_notice.as_deref() {
+            Some(notice) => json!({"status":"signed_out", "notice": notice}),
+            None => json!({"status":"signed_out"}),
+        };
     }
     // Network I/O runs on an isolated adapter copy. Logout and other IPC
     // commands can acquire the real state mutex while upstream requests wait.
