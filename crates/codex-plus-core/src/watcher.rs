@@ -240,6 +240,45 @@ pub fn uninstall_watcher() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 卸载时清理**指向本 exe** 的开机自启项。
+///
+/// 背景:瘦身版 ReCodex 自己从不调用 `install_watcher`(那是已下线的 manager 干的),
+/// 但**从 Codex++ 迁移过来的用户**,注册表 Run 里留着 `CodexPlusPlusWatcher`。
+/// 我们的卸载原先完全不碰它 —— 卸完之后每次开机都会去拉一个已经被删掉的 exe。
+///
+/// 只在 Run 值里确实提到**我们即将删除的这个 exe** 时才动手:
+/// 用户可能还单独装着 Codex++,那是别人的自启项,不该由我们越界清理。
+///
+/// 返回是否真的清掉了(供卸载结果里给用户一句交代)。
+#[cfg(windows)]
+pub fn uninstall_watcher_pointing_at(exe: &Path) -> bool {
+    let Ok(values) = crate::windows_integration::read_current_user_string_values(WATCHER_RUN_KEY)
+    else {
+        return false;
+    };
+    let exe_key = exe.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    let points_at_us = values.iter().any(|(name, value)| {
+        name == WATCHER_RUN_NAME
+            && value.as_deref().is_some_and(|value| {
+                value.to_ascii_lowercase().replace('/', "\\").contains(&exe_key)
+            })
+    });
+    if !points_at_us {
+        return false;
+    }
+    let _ =
+        crate::windows_integration::delete_current_user_value(WATCHER_RUN_KEY, WATCHER_RUN_NAME);
+    if let Some(shortcut) = startup_shortcut_path() {
+        let _ = std::fs::remove_file(shortcut);
+    }
+    true
+}
+
+#[cfg(not(windows))]
+pub fn uninstall_watcher_pointing_at(_exe: &Path) -> bool {
+    false
+}
+
 #[cfg(not(windows))]
 pub fn uninstall_watcher() -> anyhow::Result<()> {
     Ok(())

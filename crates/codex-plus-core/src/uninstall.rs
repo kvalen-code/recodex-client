@@ -104,10 +104,15 @@ where
         warnings.push(format!("卸载快捷方式:{}", result.message));
     }
 
-    // 3) 安排 exe 自删
+    // 3) 清理指向本 exe 的开机自启项,再安排 exe 自删
     let exe: Option<PathBuf> = std::env::current_exe().ok();
     match exe {
         Some(path) => {
+            // 从 Codex++ 迁移过来的用户,注册表 Run 里可能留着 CodexPlusPlusWatcher。
+            // 不清的话,卸载之后每次开机都会去拉一个已经被删掉的 exe。
+            if crate::watcher::uninstall_watcher_pointing_at(&path) {
+                warnings.push("已一并清除开机自启项(旧版遗留)".to_string());
+            }
             if let Err(error) = schedule_self_delete(&path) {
                 warnings.push(format!("安排删除程序文件失败:{error}"));
             }
@@ -162,6 +167,20 @@ mod tests {
             // 只匹配真正的桥调用 —— 注释里提到 /restart-codex 是在解释为什么不能用它
             !uninstall_block.contains("bridge(\"/restart-codex\""),
             "卸载后不能调 /restart-codex —— 接班进程会锁住待删的 exe"
+        );
+    }
+
+    /// 开机自启只清**指向本 exe** 的那一条。
+    ///
+    /// 用户可能还单独装着 Codex++,那是别人的自启项 —— 卸我们的东西不该顺手删它。
+    /// 这里用一个绝不可能出现在真实 Run 值里的路径,断言我们不会误伤。
+    #[cfg(windows)]
+    #[test]
+    fn autostart_cleanup_only_touches_entries_pointing_at_us() {
+        let bogus = std::env::temp_dir().join("recodex-not-installed-anywhere-12345.exe");
+        assert!(
+            !crate::watcher::uninstall_watcher_pointing_at(&bogus),
+            "Run 值里没提到这个 exe,就不该动任何东西"
         );
     }
 
