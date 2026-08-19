@@ -304,7 +304,7 @@ pub async fn perform_update(
 
 fn update_http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent(format!("Codex++/{}", crate::version::VERSION))
+        .user_agent(format!("ReCodex/{}", crate::version::VERSION))
         .connect_timeout(UPDATE_CONNECT_TIMEOUT)
         .timeout(UPDATE_DOWNLOAD_TIMEOUT)
         .build()?)

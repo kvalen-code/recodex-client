@@ -300,7 +300,7 @@ async fn initialize_openai_curated_marketplace_from_github(home: &Path) -> anyho
 
 async fn download_openai_plugins_zip() -> anyhow::Result<Vec<u8>> {
     let client =
-        crate::http_client::proxied_client(&format!("Codex++/{}", crate::version::VERSION))?;
+        crate::http_client::proxied_client(&format!("ReCodex/{}", crate::version::VERSION))?;
     let bytes = client
         .get(OPENAI_PLUGINS_ZIP_URL)
         .header(reqwest::header::ACCEPT, "application/zip")

@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+url = "2" # recodex-overlay: 校验更新链路协议
 aes-gcm.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"

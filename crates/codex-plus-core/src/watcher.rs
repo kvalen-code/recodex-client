@@ -606,7 +606,7 @@ fn create_startup_shortcut(launcher_path: &Path, arguments: &str) -> anyhow::Res
         target: launcher_path.to_path_buf(),
         arguments: arguments.to_string(),
         working_directory: launcher_path.parent().map(Path::to_path_buf),
-        description: "Codex++ watcher".to_string(),
+        description: "ReCodex watcher".to_string(),
         icon: None,
         show_minimized: true,
     })
@@ -639,4 +639,49 @@ fn startup_shortcut_path() -> Option<PathBuf> {
             .join("Startup")
             .join(WATCHER_STARTUP_SHORTCUT_NAME)
     })
+}
+
+// recodex-overlay: 关掉当前 Codex,并拉起一个全新的 launcher 进程接管。
+//
+// 为什么要整个 launcher 重启,而不是只重启 Codex:
+//   1) `config.toml` 与 `RECODEX_KEY` 都是 Codex **进程启动时读一次**,切换官方模式后
+//      必须让 Codex 重新起来才生效;
+//   2) 当前 launcher 正阻塞在 `wait_for_codex_exit()`,Codex 一退它自己也会退出,
+//      所以必须先把接班人拉起来;
+//   3) Windows 上 launcher 遇到"已在运行的 Codex"只会激活、不会重新注入
+//      (macOS 有 RestartRunningApp 分支,Windows 没有)—— 先杀干净再交接,
+//      正好绕开这个老坑。
+//
+// 调用方在本函数返回 Ok 后应尽快退出当前进程。
+#[cfg(windows)]
+pub fn restart_with_fresh_launcher() -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+    let exe = std::env::current_exe()?;
+    for process_id in find_codex_processes() {
+        let _ = crate::windows_integration::terminate_process(process_id);
+    }
+    // 给 Codex 一点时间真正退出,否则接班的 launcher 会看到"已在运行"
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // --await-guard:告诉接班的 launcher「旧实例正在退出,请等锁释放再判断」。
+    // 否则它会看到锁还被占,以为已有实例在跑,走「激活已存在」分支后立刻退出 ——
+    // 结果页面里的 CDP binding 没人应答,面板永远停在「加载中」。
+    std::process::Command::new(exe)
+        .arg("--await-guard")
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn restart_with_fresh_launcher() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    for process_id in find_codex_processes() {
+        let _ = terminate_macos_process(process_id);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    std::process::Command::new(exe).arg("--await-guard").spawn()?;
+    Ok(())
 }

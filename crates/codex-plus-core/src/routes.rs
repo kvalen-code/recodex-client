@@ -97,13 +97,20 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn delete_user_script(&self, key: String) -> anyhow::Result<Value>;
     async fn reload_user_scripts(&self) -> anyhow::Result<Value>;
     async fn open_devtools(&self) -> anyhow::Result<Value>;
+    // recodex-overlay: 默认不支持,由 launcher 覆盖
+    async fn restart_codex(&self) -> anyhow::Result<Value> {
+        anyhow::bail!("restarting Codex is unavailable")
+    }
+    // recodex-overlay: 默认拒绝,由 launcher 覆盖实现
+    async fn open_external(&self, _url: String) -> anyhow::Result<Value> {
+        anyhow::bail!("opening external URLs is unavailable")
+    }
     async fn open_manager(&self) -> anyhow::Result<Value>;
     async fn open_transient_manager(&self) -> anyhow::Result<Value> {
         self.open_manager().await
     }
     async fn backend_status(&self) -> anyhow::Result<Value>;
     async fn codex_model_catalog(&self) -> anyhow::Result<Value>;
-    async fn ads(&self) -> anyhow::Result<Value>;
     async fn zed_remote_status(&self) -> anyhow::Result<Value>;
     async fn resolve_zed_remote_host(&self, payload: Value) -> anyhow::Result<Value>;
     async fn fallback_zed_remote_request(&self, payload: Value) -> anyhow::Result<Value>;
@@ -149,12 +156,24 @@ pub async fn handle_bridge_request(
         }),
     );
     // recodex-overlay:hook — /recodex/* 委托给 launcher 注入的 ReCodex 桥。
-    // TODO(perf): 命令是阻塞网络 I/O,后续包一层 spawn_blocking 避免占用 async 执行线程。
+    // 这些命令是**同步阻塞网络 I/O**(账号/额度/网关都要打上游),直接在 async 线程里跑
+    // 会把执行器占住,导致同期的其它桥请求全部卡死(表现为面板永远「加载中」)。
+    // 所以丢到 spawn_blocking。
     if path.starts_with("/recodex/") {
-        return match ctx.recodex.as_ref() {
-            Some(recodex) => recodex.handle(path, &payload),
-            None => json!({"status":"error","error":{"code":"unavailable","message":"recodex bridge not configured"}}),
+        let Some(recodex) = ctx.recodex.clone() else {
+            return json!({"status":"error","error":{"code":"unavailable","message":"recodex bridge not configured"}});
         };
+        let owned_path = path.to_string();
+        let owned_payload = payload.clone();
+        return tokio::task::spawn_blocking(move || recodex.handle(&owned_path, &owned_payload))
+            .await
+            .unwrap_or_else(|error| {
+                json!({"status":"error","error":{"code":"panic","message":error.to_string()}})
+            });
+    }
+    // recodex-overlay:hook — /weixin/* 微信连接控制面(原 manager Tauri 命令,已迁到 core)。
+    if path.starts_with("/weixin/") {
+        return crate::connect::control::handle_bridge(path, &payload).await;
     }
     let result = match path {
         "/settings/get" => settings_value(&ctx, ctx.settings.get_settings().await).await,
@@ -195,6 +214,42 @@ pub async fn handle_bridge_request(
         }
         "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
         "/devtools/open" => ctx.runtime.open_devtools().await,
+        // recodex-overlay: 切换官方模式 / 更新配置后需要 Codex 重新起来才生效
+        "/restart-codex" => ctx.runtime.restart_codex().await,
+        // recodex-overlay: 自更新 —— 下载并校验后就位,由前端接着触发重启
+        "/self-update" => {
+            let manifest_url = payload
+                .get("manifestUrl")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Ok(self_update_value(manifest_url).await)
+        }
+        // recodex-overlay: 卸载 —— 先让 ReCodex 桥做登出与凭据清理(它持有账号状态),
+        // 再由本模块删目录/快捷方式并安排 exe 自删。面板侧已二次确认。
+        "/uninstall" => {
+            let prepared = match ctx.recodex.as_ref() {
+                Some(recodex) => recodex.handle("/recodex/prepare-uninstall", &payload),
+                None => json!({"status": "ready"}),
+            };
+            let mut result = crate::uninstall::perform_uninstall(|| Ok(()));
+            if let (Some(warning), Some(list)) = (
+                prepared.get("warning").and_then(Value::as_str),
+                result.get_mut("warnings").and_then(Value::as_array_mut),
+            ) {
+                list.push(Value::String(format!("登出:{warning}")));
+            }
+            Ok(result)
+        }
+        // recodex-overlay: 用系统浏览器打开外部链接(注入页里 window.open 会被 Electron 拦)
+        "/open-external" => {
+            let url = payload
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            ctx.runtime.open_external(url).await
+        }
         "/manager/open" => ctx.runtime.open_manager().await,
         "/manager/open-transient" => ctx.runtime.open_transient_manager().await,
         "/backend/status" => backend_status_value(
@@ -204,7 +259,6 @@ pub async fn handle_bridge_request(
         "/codex-model-catalog" | "/codex-config-model" => ctx.runtime.codex_model_catalog().await,
         "/diagnostics/log" => diagnostic_log_value(payload.clone()),
         "/llm-proxy" => llm_proxy_value(payload.clone()).await,
-        "/ads" => ctx.runtime.ads().await,
         "/zed-remote/status" => ctx.runtime.zed_remote_status().await,
         "/zed-remote/resolve-host" => ctx.runtime.resolve_zed_remote_host(payload.clone()).await,
         "/zed-remote/fallback-request" => {
@@ -232,13 +286,6 @@ pub async fn handle_bridge_request(
             ctx.runtime.upstream_worktree_prepare(payload.clone()).await
         }
         "/upstream-worktree/create" => ctx.runtime.upstream_worktree_create(payload.clone()).await,
-        "/stepwise/settings" => stepwise_settings_value(ctx.settings.get_settings().await),
-        "/stepwise/generate" => {
-            stepwise_generate_value(ctx.settings.get_settings().await, payload.clone()).await
-        }
-        "/stepwise/test" => {
-            stepwise_test_value(ctx.settings.get_settings().await, payload.clone()).await
-        }
         "/delete" => result_value(ctx.data.delete(session_from_payload(&payload)).await),
         "/undo" => {
             let undo_token = payload
@@ -502,10 +549,6 @@ impl BridgeRuntimeService for CoreRuntimeService {
         Ok(crate::model_catalog::read_codex_model_catalog().await)
     }
 
-    async fn ads(&self) -> anyhow::Result<Value> {
-        crate::ads::fetch_ad_list().await
-    }
-
     async fn zed_remote_status(&self) -> anyhow::Result<Value> {
         Ok(crate::zed_remote::zed_remote_status())
     }
@@ -615,7 +658,6 @@ fn settings_payload_value(
 ) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(settings)?;
     if let Some(object) = value.as_object_mut() {
-        object.remove("codexAppStepwiseApiKey");
         object.insert(
             "codexAppVersion".to_string(),
             Value::String(codex_app_version),
@@ -631,6 +673,33 @@ async fn settings_value(
     let settings = result?;
     let codex_app_version = ctx.settings.codex_app_version().await.unwrap_or_default();
     settings_payload_value(settings, codex_app_version)
+}
+
+// 全流程失败都返回结构化结果而不是 Err —— 更新失败要让用户看到原因,
+// 而不是一个笼统的桥错误。
+async fn self_update_value(manifest_url: String) -> Value {
+    if manifest_url.trim().is_empty() {
+        return json!({"status": "failed", "message": "服务端未提供更新清单地址"});
+    }
+    let manifest = match crate::selfupdate::fetch_manifest(&manifest_url).await {
+        Ok(value) => value,
+        Err(error) => return json!({"status":"failed","message":format!("获取更新清单失败:{error}")}),
+    };
+    let bytes = match crate::selfupdate::download_verified(&manifest).await {
+        Ok(value) => value,
+        Err(error) => return json!({"status":"failed","message":format!("{error}")}),
+    };
+    let exe = match std::env::current_exe() {
+        Ok(value) => value,
+        Err(error) => return json!({"status":"failed","message":format!("无法定位程序文件:{error}")}),
+    };
+    match crate::selfupdate::stage_replacement(&exe, &bytes) {
+        Ok(_) => json!({
+            "status": "ok",
+            "message": format!("已更新到 {},正在重启…", manifest.version)
+        }),
+        Err(error) => json!({"status":"failed","message":format!("替换程序文件失败:{error}")}),
+    }
 }
 
 fn backend_status_value(
@@ -652,33 +721,6 @@ where
     T: serde::Serialize,
 {
     Ok(serde_json::to_value(result?)?)
-}
-
-fn stepwise_settings_value(result: anyhow::Result<BackendSettings>) -> anyhow::Result<Value> {
-    let settings = result?;
-    Ok(json!({
-        "status": "ok",
-        "settings": crate::stepwise::public_settings(&settings),
-    }))
-}
-
-async fn stepwise_generate_value(
-    result: anyhow::Result<BackendSettings>,
-    payload: Value,
-) -> anyhow::Result<Value> {
-    let settings = result?;
-    let request = payload.get("request").cloned().unwrap_or(payload);
-    let request =
-        serde_json::from_value::<crate::stepwise::StepwiseRequest>(request).unwrap_or_default();
-    crate::stepwise::generate(request, &settings).await
-}
-
-async fn stepwise_test_value(
-    result: anyhow::Result<BackendSettings>,
-    payload: Value,
-) -> anyhow::Result<Value> {
-    let settings = crate::stepwise::settings_with_payload(result?, &payload);
-    crate::stepwise::test_connection(&settings).await
 }
 
 async fn llm_proxy_value(payload: Value) -> anyhow::Result<Value> {

@@ -310,6 +310,85 @@ fn setx(name: &str, value: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Reads a user environment variable straight from `HKCU\Environment`.
+///
+/// A process's environment block is a snapshot of its parent's, so a launcher
+/// started from a shell that predates the last sign-in still carries the old
+/// key even though `setx` already wrote the new one. Codex (spawned as our
+/// child) then inherits the stale key and the gateway answers
+/// `SUBSCRIPTION_NOT_FOUND`. The registry is the authoritative copy.
+#[cfg(windows)]
+fn read_user_env_from_registry(name: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+    };
+
+    let subkey: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let value: Vec<u16> = format!("{name}\0").encode_utf16().collect();
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+
+    let mut size: u32 = 0;
+    // First call sizes the buffer (in bytes), second call fills it.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if status != ERROR_SUCCESS || size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; (size as usize).div_ceil(2)];
+    let mut size_out = size;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut size_out,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let len = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+    let text = OsString::from_wide(&buffer[..len]).to_string_lossy().into_owned();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Re-reads `RECODEX_KEY` from the user registry into this process, so the Codex
+/// we spawn uses the key from the most recent sign-in rather than whatever our
+/// parent process happened to hold. Returns true when the value changed.
+/// No-op off Windows, where there is no `setx`/registry split.
+pub fn refresh_key_env_from_user_scope() -> bool {
+    #[cfg(windows)]
+    {
+        let Some(stored) = read_user_env_from_registry(SUB2API_ENV_KEY) else {
+            return false;
+        };
+        if std::env::var(SUB2API_ENV_KEY).ok().as_deref() == Some(stored.as_str()) {
+            return false;
+        }
+        // Safe here: called once at startup, before any Codex child is spawned.
+        unsafe { std::env::set_var(SUB2API_ENV_KEY, &stored) };
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Persists `name=value` to the user environment so a freshly launched Codex can
 /// read the key. Also sets it on this process, so the Codex the desktop launcher
 /// spawns as a child inherits the key immediately — no app restart needed after

@@ -5,7 +5,9 @@ members = [
   "crates/recodex-integration", # recodex-overlay:workspace-member
   "crates/codex-plus-data",
   "apps/codex-plus-launcher",
-  "apps/codex-plus-manager/src-tauri",
+  # recodex-overlay: manager(Tauri GUI + 托盘)已弃用 —— 方案A 把能力收进悬浮面板。
+  # 移出 workspace 后不再参与构建,也不再阻挡删除它独有的模块。目录暂留作参考。
+  # "apps/codex-plus-manager/src-tauri",
 ]
 
 [workspace.package]

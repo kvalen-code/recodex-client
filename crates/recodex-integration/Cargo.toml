@@ -1,6 +1,6 @@
 [package]
 name = "recodex-integration"
-version = "0.1.0"
+version.workspace = true # recodex-overlay: 跟随产品版本,否则上报的 client_version 永远是 0.1.0
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "The single ReCodex adapter board for the Codex++ desktop upstream"
@@ -16,4 +16,9 @@ ureq = { version = "2.12", default-features = true, features = ["json", "native-
 getrandom = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+    # recodex-overlay: 读 HKCU\Environment,把 setx 写入的新 key 回填进本进程
+    "Win32_System_Registry",
+] }

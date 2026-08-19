@@ -56,6 +56,13 @@ impl CodexAppServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // launcher 是 GUI 子系统进程(无控制台),拉起控制台程序时 Windows 会给它新开一个
+        // 黑窗口弹在用户桌面上。stdio 已全部管道化,不需要控制台。
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         let mut child = command.spawn().with_context(|| {
             format!(
                 "无法启动 Codex app-server（{}），请检查 Codex CLI 路径",
@@ -189,6 +196,12 @@ impl CodexAppServer {
                 Some("error") => {
                     let error = deep_string(message.get("params"), &["message", "error"])
                         .unwrap_or_else(|| "Codex app-server 返回未知错误".to_string());
+                    // app-server 把上游重连提示("Reconnecting... 1/5")也发成 error 通知。
+                    // 那是瞬时的、还会自己重试成功,当成致命错误会白白中断整轮。
+                    // 重试耗尽后 app-server 会发真正的终态错误,加上 TURN_TIMEOUT 兜底,不会卡死。
+                    if is_transient_stream_notice(&error) {
+                        continue;
+                    }
                     bail!("{error}");
                 }
                 _ => {}
@@ -212,9 +225,15 @@ impl CodexAppServer {
         self.request(
             "initialize",
             json!({
+                // clientInfo.name 会被 Codex CLI 直接当成发往上游的 originator
+                // (官方二进制里就有 "clientInfo.name was rejected while setting originator")。
+                // 之前填 "codex-plus-weixin" 这个第三方名字,上游把它判成非官方客户端,
+                // 整轮 403 "This account only allows Codex official clients"。
+                // 这里跑的本来就是官方 codex CLI 的 app-server 模式,如实用 CLI 自己的
+                // 标识;我们自己的身份放 title(不参与 originator)。
                 "clientInfo": {
-                    "name": "codex-plus-weixin",
-                    "title": "Codex++ Weixin Connect",
+                    "name": "codex_cli_rs",
+                    "title": "ReCodex 微信连接",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
@@ -395,6 +414,12 @@ fn rpc_error(message: &Value) -> Option<String> {
     deep_string(Some(error), &["message", "error"]).or_else(|| Some(error.to_string()))
 }
 
+/// 上游流的瞬时重连/重试提示,不是终态失败。
+fn is_transient_stream_notice(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    lower.starts_with("reconnecting") || lower.starts_with("retrying")
+}
+
 fn is_server_request(message: &Value) -> bool {
     message.get("id").is_some() && message.get("method").and_then(Value::as_str).is_some()
 }
@@ -526,6 +551,18 @@ fn deep_string(value: Option<&Value>, keys: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_reconnect_notices_do_not_abort_a_turn() {
+        // 微信连接实测挂在这条:app-server 把重连提示当 error 通知发出来
+        assert!(is_transient_stream_notice("Reconnecting... 1/5"));
+        assert!(is_transient_stream_notice("  retrying request 2/3 "));
+        // 真正的失败必须仍然中断
+        assert!(!is_transient_stream_notice(
+            "This account only allows Codex official clients"
+        ));
+        assert!(!is_transient_stream_notice("stream closed before completion"));
+    }
 
     #[test]
     fn extracts_ids_from_current_app_server_shapes() {

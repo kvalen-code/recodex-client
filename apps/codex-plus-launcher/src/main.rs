@@ -94,6 +94,17 @@ async fn launcher_main(
     helper_only: bool,
     options: LaunchOptions,
 ) -> Result<()> {
+    // recodex-overlay: 必须早于任何子进程(Codex / 微信 app-server)——它们继承本进程
+    // 环境块,而环境块是父进程的旧快照;上次登录后 setx 写的新 key 只在注册表里。
+    // 拿旧 key 请求网关会被拒(SUBSCRIPTION_NOT_FOUND)。
+    // recodex-overlay: 清掉上一轮自更新留下的 .old/.new(那时它们已不再被占用)
+    codex_plus_core::selfupdate::cleanup_previous_update();
+    if recodex_integration::codexcfg::refresh_key_env_from_user_scope() {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.recodex_key_refreshed_from_user_scope",
+            json!({}),
+        );
+    }
     if helper_only {
         let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
@@ -101,7 +112,10 @@ async fn launcher_main(
         hooks.shutdown_helper(options.helper_port).await;
         return Ok(());
     }
-    let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
+    // recodex-overlay: 由「切换模式/更新后重启」拉起时带 --await-guard —— 旧 launcher
+    // 还要 1 秒左右才退出,不等的话会误判成「已有实例」而直接退出,页面就失去后端。
+    let await_guard = args.iter().any(|arg| arg == "--await-guard");
+    let Some(_guard) = acquire_guard_maybe_waiting(options.debug_port, await_guard)? else {
         activate_existing_codex_app(&options).await?;
         options.status_store.save_latest(&LaunchStatus {
             status: "running".to_string(),
@@ -118,6 +132,8 @@ async fn launcher_main(
     tokio::spawn(async {
         let _ = notify_manager_when_update_available().await;
     });
+    // recodex-overlay: 微信连接按已保存设置自动拉起(原由 manager 负责)
+    codex_plus_core::connect::control::start_from_saved_settings();
     let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
@@ -129,6 +145,23 @@ fn current_timestamp_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+// 等旧实例释放单实例锁(最多约 10 秒);正常双击启动不受影响(wait=false 直接判断)。
+fn acquire_guard_maybe_waiting(
+    debug_port: u16,
+    wait: bool,
+) -> anyhow::Result<Option<codex_plus_core::ports::LoopbackPortGuard>> {
+    if !wait {
+        return acquire_single_instance_guard(debug_port);
+    }
+    for _ in 0..40 {
+        if let Some(guard) = acquire_single_instance_guard(debug_port)? {
+            return Ok(Some(guard));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    acquire_single_instance_guard(debug_port)
 }
 
 fn acquire_single_instance_guard(
@@ -790,6 +823,29 @@ impl BridgeRuntimeService for LauncherRuntimeService {
         self.user_scripts.inventory()
     }
 
+    // recodex-overlay: 只放行 https 链接 —— 注入脚本运行在页面里,
+    // 不限制协议等于把 file:// / 自定义协议的启动能力暴露给页面。
+    async fn open_external(&self, url: String) -> anyhow::Result<Value> {
+        let parsed = url::Url::parse(url.trim())
+            .map_err(|error| anyhow::anyhow!("invalid external URL: {error}"))?;
+        if parsed.scheme() != "https" {
+            anyhow::bail!("only https URLs can be opened externally");
+        }
+        open_url(parsed.as_str())?;
+        Ok(json!({ "status": "ok", "url": parsed.as_str() }))
+    }
+
+    // recodex-overlay: 拉起接班的 launcher 后,当前进程延迟退出 —— 先让这次桥调用
+    // 把响应回给页面,否则面板会看到连接被掐断而不是成功。
+    async fn restart_codex(&self) -> anyhow::Result<Value> {
+        codex_plus_core::watcher::restart_with_fresh_launcher()?;
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            std::process::exit(0);
+        });
+        Ok(json!({ "status": "ok", "message": "Codex 正在重启" }))
+    }
+
     async fn open_devtools(&self) -> anyhow::Result<Value> {
         let debug_port = *self.debug_port.lock().unwrap();
         let targets = codex_plus_core::cdp::list_targets(debug_port).await?;
@@ -835,10 +891,6 @@ impl BridgeRuntimeService for LauncherRuntimeService {
 
     async fn codex_model_catalog(&self) -> anyhow::Result<Value> {
         Ok(codex_plus_core::model_catalog::read_codex_model_catalog().await)
-    }
-
-    async fn ads(&self) -> anyhow::Result<Value> {
-        codex_plus_core::ads::fetch_ad_list().await
     }
 
     async fn zed_remote_status(&self) -> anyhow::Result<Value> {
@@ -1000,20 +1052,29 @@ fn default_user_script_manager() -> UserScriptManager {
     )
 }
 
+// recodex-overlay: 用户脚本配置目录去品牌 `Codex++` → `ReCodex`,
+// 并把旧目录整个搬过来 —— 否则用户装的脚本会「凭空消失」。
 fn default_user_scripts_config_dir() -> PathBuf {
-    if cfg!(windows) {
-        if let Some(roaming) = std::env::var_os("APPDATA") {
-            return PathBuf::from(roaming).join("Codex++");
-        }
-        if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
-            return home.join("AppData").join("Roaming").join("Codex++");
-        }
+    let (current, legacy) = if cfg!(windows) {
+        let base = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                directories::BaseDirs::new()
+                    .map(|dirs| dirs.home_dir().join("AppData").join("Roaming"))
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        (base.join("ReCodex"), base.join("Codex++"))
+    } else {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".config")))
+            .unwrap_or_else(|| PathBuf::from(".config"));
+        (base.join("ReCodex"), base.join("Codex++"))
+    };
+    if !current.exists() && legacy.exists() {
+        let _ = std::fs::rename(&legacy, &current);
     }
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("Codex++")
+    current
 }
 
 #[cfg(test)]

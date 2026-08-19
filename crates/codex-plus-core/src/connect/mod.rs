@@ -1,4 +1,5 @@
 pub mod app_server;
+pub mod control; // recodex-overlay: 微信控制面(扫码/启停/状态),供 launcher CDP 桥调用
 pub mod session_store;
 pub mod weixin;
 
@@ -110,8 +111,13 @@ pub async fn run_weixin_connect(
     if config.token.is_empty() {
         bail!("请先扫码登录微信");
     }
+    // 没配工作目录时不能退回进程 cwd:launcher 是 GUI 程序,cwd 取决于启动方式
+    // (双击快捷方式=exe 所在目录,命令行=当时的目录),Codex 会每次在不同地方干活。
+    // 退回用户主目录至少是确定的,面板里也看得见。
     let work_dir = if config.work_dir.is_empty() {
-        std::env::current_dir().context("无法读取当前工作目录")?
+        directories::BaseDirs::new()
+            .map(|dirs| dirs.home_dir().to_path_buf())
+            .context("无法确定用户主目录，请在 ReCodex 面板里指定工作目录")?
     } else {
         PathBuf::from(&config.work_dir)
     };
@@ -224,10 +230,15 @@ pub async fn run_weixin_connect(
                 Err(error) => {
                     app_server = None;
                     state.mark_processed(&message_key);
+                    // 带上真实原因,否则用户在微信里只看到一句无从下手的失败提示。
+                    let detail = error.to_string();
+                    let detail = detail.lines().next().unwrap_or("未知错误").trim();
                     let _ = client
                         .send_text_chunks(
                             &message.from_user_id,
-                            "Codex 处理失败，请在 Codex++ 管理器中查看连接状态。",
+                            &format!(
+                                "Codex 处理失败：{detail}\n可在 ReCodex 面板(Codex 右下角 Rx)查看连接状态。"
+                            ),
                             &message.context_token,
                         )
                         .await;

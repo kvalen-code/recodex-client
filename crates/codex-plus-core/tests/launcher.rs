@@ -1706,14 +1706,6 @@ async fn default_launch_hooks_provider_sync_enabled_returns_explicit_error() {
     );
 }
 
-#[test]
-fn paused_dream_skin_does_not_reapply_the_native_base_theme_on_launch() {
-    let source =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/launcher.rs")).unwrap();
-
-    assert!(source.contains("!settings.codex_app_dream_skin_paused"));
-}
-
 #[derive(Clone)]
 struct FakeHooks {
     events: Arc<Mutex<Vec<String>>>,

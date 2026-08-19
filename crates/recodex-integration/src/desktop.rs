@@ -537,6 +537,45 @@ pub fn recodex_logout(state: &ReCodexState) -> Value {
     json!({"status":"signed_out"})
 }
 
+/// 官方模式状态(面板用来决定显示哪种按钮,以及状态灯是否隐藏)。
+pub fn recodex_official_mode_status() -> Value {
+    json!({
+        "status": "ready",
+        "data": { "official": crate::officialmode::is_official_mode() }
+    })
+}
+
+/// 切到官方 ChatGPT 模式(可逆:先存快照再撤配置)。
+pub fn recodex_official_mode_enable() -> Value {
+    match crate::officialmode::switch_to_official() {
+        Ok(()) => json!({"status":"ready","data":{"official":true},
+            "message":"已切到官方模式,重启 Codex 后生效"}),
+        Err(io_error) => error("official_mode", io_error.to_string()),
+    }
+}
+
+/// 切回 ReCodex(按快照写回,无需重新登录)。
+pub fn recodex_official_mode_disable() -> Value {
+    match crate::officialmode::switch_to_recodex() {
+        Ok(()) => json!({"status":"ready","data":{"official":false},
+            "message":"已切回 ReCodex,重启 Codex 后生效"}),
+        Err(io_error) => error("official_mode", io_error.to_string()),
+    }
+}
+
+/// 卸载前的本地清理:登出(服务端吊销设备 + 清凭据 + 还原 Codex 配置),
+/// 并清掉官方模式快照(残留会让下次安装误判仍在官方模式)。
+/// 删目录/快捷方式/自删 exe 由 core 的 uninstall 模块接手 —— 放在 core 是为了
+/// 避免本 crate 反向依赖 codex-plus-core。
+pub fn recodex_prepare_uninstall(state: &ReCodexState) -> Value {
+    let logout = recodex_logout(state);
+    let _ = crate::officialmode::switch_to_recodex();
+    json!({
+        "status": "ready",
+        "warning": logout.get("error").and_then(|v| v.get("message")).cloned()
+    })
+}
+
 /// CDP 桥分发器:把 /recodex/* 路径映射到命令实现。由 launcher 的 RecodexBridge impl 调用(持 ReCodexState)。
 pub fn handle_bridge(state: &ReCodexState, path: &str, payload: &Value) -> Value {
     match path {
@@ -553,6 +592,10 @@ pub fn handle_bridge(state: &ReCodexState, path: &str, payload: &Value) -> Value
         },
         "/recodex/gateway/fastest" => recodex_use_fastest_gateway(state),
         "/recodex/logout" => recodex_logout(state),
+        "/recodex/official-mode" => recodex_official_mode_status(),
+        "/recodex/official-mode/enable" => recodex_official_mode_enable(),
+        "/recodex/official-mode/disable" => recodex_official_mode_disable(),
+        "/recodex/prepare-uninstall" => recodex_prepare_uninstall(state),
         _ => error("not_found", format!("unknown recodex path: {path}")),
     }
 }

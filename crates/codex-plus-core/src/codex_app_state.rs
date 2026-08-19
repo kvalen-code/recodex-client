@@ -584,7 +584,7 @@ fn create_backup(home: &Path, original: &Value) -> anyhow::Result<PathBuf> {
         root.join("metadata.json"),
         serde_json::to_string_pretty(&json!({
             "version": SNAPSHOT_VERSION,
-            "managedBy": "Codex++ app state sync",
+            "managedBy": "ReCodex app state sync",
             "createdAtMs": now_ms(),
         }))?,
     )?;

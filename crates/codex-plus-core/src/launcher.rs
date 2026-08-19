@@ -291,12 +291,6 @@ where
                 serde_json::json!({"reason": "desktop_writer_active"}),
             );
         }
-        crate::dream_skin::sync_default_dream_skin_base_theme(
-            settings.enhancements_enabled
-                && settings.codex_app_dream_skin_enabled
-                && !settings.codex_app_dream_skin_paused,
-            &settings.codex_app_dream_skin_theme_config,
-        )?;
         if let Err(error) = hooks.ensure_plugin_marketplace_config(&settings).await {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "launcher.plugin_marketplace_config_failed_nonfatal",
@@ -358,7 +352,7 @@ where
             } else {
                 let degraded = launch_status(
                     "running_degraded",
-                    "Codex launched; Codex++ enhancements are still waiting for the page bridge.",
+                    "Codex launched; ReCodex enhancements are still waiting for the page bridge.",
                     debug_port,
                     helper_port,
                     &app_dir,
@@ -372,7 +366,7 @@ where
         if !settings.enhancements_enabled || !injection_degraded {
             let status = launch_status(
                 "running",
-                "Codex++ launcher ready",
+                "ReCodex launcher ready",
                 debug_port,
                 helper_port,
                 &app_dir,
@@ -1161,17 +1155,6 @@ async fn handle_helper_connection(
         } else {
             overlay_image_response()
         }
-    } else if path == "/dream-skin/image" && matches!(method, "GET" | "OPTIONS") {
-        if method == "OPTIONS" {
-            (
-                "200 OK".to_string(),
-                Vec::new(),
-                "application/octet-stream".to_string(),
-                "helper.dream_skin_image_options",
-            )
-        } else {
-            dream_skin_image_response()
-        }
     } else {
         (
             "404 Not Found".to_string(),
@@ -1264,47 +1247,6 @@ fn overlay_image_response() -> (String, Vec<u8>, String, &'static str) {
             bytes,
             content_type.to_string(),
             "helper.overlay_image_ok",
-        ),
-        Err(_) => not_found(),
-    }
-}
-
-fn dream_skin_image_response() -> (String, Vec<u8>, String, &'static str) {
-    let not_found = || {
-        (
-            "404 Not Found".to_string(),
-            serde_json::to_vec(&serde_json::json!({
-                "status": "failed",
-                "message": "皮肤图片未启用或图片不可用"
-            }))
-            .unwrap_or_default(),
-            "application/json; charset=utf-8".to_string(),
-            "helper.dream_skin_image_not_found",
-        )
-    };
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    if !settings.codex_app_dream_skin_enabled {
-        return not_found();
-    }
-    let image_path = PathBuf::from(settings.codex_app_dream_skin_image_path.trim());
-    if image_path.as_os_str().is_empty() || !image_path.is_file() {
-        let (content_type, image) = crate::assets::dream_skin_default_image();
-        return (
-            "200 OK".to_string(),
-            image.to_vec(),
-            content_type.to_string(),
-            "helper.dream_skin_default_image_ok",
-        );
-    }
-    let Some(content_type) = overlay_image_content_type(&image_path) else {
-        return not_found();
-    };
-    match std::fs::read(&image_path) {
-        Ok(bytes) => (
-            "200 OK".to_string(),
-            bytes,
-            content_type.to_string(),
-            "helper.dream_skin_image_ok",
         ),
         Err(_) => not_found(),
     }

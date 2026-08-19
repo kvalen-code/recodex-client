@@ -17,6 +17,7 @@ recodex-integration = { path = "../../crates/recodex-integration" } # recodex-ov
 codex-plus-data = { path = "../../crates/codex-plus-data" }
 directories.workspace = true
 serde_json.workspace = true
+url = "2" # recodex-overlay: 校验外部链接协议
 tokio.workspace = true
 
 [build-dependencies]

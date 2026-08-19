@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 pub mod macos;
 pub mod windows;
 
-pub const SILENT_NAME: &str = "Codex++";
-pub const MANAGER_NAME: &str = "Codex++ 管理工具";
+pub const SILENT_NAME: &str = "ReCodex";
+// manager 已弃用(方案A),保留常量仅为兼容旧快捷方式清理
+pub const MANAGER_NAME: &str = "ReCodex 管理工具";
 pub const SILENT_BINARY: &str = "codex-plus-plus";
 pub const MANAGER_BINARY: &str = "codex-plus-plus-manager";
 pub const SILENT_BUNDLE_ID: &str = "com.bigpizzav3.codexplusplus";
@@ -76,11 +77,11 @@ impl ShortcutState {
 }
 
 pub fn shortcut_names() -> (&'static str, &'static str) {
-    ("Codex++.lnk", "Codex++ 管理工具.lnk")
+    ("ReCodex.lnk", "ReCodex 管理工具.lnk")
 }
 
 pub fn app_bundle_names() -> (&'static str, &'static str) {
-    ("Codex++.app", "Codex++ 管理工具.app")
+    ("ReCodex.app", "ReCodex 管理工具.app")
 }
 
 pub fn inspect_entrypoints() -> EntryPointState {
@@ -181,7 +182,7 @@ fn platform_install(options: &InstallOptions) -> anyhow::Result<()> {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = options;
-        anyhow::bail!("当前平台暂不支持安装 Codex++ 入口")
+        anyhow::bail!("当前平台暂不支持安装 ReCodex 入口")
     }
 }
 
@@ -199,7 +200,7 @@ fn platform_uninstall(options: &InstallOptions) -> anyhow::Result<()> {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = options;
-        anyhow::bail!("当前平台暂不支持卸载 Codex++ 入口")
+        anyhow::bail!("当前平台暂不支持卸载 ReCodex 入口")
     }
 }
 

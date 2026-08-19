@@ -580,7 +580,7 @@ fn apply_taskbar_properties(hwnd: HWND, icon_resource_path: &PathBuf) -> anyhow:
     set_property_string(
         &store,
         &PKEY_AppUserModel_RelaunchDisplayNameResource,
-        "Codex++",
+        "ReCodex",
     )?;
     set_property_string(
         &store,

@@ -2034,7 +2034,6 @@
       }
     }
     if (key === "stepwise") syncStepwisePanel(value);
-    renderCodexPlusMenu();
     scan();
   }
 
@@ -2076,19 +2075,6 @@
     const width = normalizeConversationViewWidth(value);
     if (!width) return;
     setCodexPlusSetting("conversationViewMaxWidth", width);
-  }
-
-  function renderCodexPlusMenu() {
-    const settings = codexPlusSettings();
-    document.querySelectorAll(".codex-plus-toggle[data-codex-plus-setting]").forEach((button) => {
-      const key = button.getAttribute("data-codex-plus-setting");
-      const waitsForBackend = codexPlusBackendMappedSettings.has(key) && !codexPlusBackendSettingsLoaded;
-      button.dataset.enabled = String(!!settings[key]);
-      button.dataset.pending = String(waitsForBackend);
-      button.disabled = waitsForBackend || button.dataset.relayUnneeded === "true";
-    });
-    refreshConversationViewControls();
-    refreshCodexServiceTierControls();
   }
 
   let codexPlusBackendSettings = { providerSyncEnabled: false, enhancementsEnabled: true, launchMode: "patch", codexAppVersion: "" };
@@ -3442,13 +3428,33 @@
     }
   }
 
+  // recodex-overlay: 暴露给悬浮 Rx 面板,让面板开关走与顶栏菜单相同的「内存更新→scan() 实时应用→持久化」路径
+  window.__codexPlusSetBackendSetting = (key, value) => setBackendSetting(key, value);
+  window.__codexPlusGetBackendSettings = () => ({ ...codexPlusBackendSettings });
+
+  // recodex-overlay: 面板还需要两类不在后端设置里的能力 ——
+  //  1) 客户端侧设置(如 conversationViewMaxWidth,没有后端键,存 localStorage)
+  //  2) 服务模式的四选一控制(继承/全局Standard/全局Fast/自定义)
+  // 统一从 renderer 暴露,避免面板去复刻这些逻辑。
+  window.__codexPlusSetSetting = (key, value) => setCodexPlusSetting(key, value);
+  window.__codexPlusGetSettings = () => ({ ...codexPlusSettings() });
+  window.__codexPlusServiceTier = {
+    get: () => ({
+      controlMode: codexServiceTierState.controlMode,
+      defaultMode: codexServiceTierState.defaultMode,
+      threadMode: codexServiceTierState.threadMode,
+      configServiceTier: codexServiceTierState.configServiceTier,
+      status: codexServiceTierState.status,
+    }),
+    setMode: (mode) => setCodexServiceTierControlMode(mode),
+  };
+
   function refreshCodexPlusBackendToggles() {
     document.querySelectorAll(".codex-plus-toggle[data-codex-backend-setting]").forEach((button) => {
       const key = button.getAttribute("data-codex-backend-setting");
       button.dataset.enabled = String(!!codexPlusBackendSettings[key]);
     });
     syncStepwisePanel();
-    renderCodexPlusMenu();
     scan();
   }
 
@@ -3464,7 +3470,7 @@
       label.dataset.codexPlusTriggerLabel = "true";
       trigger.appendChild(label);
     }
-    label.textContent = `Codex++ ${codexPlusVersion}`;
+    label.textContent = `ReCodex ${codexPlusVersion}`;
   }
 
   function ensureCodexPlusTriggerIndicator(trigger) {
@@ -3484,7 +3490,7 @@
     if (codexPlusBackendStatus.version) {
       codexPlusVersion = codexPlusBackendStatus.version;
       document.querySelectorAll("[data-codex-plus-version]").forEach((node) => {
-        node.textContent = `Codex++ ${codexPlusVersion}`;
+        node.textContent = `ReCodex ${codexPlusVersion}`;
       });
       document.querySelectorAll(`#${codexPlusMenuId} button`).forEach(setCodexPlusTriggerLabel);
     }
@@ -3579,112 +3585,14 @@
     }
   }
 
-  const codexPlusAdsUrl = "/ads";
-  let codexPlusAds = [];
-  let codexPlusAdsLoaded = false;
-
   function isCodexPlusAdExpired(ad) {
     if (!ad.expires_at) return false;
     const expiresAt = Date.parse(ad.expires_at);
     return Number.isFinite(expiresAt) && expiresAt < Date.now();
   }
 
-  function normalizeCodexPlusAds(payload) {
-    if (!payload || !Array.isArray(payload.ads)) return [];
-    return payload.ads.filter((ad) => {
-      return ad && ["sponsor", "normal"].includes(ad.type) && ad.title && ad.description && ad.url && !isCodexPlusAdExpired(ad);
-    }).map((ad) => ({
-      id: String(ad.id || ad.title),
-      type: ad.type,
-      title: String(ad.title),
-      description: String(ad.description),
-      url: String(ad.url),
-      image: ad.image ? String(ad.image) : "",
-      expires_at: ad.expires_at ? String(ad.expires_at) : "",
-      highlights: Array.isArray(ad.highlights) ? ad.highlights.map((item) => String(item)).filter(Boolean) : [],
-    }));
-  }
-
-  function formatCodexPlusAdTitle(title) {
-    const value = String(title || "");
-    return value.split(/[｜|]/, 1)[0].trim() || value;
-  }
-
-  function renderCodexPlusAdGroup(type, emptyText) {
-    const ads = codexPlusAds.filter((ad) => ad.type === type);
-    if (!ads.length) return `<div class="codex-plus-ad-empty">${escapeHtml(emptyText)}</div>`;
-    return ads.map((ad) => `
-      <article class="codex-plus-ad-card">
-        ${ad.image ? `<img class="codex-plus-ad-image" src="${escapeHtml(ad.image)}" alt="">` : ""}
-        <div class="codex-plus-ad-content">
-          <h3 class="codex-plus-ad-title">${escapeHtml(formatCodexPlusAdTitle(ad.title))}</h3>
-          <p class="codex-plus-ad-description">${escapeHtml(ad.description)}</p>
-          <div class="codex-plus-ad-highlights">
-            ${ad.highlights.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
-          </div>
-          <a class="codex-plus-ad-link" href="${escapeHtml(ad.url)}" target="_blank" rel="noreferrer">访问 ${escapeHtml(new URL(ad.url).hostname)}</a>
-        </div>
-      </article>
-    `).join("");
-  }
-
-  function renderCodexPlusAds() {
-    if (!codexPlusAdsLoaded) return `<div class="codex-plus-ad-empty">推荐内容加载中…</div>`;
-    if (!codexPlusAds.length) return `<div class="codex-plus-ad-empty">暂无推荐内容。</div>`;
-    return `
-      <section class="codex-plus-ad-section">
-        <h3 class="codex-plus-ad-section-title">赞助商推荐</h3>
-        <div class="codex-plus-ad-list">${renderCodexPlusAdGroup("sponsor", "暂无赞助商推荐。")}</div>
-      </section>
-      <section class="codex-plus-ad-section">
-        <h3 class="codex-plus-ad-section-title">普通推荐</h3>
-        <div class="codex-plus-ad-list">${renderCodexPlusAdGroup("normal", "暂无普通推荐。")}</div>
-      </section>
-    `;
-  }
-
   function cacheBustCodexPlusAdUrl(url, version) {
     return `${url}${url.includes("?") ? "&" : "?"}v=${version}`;
-  }
-
-  async function directFetchCodexPlusAds() {
-    const urls = [
-      "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
-      "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
-    ];
-    let lastError = null;
-    const cacheBust = Date.now();
-    for (const url of urls) {
-      try {
-        const response = await fetch(cacheBustCodexPlusAdUrl(url, cacheBust), {
-          headers: { "Accept": "application/json" },
-          cache: "no-store",
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    throw lastError || new Error("ad list unavailable");
-  }
-
-  async function fetchCodexPlusAds() {
-    try {
-      const localPayload = await postJson(codexPlusAdsUrl, {});
-      codexPlusAds = normalizeCodexPlusAds(localPayload?.ads ? localPayload : localPayload?.payload);
-      if (!codexPlusAds.length) codexPlusAds = normalizeCodexPlusAds(await directFetchCodexPlusAds());
-    } catch (error) {
-      sendCodexPlusDiagnostic("ads_fetch_failed", {
-        errorName: error?.name || "",
-        errorMessage: error?.message || String(error),
-      });
-      codexPlusAds = [];
-    } finally {
-      codexPlusAdsLoaded = true;
-      const panel = document.querySelector('[data-codex-plus-panel="sponsor"] .codex-plus-ad-remote');
-      if (panel) panel.innerHTML = renderCodexPlusAds();
-    }
   }
 
   function selectCodexPlusTab(tab) {
@@ -3700,343 +3608,6 @@
     if (tab === "userScripts") loadUserScripts();
   }
 
-  function openCodexPlusModal() {
-    document.querySelectorAll(".codex-plus-modal-overlay").forEach((node) => node.remove());
-    document.querySelectorAll('[data-codex-plus-dialog="true"]').forEach((node) => node.remove());
-    const overlay = document.createElement("div");
-    overlay.className = "codex-plus-modal-overlay";
-    overlay.innerHTML = `
-      <div class="codex-plus-modal-content" role="dialog" aria-modal="true" aria-label="Codex++">
-        <div class="codex-plus-modal-header">
-          <div class="codex-plus-modal-title"><span class="codex-plus-backend-indicator" data-codex-backend-indicator="true" data-status="checking"></span><span data-codex-plus-version="true">Codex++ ${codexPlusVersion}</span></div>
-          <button type="button" class="codex-plus-modal-close" aria-label="关闭">×</button>
-        </div>
-        <div class="codex-plus-tabs" role="tablist" aria-label="Codex++">
-          <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="home" data-active="true">主页</button>
-          <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="userScripts" data-active="false">用户脚本</button>
-          <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="sponsor" data-active="false">推荐内容</button>
-        </div>
-        <div class="codex-plus-modal-body">
-          <div class="codex-plus-panel" data-codex-plus-panel="home">
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">后端连接</div><div class="codex-plus-row-description">每 5 秒检查一次 launcher 后端状态。</div></div>
-              <div class="codex-plus-backend-status">
-                <div class="codex-plus-backend-label" data-codex-backend-status="true" data-status="checking">正在检查后端…</div>
-              </div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Codex增强</div><div class="codex-plus-row-description">关闭后停用删除、导出、插件相关和菜单位置增强。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-backend-setting="enhancementsEnabled"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">插件市场解锁</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强模式下无需开启；ChatGPT 登录态会保留官方插件市场。" : "API Key 模式下扩展插件市场请求，尽量显示完整插件列表。"}</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pluginMarketplaceUnlock" ${codexPlusBackendSettings.launchMode === "relay" ? 'disabled data-relay-unneeded="true"' : ""}><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">模型白名单解锁</div><div class="codex-plus-row-description">从环境变量和 Codex config.toml 中的中转站 /v1/models 拉取模型，并补进模型选择列表。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="modelWhitelistUnlock"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Fast 按钮</div><div class="codex-plus-row-description">显示服务模式切换按钮；Fast 仅支持 ${codexServiceTierFastModelListLabel()}，其他模型按 Standard 发送。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="serviceTierControls"><span></span></button>
-            </div>
-            ${codexPlusIsWindowsPlatform ? `<div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">桌宠跟随真实鼠标</div><div class="codex-plus-row-description">仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="petRealMouseLook"><span></span></button>
-            </div>` : ""}
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Stepwise</div><div class="codex-plus-row-description">在当前 Codex 页面显示可拖动的下一步建议浮层，可在设置页配置模型和直接发送。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
-            </div>
-            <div class="codex-plus-row" data-codex-service-tier-controls="true">
-              <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承优先读取 Codex 应用内设置，其次读取 config.toml 的 service_tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
-              <div class="codex-plus-service-tier-control">
-                <div class="codex-plus-service-tier-status" data-codex-service-tier-status="true" data-status="loading">正在读取…</div>
-                <div class="codex-plus-service-tier-actions">
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-inherit="true">继承</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-standard="true">全局 Standard</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-fast="true">全局 Fast</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-custom="true">自定义</button>
-                </div>
-                <div class="codex-plus-service-tier-actions codex-plus-service-tier-thread-actions">
-                  <span class="codex-plus-service-tier-thread-label">当前 thread 覆盖</span>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-inherit="true" title="当前 thread 不单独覆盖，继承 Codex 默认设置">继承</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-standard="true" title="仅当前 thread 使用 Standard，并切到自定义模式">Standard</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-fast="true" title="仅当前 thread 使用 Fast，并切到自定义模式">Fast</button>
-                </div>
-              </div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">会话删除</div><div class="codex-plus-row-description">在会话列表悬停显示删除按钮，并支持撤销。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="sessionDelete"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Markdown 导出</div><div class="codex-plus-row-description">在会话列表显示导出按钮，按本地 rollout 导出带时间戳的 Markdown。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="markdownExport"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">粘贴修复</div><div class="codex-plus-row-description">从 Word 等富文本来源粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pasteFix"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">会话 ID 标识</div><div class="codex-plus-row-description">在侧边栏会话标题前显示短 ID 和 UUIDv7 创建时间，方便定位历史会话。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="threadIdBadge"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">对话居中宽度</div><div class="codex-plus-row-description">开启后把主对话和输入框限制到固定最大宽度，适合大屏阅读。</div></div>
-              <div class="codex-plus-width-control">
-                <input class="codex-plus-width-input" data-codex-plus-conversation-view-width="true" min="${conversationViewMinWidth}" max="${conversationViewMaxAllowedWidth}" step="10" type="number" value="${conversationViewWidth()}">
-                <button type="button" class="codex-plus-toggle" data-codex-plus-setting="conversationView"><span></span></button>
-              </div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">切换对话保留位置</div><div class="codex-plus-row-description">开启后在不同 thread 之间切换时恢复到上一次浏览位置，不再自动跳到底部。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="threadScrollRestore"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Zed Remote open</div><div class="codex-plus-row-description">Open supported remote SSH file references in Zed without patching Codex.app.</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="zedRemoteOpen"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Upstream worktree</div><div class="codex-plus-row-description">Create a Git worktree from a fresh upstream branch, equivalent to git worktree add -b branch path upstream/base.</div></div>
-              <div class="codex-plus-worktree-actions">
-                <button type="button" class="codex-plus-action-button" data-codex-upstream-worktree-open="true">创建</button>
-                <button type="button" class="codex-plus-toggle" data-codex-plus-setting="upstreamWorktreeCreate"><span></span></button>
-              </div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">历史会话修复</div><div class="codex-plus-row-description">切换官方登录、混合 API 或纯 API 后，让旧对话重新显示在当前模式下。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-backend-setting="providerSyncEnabled"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">页面增强模式</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强：保留会话删除、导出和用户脚本，仅关闭插件市场相关增强。" : "完整增强：加载插件市场、会话管理等全部页面能力。"}</div></div>
-              <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">原生菜单栏位置</div><div class="codex-plus-row-description">把 Codex++ 菜单插入顶部原生菜单栏；默认关闭以避免页面重渲染冲突。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="nativeMenuPlacement"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">打开 DevTools</div><div class="codex-plus-row-description">打开当前 Codex 页面开发者工具，方便查看用户脚本报错。</div></div>
-              <button type="button" class="codex-plus-action-button" data-codex-open-devtools="true">打开 DevTools</button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">关于 Codex++</div><div class="codex-plus-about">Codex++ 是通过外部 launcher 注入的增强菜单，不修改 Codex App 原始安装文件。<br>Build: <span data-codex-plus-build="true">${codexPlusBuild}</span><br>GitHub: <a href="https://github.com/BigPizzaV3/CodexPlusPlus" target="_blank" rel="noreferrer">https://github.com/BigPizzaV3/CodexPlusPlus</a><br>Discord: <a href="https://discord.gg/y96kX7A76v" target="_blank" rel="noreferrer">https://discord.gg/y96kX7A76v</a><br>Telegram: <a href="https://t.me/CodexPlusPlus" target="_blank" rel="noreferrer">https://t.me/CodexPlusPlus</a></div></div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Discord 社区</div><div class="codex-plus-row-description">加入 Discord 获取更新消息、反馈问题或交流使用体验。</div></div>
-              <button type="button" class="codex-plus-action-button" data-codex-plus-discord="true">打开 Discord</button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Telegram 频道</div><div class="codex-plus-row-description">加入 Telegram 获取更新消息和交流使用体验。</div></div>
-              <button type="button" class="codex-plus-action-button" data-codex-plus-telegram="true">打开 Telegram</button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">提出问题</div><div class="codex-plus-row-description">打开 GitHub Issues 反馈问题或建议。</div></div>
-              <button type="button" class="codex-plus-issue-button" data-codex-plus-issue="true">提出问题</button>
-            </div>
-          </div>
-          <div class="codex-plus-panel" data-codex-plus-panel="userScripts" hidden>
-            <div class="codex-plus-row" data-codex-user-scripts-section="true">
-              <div>
-                <div class="codex-plus-row-title">用户脚本</div>
-                <div class="codex-plus-row-description">启用用户脚本：自动加载内置目录和用户配置目录中的 .js 文件。</div>
-                <div class="codex-plus-user-script-warning">禁用后需重载页面或重启 Codex++ 才能完全移除已执行效果。</div>
-                <div class="codex-plus-user-script-dirs" data-codex-user-script-dirs="true">正在读取脚本目录…</div>
-                <div class="codex-plus-user-script-list" data-codex-user-script-list="true">正在读取用户脚本…</div>
-              </div>
-              <div class="codex-plus-user-script-actions">
-                <button type="button" class="codex-plus-toggle" data-codex-user-scripts-enabled="true"><span></span></button>
-                <button type="button" class="codex-plus-user-script-reload" data-codex-user-scripts-reload="true">重新加载用户脚本</button>
-              </div>
-            </div>
-          </div>
-          <div class="codex-plus-panel" data-codex-plus-panel="sponsor" hidden>
-            <div class="codex-plus-sponsor-text">推荐内容分为赞助商推荐和普通推荐。赞助商推荐来自支持 Codex++ 继续维护的合作方；普通推荐用于展示适合 Codex 用户的服务与信息。</div>
-            <div class="codex-plus-ad-remote">
-              ${renderCodexPlusAds()}
-            </div>
-          </div>
-        </div>
-      </div>
-    `;
-    const closeButton = overlay.querySelector(".codex-plus-modal-close");
-    closeButton?.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      overlay.remove();
-    }, true);
-    overlay.addEventListener("input", (event) => {
-      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      const widthInput = target?.closest("[data-codex-plus-conversation-view-width]");
-      if (widthInput) setConversationViewWidth(widthInput.value);
-    }, true);
-    overlay.addEventListener("change", (event) => {
-      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      const widthInput = target?.closest("[data-codex-plus-conversation-view-width]");
-      if (widthInput) {
-        const width = normalizeConversationViewWidth(widthInput.value);
-        widthInput.value = String(width || conversationViewWidth());
-        setConversationViewWidth(widthInput.value);
-      }
-    }, true);
-    overlay.addEventListener("click", (event) => {
-      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      if (event.target === overlay || target?.closest(".codex-plus-modal-close")) {
-        overlay.remove();
-        return;
-      }
-      const tabButton = target?.closest("[data-codex-plus-tab]");
-      if (tabButton) {
-        selectCodexPlusTab(tabButton.getAttribute("data-codex-plus-tab"));
-        return;
-      }
-      if (target?.closest("[data-codex-open-devtools]")) {
-        postJson("/devtools/open", {});
-        return;
-      }
-      if (target?.closest("[data-codex-open-manager]")) {
-        openManagerFromCodex();
-        return;
-      }
-      if (target?.closest("[data-codex-plus-discord]")) {
-        window.open("https://discord.gg/y96kX7A76v", "_blank");
-        return;
-      }
-      if (target?.closest("[data-codex-plus-telegram]")) {
-        window.open("https://t.me/CodexPlusPlus", "_blank");
-        return;
-      }
-      const issueButton = target?.closest("[data-codex-plus-issue]");
-      if (issueButton) {
-        const issueUrl = "https://github.com/BigPizzaV3/CodexPlusPlus/issues";
-        window.open(issueUrl, "_blank");
-        return;
-      }
-      const userScriptsEnabled = target?.closest("[data-codex-user-scripts-enabled]");
-      if (userScriptsEnabled) {
-        loadUserScripts("/user-scripts/set-enabled", { enabled: userScriptsEnabled.dataset.enabled !== "true" });
-        return;
-      }
-      if (target?.closest("[data-codex-service-tier-inherit]")) {
-        setCodexServiceTierControlMode("inherit");
-        return;
-      }
-      if (target?.closest("[data-codex-service-tier-standard]")) {
-        setCodexServiceTierControlMode("global-standard");
-        return;
-      }
-      if (target?.closest("[data-codex-service-tier-fast]")) {
-        setCodexServiceTierControlMode("global-fast");
-        return;
-      }
-      if (target?.closest("[data-codex-service-tier-custom]")) {
-        setCodexServiceTierControlMode("custom");
-        return;
-      }
-      if (target?.closest("[data-codex-service-tier-thread-inherit]")) {
-        setCodexThreadServiceTierMode("inherit");
-        return;
-      }
-      if (target?.closest("[data-codex-service-tier-thread-standard]")) {
-        setCodexThreadServiceTierMode("standard");
-        return;
-      }
-      if (target?.closest("[data-codex-service-tier-thread-fast]")) {
-        setCodexThreadServiceTierMode("fast");
-        return;
-      }
-      const userScriptToggle = target?.closest("[data-codex-user-script-key]");
-      if (userScriptToggle) {
-        loadUserScripts("/user-scripts/set-script-enabled", { key: userScriptToggle.getAttribute("data-codex-user-script-key"), enabled: userScriptToggle.dataset.enabled !== "true" });
-        return;
-      }
-      if (target?.closest("[data-codex-user-scripts-reload]")) {
-        loadUserScripts("/user-scripts/reload", {});
-        return;
-      }
-      if (target?.closest("[data-codex-upstream-worktree-open]")) {
-        if (!codexPlusSettings().upstreamWorktreeCreate) {
-          showToast("Upstream worktree enhancement is disabled", null);
-          return;
-        }
-        openUpstreamWorktreeDialog();
-        return;
-      }
-      const toggle = target?.closest("[data-codex-plus-setting]");
-      if (toggle) {
-        if (toggle.disabled || toggle.dataset.pending === "true") return;
-        const key = toggle.getAttribute("data-codex-plus-setting");
-        setCodexPlusSetting(key, !codexPlusSettings()[key]);
-        return;
-      }
-      const backendToggle = target?.closest("[data-codex-backend-setting]");
-      if (backendToggle) {
-        const key = backendToggle.getAttribute("data-codex-backend-setting");
-        setBackendSetting(key, !codexPlusBackendSettings[key]);
-        return;
-      }
-    }, true);
-    document.body.appendChild(overlay);
-    if (!codexPlusAdsLoaded) fetchCodexPlusAds();
-    selectCodexPlusTab("home");
-    renderCodexPlusMenu();
-    refreshCodexPlusBackendToggles();
-    renderBackendStatus();
-    void loadCodexServiceTierState();
-    loadUserScripts();
-  }
-
-  function findNativeMenuInsertionPoint() {
-    if (!codexPlusSettings().nativeMenuPlacement) return null;
-    const header = document.querySelector(selectors.appHeader);
-    const isIconOnlyButton = (button) => String(button.className || "").includes("aspect-square");
-    const menuBar = Array.from(header?.querySelectorAll?.(selectors.nativeMenuBar) || [])
-      .find((node) => {
-        const rect = node.getBoundingClientRect();
-        return !node.closest(".invisible") && rect.width > 0 && rect.height > 0;
-      });
-    if (menuBar) {
-      const buttons = Array.from(menuBar.querySelectorAll("button")).filter((button) => !button.closest(`#${codexPlusMenuId}`));
-      if (buttons.length && buttons.every(isIconOnlyButton)) return null;
-      const openLocationButton = buttons.find((button) => /^(打开位置|Open location)$/i.test(button.getAttribute("aria-label") || ""));
-      const openLocationGroup = openLocationButton?.closest?.(".inline-flex.self-start.items-stretch.overflow-hidden.rounded-lg");
-      const openLocationIndex = buttons.indexOf(openLocationButton);
-      const nativeButtonClass = openLocationButton
-        ? buttons[openLocationIndex + 1]?.className || openLocationButton.className || ""
-        : buttons[buttons.length - 1]?.className || "";
-      if (openLocationGroup?.parentElement === menuBar) return { parent: menuBar, before: openLocationGroup, nativeButtonClass };
-      if (openLocationGroup?.parentElement?.parentElement === menuBar) return { parent: menuBar, before: openLocationGroup.parentElement, nativeButtonClass };
-      return { parent: menuBar, before: buttons[buttons.length - 1]?.nextSibling || null, nativeButtonClass: buttons[buttons.length - 1]?.className || "" };
-    }
-    const contextSurface = header?.querySelector(selectors.headerContextMenuSurface);
-    const buttons = Array.from(contextSurface?.querySelectorAll?.("button") || [])
-      .filter((button) => !button.closest(`#${codexPlusMenuId}`) && button.getBoundingClientRect().width > 0 && button.getBoundingClientRect().height > 0);
-    if (buttons.length && buttons.every(isIconOnlyButton)) return null;
-    const nativeButton = buttons.find((button) => !button.parentElement?.classList?.contains("inline-flex")) || buttons[0];
-    const parent = nativeButton?.parentElement;
-    if (!parent) {
-      const emptyButtonGroup = Array.from(contextSurface?.querySelectorAll?.("div") || [])
-        .find((node) => {
-          const className = String(node.className || "");
-          return className.includes("items-center") && className.includes("gap-2");
-        });
-      return emptyButtonGroup ? { parent: emptyButtonGroup, before: emptyButtonGroup.firstChild, nativeButtonClass: headerIconTextButtonClass } : null;
-    }
-    return { parent, before: nativeButton, nativeButtonClass: nativeButton.className || "" };
-  }
-
-  function removeDuplicateCodexPlusMenus(keep) {
-    document.querySelectorAll(`#${codexPlusMenuId}, [data-codex-plus-menu="true"]`).forEach((node) => {
-      if (node !== keep) node.remove();
-    });
-    Array.from(document.querySelectorAll("button")).forEach((button) => {
-      if ((button.textContent || "").trim() === `Codex++ ${codexPlusVersion}` && !button.closest(`#${codexPlusMenuId}`)) {
-        button.remove();
-      }
-    });
-  }
-
   function normalizeCodexPlusTriggerClassName(className) {
     const classes = String(className || "").split(/\s+/).filter(Boolean);
     const incompatibleNativeGroupClasses = new Set(["gap-0", "rounded-l-none", "border-l-0", "pl-0.5", "pr-1.5"]);
@@ -4048,25 +3619,6 @@
       });
     }
     return normalized.join(" ");
-  }
-
-  function configureCodexPlusTrigger(menu, trigger, nativeButtonClass) {
-    if (!trigger) return;
-    if (nativeButtonClass) trigger.className = normalizeCodexPlusTriggerClassName(nativeButtonClass);
-    if (!trigger.querySelector(".codex-plus-backend-indicator")) {
-      const indicator = document.createElement("span");
-      indicator.className = "codex-plus-backend-indicator";
-      indicator.dataset.codexBackendIndicator = "true";
-      indicator.dataset.status = codexPlusBackendStatus.status || "checking";
-      trigger.prepend(indicator);
-    }
-    if (trigger.dataset.codexPlusTriggerInstalled === "5") return;
-    trigger.dataset.codexPlusTriggerInstalled = "5";
-    trigger.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      openCodexPlusModal();
-    }, true);
   }
 
   function numericCssValue(value) {
@@ -4097,86 +3649,6 @@
     const titleRegion = headerTitleRegion(header);
     if (titleRegion?.contains?.(button)) return false;
     return !!button.closest?.('[class*="ms-auto"][class*="shrink-0"][class*="items-center"]');
-  }
-
-  function updateFloatingCodexPlusMenuPosition(menu) {
-    if (!menu?.classList?.contains(codexPlusMenuFloatingClass)) return;
-    const header = document.querySelector(selectors.appHeader);
-    if (!header) return;
-    const toolbarButtons = Array.from(header.querySelectorAll("button"))
-      .map((button) => ({ button, rect: button.getBoundingClientRect() }))
-      .filter(({ button, rect }) => isHeaderToolbarButton(button, header, rect))
-      .sort((left, right) => left.rect.left - right.rect.left);
-    const anchor = toolbarButtons[0];
-    if (anchor) {
-      const measuredGap = toolbarButtons[1] ? toolbarButtons[1].rect.left - toolbarButtons[0].rect.right : 0;
-      const styles = anchor.button.parentElement ? getComputedStyle(anchor.button.parentElement) : null;
-      const gap = Math.max(numericCssValue(styles?.columnGap || styles?.gap), measuredGap, 0);
-      setCssPropIfChanged(menu, "--codex-plus-menu-top", `${anchor.rect.top}px`);
-      setCssPropIfChanged(menu, "--codex-plus-menu-height", `${anchor.rect.height}px`);
-      setCssPropIfChanged(menu, "--codex-plus-menu-right", `${Math.max(0, window.innerWidth - anchor.rect.left + gap)}px`);
-      return;
-    }
-
-    const headerRect = header.getBoundingClientRect();
-    if (headerRect.height) {
-      const isApplicationMenuTopBar = header.matches?.('[class*="ApplicationMenuTopBar"]');
-      setCssPropIfChanged(menu, "--codex-plus-menu-top", `${isApplicationMenuTopBar ? Math.max(4, headerRect.top) : headerRect.top}px`);
-      setCssPropIfChanged(menu, "--codex-plus-menu-height", `${isApplicationMenuTopBar ? 28 : headerRect.height}px`);
-    }
-    menu.style.removeProperty("--codex-plus-menu-right");
-  }
-
-  function installCodexPlusMenu() {
-    const existing = document.getElementById(codexPlusMenuId);
-    removeDuplicateCodexPlusMenus(existing);
-    let insertionPoint = findNativeMenuInsertionPoint();
-    if (existing && existing.dataset.codexPlusMenuVersion !== "6") {
-      existing.remove();
-      insertionPoint = findNativeMenuInsertionPoint();
-    } else if (existing && insertionPoint && existing.parentElement === insertionPoint.parent) {
-      configureCodexPlusTrigger(existing, existing.querySelector("button"), insertionPoint.nativeButtonClass);
-      const safeBefore = insertionPoint.before?.parentElement === insertionPoint.parent ? insertionPoint.before : null;
-      if (existing.nextSibling !== safeBefore) insertionPoint.parent.insertBefore(existing, safeBefore);
-      removeDuplicateCodexPlusMenus(existing);
-      return;
-    } else if (existing && insertionPoint) {
-      configureCodexPlusTrigger(existing, existing.querySelector("button"), insertionPoint.nativeButtonClass);
-      existing.className = "";
-      const safeBefore = insertionPoint.before?.parentElement === insertionPoint.parent ? insertionPoint.before : null;
-      insertionPoint.parent.insertBefore(existing, safeBefore);
-      removeDuplicateCodexPlusMenus(existing);
-      return;
-    } else if (existing) {
-      configureCodexPlusTrigger(existing, existing.querySelector("button"), headerIconTextButtonClass);
-      existing.className = codexPlusMenuFloatingClass;
-      document.documentElement.appendChild(existing);
-      updateFloatingCodexPlusMenuPosition(existing);
-      removeDuplicateCodexPlusMenus(existing);
-      return;
-    }
-    const menu = document.createElement("div");
-    menu.id = codexPlusMenuId;
-    menu.dataset.codexPlusMenu = "true";
-    menu.dataset.codexPlusMenuVersion = "6";
-    const trigger = document.createElement("button");
-    trigger.type = "button";
-    const indicator = ensureCodexPlusTriggerIndicator(trigger);
-    if (indicator) indicator.dataset.status = codexPlusBackendStatus.status || "checking";
-    setCodexPlusTriggerLabel(trigger);
-    const nativeButtonClass = insertionPoint?.nativeButtonClass || headerIconTextButtonClass;
-    configureCodexPlusTrigger(menu, trigger, nativeButtonClass);
-    menu.appendChild(trigger);
-    if (insertionPoint) {
-      menu.className = "";
-      const safeBefore = insertionPoint.before?.parentElement === insertionPoint.parent ? insertionPoint.before : null;
-      insertionPoint.parent.insertBefore(menu, safeBefore);
-    } else {
-      menu.className = codexPlusMenuFloatingClass;
-      document.documentElement.appendChild(menu);
-      updateFloatingCodexPlusMenuPosition(menu);
-    }
-    removeDuplicateCodexPlusMenus(menu);
   }
 
   const codexPluginRemoteOnlyMarketplaceKinds = new Set(["created-by-me-remote", "shared-with-me"]);
@@ -6082,7 +5554,6 @@
           }
         }
         codexModelCatalogLoadedAt = Date.now();
-        renderCodexPlusMenu();
         scheduleCodexModelWhitelistRefresh();
         return codexModelCatalog;
       })
@@ -8600,7 +8071,6 @@
         "existing-renderer"
       );
     }
-    installCodexPlusMenu();
     localizeCodexMenus();
     scheduleBackendHeartbeat();
     installDeleteButtonEventDelegation();

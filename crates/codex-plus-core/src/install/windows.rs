@@ -5,9 +5,13 @@ use super::{
     install_root_or_default, option_or_current_exe,
 };
 
-const UNINSTALL_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexPlusPlus";
-const LEGACY_UNINSTALL_SUBKEY: &str =
-    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex++";
+// recodex-overlay: 卸载项改名 ReCodex。历史上用过 `Codex++`(更早)与 `CodexPlusPlus`(上一代),
+// 升级时两个都要清掉,否则控制面板里会留下重复条目。
+const UNINSTALL_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ReCodex";
+const LEGACY_UNINSTALL_SUBKEYS: [&str; 2] = [
+    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexPlusPlus",
+    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex++",
+];
 const URL_PROTOCOL_SUBKEY: &str = r"Software\Classes\codexplusplus";
 const DREAM_SKIN_URL_PROTOCOL_SUBKEY: &str = r"Software\Classes\dreamskin";
 
@@ -43,11 +47,11 @@ pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> WindowsEntrypo
     let quiet_uninstall_command = format!("{uninstall_command} /S");
     WindowsEntrypointPlan {
         silent_shortcut: install_root
-            .join("Codex++.lnk")
+            .join("ReCodex.lnk")
             .to_string_lossy()
             .to_string(),
         manager_shortcut: install_root
-            .join("Codex++ 管理工具.lnk")
+            .join("ReCodex 管理工具.lnk")
             .to_string_lossy()
             .to_string(),
         install_root: install_root.to_string_lossy().to_string(),
@@ -59,8 +63,8 @@ pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> WindowsEntrypo
         uninstaller_path: uninstaller_path.to_string_lossy().to_string(),
         uninstall_command,
         quiet_uninstall_command,
-        uninstall_key: "CodexPlusPlus".to_string(),
-        legacy_uninstall_key: "Codex++".to_string(),
+        uninstall_key: "ReCodex".to_string(),
+        legacy_uninstall_key: "CodexPlusPlus".to_string(),
         remove_owned_data: options.remove_owned_data,
     }
 }
@@ -73,13 +77,13 @@ pub fn install_shortcuts(options: &InstallOptions) -> anyhow::Result<()> {
     create_entrypoint_shortcut(
         PathBuf::from(&plan.silent_shortcut),
         PathBuf::from(&plan.launcher_path),
-        "Launch Codex++ silently",
+        "Launch ReCodex silently",
         PathBuf::from(&plan.silent_icon_path),
     )?;
     create_entrypoint_shortcut(
         PathBuf::from(&plan.manager_shortcut),
         PathBuf::from(&plan.manager_path),
-        "Open Codex++ management tool",
+        "Open ReCodex management tool",
         PathBuf::from(&plan.manager_icon_path),
     )?;
     register_url_protocol(&plan.manager_path)?;
@@ -112,7 +116,9 @@ pub fn uninstall_shortcuts(options: &InstallOptions) -> anyhow::Result<()> {
         r"{DREAM_SKIN_URL_PROTOCOL_SUBKEY}\shell"
     ));
     let _ = crate::windows_integration::delete_current_user_key(DREAM_SKIN_URL_PROTOCOL_SUBKEY);
-    let _ = crate::windows_integration::delete_current_user_key(LEGACY_UNINSTALL_SUBKEY);
+    for key in LEGACY_UNINSTALL_SUBKEYS {
+        let _ = crate::windows_integration::delete_current_user_key(key);
+    }
     let _ = crate::windows_integration::delete_current_user_key(UNINSTALL_SUBKEY);
     Ok(())
 }
@@ -147,7 +153,9 @@ fn create_entrypoint_shortcut(
 
 #[cfg(windows)]
 fn write_uninstall_registration(plan: &WindowsEntrypointPlan) -> anyhow::Result<()> {
-    let _ = crate::windows_integration::delete_current_user_key(LEGACY_UNINSTALL_SUBKEY);
+    for key in LEGACY_UNINSTALL_SUBKEYS {
+        let _ = crate::windows_integration::delete_current_user_key(key);
+    }
     let install_location = Path::new(&plan.manager_path)
         .parent()
         .map(Path::to_path_buf)
@@ -155,7 +163,7 @@ fn write_uninstall_registration(plan: &WindowsEntrypointPlan) -> anyhow::Result<
         .to_string_lossy()
         .to_string();
     for (name, value) in [
-        ("DisplayName", "Codex++".to_string()),
+        ("DisplayName", "ReCodex".to_string()),
         ("DisplayVersion", crate::version::VERSION.to_string()),
         ("Publisher", "BigPizzaV3".to_string()),
         ("DisplayIcon", plan.manager_icon_path.clone()),
@@ -172,7 +180,7 @@ fn write_uninstall_registration(plan: &WindowsEntrypointPlan) -> anyhow::Result<
 fn register_url_protocol(manager_path: &str) -> anyhow::Result<()> {
     register_url_protocol_key(
         URL_PROTOCOL_SUBKEY,
-        "URL:Codex++ Import Protocol",
+        "URL:ReCodex Import Protocol",
         manager_path,
     )?;
     register_url_protocol_key(

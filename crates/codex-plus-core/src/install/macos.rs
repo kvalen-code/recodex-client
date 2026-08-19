@@ -198,7 +198,7 @@ fn info_plist(display_name: &str, executable_name: &str, identifier_suffix: &str
   <array>
     <dict>
       <key>CFBundleURLName</key>
-      <string>Codex++ Links</string>
+      <string>ReCodex Links</string>
       <key>CFBundleURLSchemes</key>
       <array>
         <string>codexplusplus</string>

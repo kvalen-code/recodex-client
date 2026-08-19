@@ -1,8 +1,6 @@
-pub mod ads;
 pub mod app_paths;
 pub mod assets;
 pub mod bridge;
-pub mod ccs_import;
 pub mod cdp;
 pub mod codex_app_state;
 pub mod codex_home;
@@ -10,13 +8,6 @@ pub mod codex_local_storage;
 pub mod codex_sqlite;
 pub mod connect;
 pub mod diagnostic_log;
-pub mod dream_skin;
-pub mod dream_skin_community;
-pub mod dream_skin_library;
-pub mod dream_skin_market;
-pub mod dream_skin_package;
-pub mod dream_skin_runtime;
-pub mod env_conflicts;
 pub mod http_client;
 pub mod install;
 pub mod launcher;
@@ -28,19 +19,16 @@ pub mod paths;
 pub mod plugin_marketplace;
 pub mod ports;
 pub mod protocol_proxy;
-pub mod provider_import;
-pub mod proxy;
 pub mod relay_config;
-pub mod relay_environment;
 pub mod relay_rotation;
-pub mod relay_switch;
 pub mod remote_control_recovery;
 pub mod routes;
 pub mod script_market;
+pub mod selfupdate; // recodex-overlay: 自更新
 pub mod settings;
 pub mod status;
-pub mod stepwise;
-pub mod sub2api;
+// recodex-overlay: Stepwise 已下线并删除
+pub mod uninstall; // recodex-overlay: 卸载流程
 pub mod update;
 pub mod upstream_worktree;
 pub mod user_scripts;

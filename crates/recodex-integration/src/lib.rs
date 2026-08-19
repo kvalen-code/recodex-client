@@ -1,6 +1,7 @@
 mod compatibility;
 pub mod codexcfg;
 pub mod desktop;
+pub mod officialmode; // recodex-overlay: 官方模式切换(可逆)
 pub mod credential;
 mod error;
 mod install_id;
