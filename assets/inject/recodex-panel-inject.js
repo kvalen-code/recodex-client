@@ -117,7 +117,7 @@
       "白名单(微信 user id,逗号分隔)": "白名單(微信 user id,逗號分隔)",
       "留空=不响应任何人": "留空=不回應任何人",
       "模型(留空=Codex 默认)": "模型(留空=Codex 預設)",
-      "ReCodex 桥未就绪": "ReCodex 橋未就緒", "设置没有生效,请重试": "設定沒有生效,請重試", "ReCodex 桥未响应": "ReCodex 橋沒有回應",
+      "ReCodex 桥未就绪": "ReCodex 橋未就緒", "设置没有生效,请重试": "設定沒有生效,請重試", "配置没有保存成功,请重试": "設定沒有儲存成功,請重試", "ReCodex 桥未响应": "ReCodex 橋沒有回應",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "未綁定微信。掃碼後可在微信裡直接指揮本機 Codex。",
       "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ 白名單為空:微信連線不會回應任何人。填入你的微信 ID,或填 * 放開所有人。",
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ 白名單為 *:任何人給該微信號發訊息都能在本機執行 Codex。",
@@ -190,7 +190,7 @@
       "白名单(微信 user id,逗号分隔)": "Белый список (user id WeChat, через запятую)",
       "留空=不响应任何人": "Пусто = никто не получит ответа",
       "模型(留空=Codex 默认)": "Модель (пусто = по умолчанию)",
-      "ReCodex 桥未就绪": "Мост ReCodex не готов", "设置没有生效,请重试": "Настройка не применилась, попробуйте ещё раз", "ReCodex 桥未响应": "Мост ReCodex не отвечает",
+      "ReCodex 桥未就绪": "Мост ReCodex не готов", "设置没有生效,请重试": "Настройка не применилась, попробуйте ещё раз", "配置没有保存成功,请重试": "Настройки не сохранились, попробуйте ещё раз", "ReCodex 桥未响应": "Мост ReCodex не отвечает",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "WeChat не привязан. После сканирования можно управлять Codex прямо из WeChat.",
       "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ Белый список пуст: бот никому не ответит. Укажите свой WeChat ID или * , чтобы разрешить всем.",
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ Белый список = *: любой, кто напишет боту, сможет запускать Codex на этом компьютере.",
@@ -744,12 +744,28 @@
     const saveBtn = c.querySelector("#wx-save");
     if (saveBtn) saveBtn.onclick = async () => {
       saveBtn.disabled = true; saveBtn.textContent = t("保存中…");
+      const want = {
+        workDir: c.querySelector("#wx-workdir").value.trim(),
+        sandbox: c.querySelector("#wx-sandbox").value,
+        allowFrom: c.querySelector("#wx-allow").value.trim(),
+        model: c.querySelector("#wx-model").value.trim(),
+      };
       await bridge("/settings/set", {
-        weixinConnectWorkDir: c.querySelector("#wx-workdir").value.trim(),
-        weixinConnectSandbox: c.querySelector("#wx-sandbox").value,
-        weixinConnectAllowFrom: c.querySelector("#wx-allow").value.trim(),
-        weixinConnectModel: c.querySelector("#wx-model").value.trim(),
+        weixinConnectWorkDir: want.workDir,
+        weixinConnectSandbox: want.sandbox,
+        weixinConnectAllowFrom: want.allowFrom,
+        weixinConnectModel: want.model,
       });
+      // 回读校验。这里**必须**较真:payload 里有白名单,写不进去却报「已保存」,
+      // 就是给用户一个虚假的安全感 —— 他以为只有自己能触发,实际谁都能。
+      const saved = ((await bridge("/weixin/status", {})) || {}).config || {};
+      const same = ["workDir", "sandbox", "allowFrom", "model"]
+        .every((key) => String(saved[key] || "") === String(want[key] || ""));
+      if (!same) {
+        saveBtn.disabled = false; saveBtn.textContent = t("保存配置");
+        wxNote(t("配置没有保存成功,请重试"), true);
+        return;
+      }
       if (!running) { saveBtn.textContent = t("已保存"); setTimeout(renderWeixin, 1200); return; }
       // 配置只在启动连接时读取,所以保存后必须重启;这里代劳,免得用户在
       // 「停止中」阶段点启动被静默拒掉(停止要等长轮询结束,最长约 35 秒)。
