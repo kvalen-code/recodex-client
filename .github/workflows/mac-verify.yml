@@ -21,7 +21,7 @@ jobs:
             target: aarch64-apple-darwin
     # 挂死要快速失败:第一次跑就因为钥匙串弹授权框卡了 76 分钟才被人发现,
     # 而 mac runner 按 10 倍计费、默认上限 6 小时。
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,10 @@ jobs:
           security default-keychain -s recodex-ci.keychain
 
       # 钥匙串那层只能在真 mac 上验:编得过但存不进 = 用户登不上
+      # 单独给这步设上限:上一次是整个 job 烧到 45 分钟才停,
+      # 从日志才看出挂在哪个测试。步骤级超时能直接把手指到那一步。
       - name: 测试(含钥匙串往返)
+        timeout-minutes: 35
         run: cargo test -p recodex-integration --target ${{ matrix.target }}
       - name: 构建
         run: cargo build --release --target ${{ matrix.target }} -p codex-plus-launcher

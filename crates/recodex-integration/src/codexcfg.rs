@@ -419,33 +419,53 @@ pub fn refresh_key_env_from_user_scope() -> bool {
     }
 }
 
-/// mac 侧「用户级环境变量」的替身。Windows 有 setx+注册表,mac 没有对应物;
-/// 这里存的又是密钥,所以复用凭据模块那套钥匙串,而不是自己造一个明文文件。
+/// mac 侧「用户级环境变量」的替身。Windows 有 setx+注册表,mac 没有对应物。
+///
+/// **不放钥匙串。** 第一版放了,结果 `apply_login` 整条配置写入都被耦合到钥匙串上:
+/// 任何把 HOME 指到别处的场景(测试沙箱、多用户)钥匙串解析就会阻塞,
+/// CI 上表现是某个测试挂死 46 分钟直到超时 —— 不是失败,是卡住。
+///
+/// 而且它本来也没换来更高的安全性:同一个 `apply_login` **已经**把
+/// `auth.json`(里面就是 ReCodex 的访问令牌)明文写进 `~/.codex/`,
+/// Windows 那边 `setx` 也是明文进注册表。所以这里用 0600 的文件,
+/// 与既有存储同一量级,而且和这个模块其余部分一样是 HOME 相对的。
 #[cfg(target_os = "macos")]
 mod mac_env {
-    use super::io;
-    use crate::credential::keychain;
+    use super::{codex_dir, io};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
-    /// 与登录令牌分开的 service,免得清理其中一个误删另一个。
-    const SERVICE: &str = "com.recodex.desktop/env";
-
-    fn unavailable(what: &str) -> io::Error {
-        io::Error::other(format!("keychain {what} failed"))
+    fn env_path(name: &str) -> io::Result<PathBuf> {
+        // 文件名跟着变量名走,免得以后多存一个键还要改结构
+        Ok(codex_dir()?.join("recodex").join(format!("{name}.env")))
     }
 
     pub(super) fn save(name: &str, value: &str) -> io::Result<()> {
-        keychain::set(SERVICE, name, value.as_bytes()).map_err(|_| unavailable("write"))
+        let path = env_path(name)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, value.as_bytes())?;
+        // 先写后改权限会有一瞬间是默认权限;这里内容是密钥,所以写完立刻收紧
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
     }
 
     pub(super) fn clear(name: &str) -> io::Result<()> {
-        keychain::delete(SERVICE, name).map_err(|_| unavailable("delete"))
+        match fs::remove_file(env_path(name)?) {
+            Ok(()) => Ok(()),
+            // 本来就没有 = 成功。清理要幂等,卸载会重复调用
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
-    /// 读不到就当没设过 —— 与 Windows 侧 `read_user_env_from_registry` 的语义一致。
+    /// 读不到就当没设过 —— 与 Windows 侧 `read_user_env_from_registry` 语义一致。
     pub(super) fn load(name: &str) -> Option<String> {
-        let bytes = keychain::get(SERVICE, name).ok().flatten()?;
-        let text = String::from_utf8(bytes).ok()?;
-        (!text.trim().is_empty()).then_some(text)
+        let text = fs::read_to_string(env_path(name).ok()?).ok()?;
+        let text = text.trim().to_owned();
+        (!text.is_empty()).then_some(text)
     }
 }
 
