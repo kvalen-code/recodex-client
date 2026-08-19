@@ -30,6 +30,10 @@
       "无法检查更新": "無法檢查更新", "正在下载…": "正在下載…", "更新失败": "更新失敗",
       "更新完成,正在重启…": "更新完成,正在重啟…", "返回": "返回", "最低版本": "最低版本",
       "当前版本已停止支持,必须更新后才能继续使用。": "目前版本已停止支援,必須更新後才能繼續使用。",
+      "当前版本已停止支持,但暂时没有可用的更新包。": "目前版本已停止支援,但暫時沒有可用的更新包。",
+      "请联系管理员,或稍后重新检查。": "請聯絡管理員,或稍後重新檢查。",
+      "你不在本次更新的推送名单内。": "你不在本次更新的推送名單內。",
+      "服务端尚未配置更新包。": "伺服器尚未設定更新包。",
       "卸载 ReCodex": "解除安裝 ReCodex", "确定卸载?此操作不可撤销:": "確定解除安裝?此操作無法復原:",
       "还原 Codex 配置并清除登录凭据": "還原 Codex 設定並清除登入憑據",
       "服务端吊销本设备": "伺服器端撤銷本裝置", "删除快捷方式与程序本体": "刪除捷徑與程式本體",
@@ -98,6 +102,10 @@
       "无法检查更新": "Не удалось проверить обновления", "正在下载…": "Загрузка…", "更新失败": "Ошибка обновления",
       "更新完成,正在重启…": "Обновление завершено, перезапуск…", "返回": "Назад", "最低版本": "Минимальная версия",
       "当前版本已停止支持,必须更新后才能继续使用。": "Эта версия больше не поддерживается — обновитесь, чтобы продолжить.",
+      "当前版本已停止支持,但暂时没有可用的更新包。": "Версия больше не поддерживается, но обновление пока недоступно.",
+      "请联系管理员,或稍后重新检查。": "Обратитесь к администратору или проверьте позже.",
+      "你不在本次更新的推送名单内。": "Вы не входите в список рассылки этого обновления.",
+      "服务端尚未配置更新包。": "Обновление ещё не настроено на сервере.",
       "卸载 ReCodex": "Удалить ReCodex", "确定卸载?此操作不可撤销:": "Удалить? Действие необратимо:",
       "还原 Codex 配置并清除登录凭据": "Восстановить конфиг Codex и удалить учётные данные",
       "服务端吊销本设备": "Отозвать это устройство на сервере", "删除快捷方式与程序本体": "Удалить ярлыки и сам файл программы",
@@ -866,21 +874,37 @@
     const current = compat.client_version || "—";
     const forced = compat.supported === false;
     const hasUpdate = !!channel.available;
+    // 服务端给的是机器码(already_latest / not_in_rollout / not_configured),
+    // 直接打印给用户等于没说。认识的翻译掉,不认识的原样透出(便于排查)。
+    const REASONS = {
+      already_latest: t("已是最新版本"),
+      not_in_rollout: t("你不在本次更新的推送名单内。"),
+      not_configured: t("服务端尚未配置更新包。"),
+    };
+    const reasonText = channel.reason ? (REASONS[channel.reason] || channel.reason) : "";
 
     let html = `<div class="rcx-row"><span class="rcx-k">${t("当前版本")}</span><span>${esc(current)}</span></div>`;
     if (hasUpdate) {
       html += `<div class="rcx-row"><span class="rcx-k">${t("最新版本")}</span><span>${esc(channel.latest_version || "—")}</span></div>`;
     }
     if (forced) {
-      html += `<div class="rcx-err" style="margin-top:6px;font-size:12px">${
-        t("当前版本已停止支持,必须更新后才能继续使用。")}${
-        compat.minimum_version ? ` ${t("最低版本")}: ${esc(compat.minimum_version)}` : ""}</div>`;
+      // 「必须更新」+「没有更新可点」是个死角:后端抬了最低版本却没配更新包,
+      // 或者这个用户不在灰度名单里。只说"必须更新"等于把人堵死,得说清楚下一步。
+      const headline = hasUpdate
+        ? t("当前版本已停止支持,必须更新后才能继续使用。")
+        : t("当前版本已停止支持,但暂时没有可用的更新包。");
+      html += `<div class="rcx-err" style="margin-top:6px;font-size:12px">${headline}${
+        compat.minimum_version ? ` ${t("最低版本")}: ${esc(compat.minimum_version)}` : ""}${
+        hasUpdate ? "" : `<br>${reasonText ? esc(reasonText) + " " : ""}${t("请联系管理员,或稍后重新检查。")}`}</div>`;
     }
     if (hasUpdate) {
       html += `<button class="rcx-act" id="rcx-upd-go">${forced ? t("立即更新(必需)") : t("更新到最新版")}</button>`;
     } else {
-      html += `<div class="rcx-muted" style="margin-top:6px;font-size:12px">${
-        channel.reason ? esc(channel.reason) : t("已是最新版本")}</div>`;
+      // forced 分支已经把原因说过一遍了,这里再打一次就是重复
+      if (!forced) {
+        html += `<div class="rcx-muted" style="margin-top:6px;font-size:12px">${
+          reasonText ? esc(reasonText) : t("已是最新版本")}</div>`;
+      }
       html += `<button class="rcx-act sec" id="rcx-upd-check">${t("重新检查")}</button>`;
     }
     box.innerHTML = html;
