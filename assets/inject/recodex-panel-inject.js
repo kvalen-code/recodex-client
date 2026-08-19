@@ -92,7 +92,7 @@
       "正在发起登录…": "正在發起登入…", "登录发起失败": "登入發起失敗",
       "在浏览器打开并输入授权码:": "在瀏覽器開啟並輸入授權碼:",
       "授权码": "授權碼", "打开授权页": "開啟授權頁", "等待确认…": "等待確認…",
-      "授权超时,请重试": "授權逾時,請重試", "无法自动打开,请手动复制地址": "無法自動開啟,請手動複製網址", "登录失败": "登入失敗",
+      "授权超时,请重试": "授權逾時,請重試", "重新登录": "重新登入", "无法自动打开,请手动复制地址": "無法自動開啟,請手動複製網址", "登录失败": "登入失敗",
       "✅ 登录成功": "✅ 登入成功",
       "我已重启,刷新状态": "我已重啟,重新整理狀態",
       "会话删除": "工作階段刪除", "Markdown 导出": "Markdown 匯出", "会话 ID 标识": "工作階段 ID 標識",
@@ -165,7 +165,7 @@
       "正在发起登录…": "Запуск входа…", "登录发起失败": "Не удалось начать вход",
       "在浏览器打开并输入授权码:": "Откройте в браузере и введите код:",
       "授权码": "Код", "打开授权页": "Открыть страницу входа", "等待确认…": "Ожидание подтверждения…",
-      "授权超时,请重试": "Время вышло, повторите", "无法自动打开,请手动复制地址": "Не удалось открыть автоматически, скопируйте ссылку вручную", "登录失败": "Ошибка входа",
+      "授权超时,请重试": "Время вышло, повторите", "重新登录": "Войти заново", "无法自动打开,请手动复制地址": "Не удалось открыть автоматически, скопируйте ссылку вручную", "登录失败": "Ошибка входа",
       "✅ 登录成功": "✅ Вход выполнен",
       "我已重启,刷新状态": "Я перезапустил — обновить",
       "会话删除": "Удаление диалогов", "Markdown 导出": "Экспорт в Markdown", "会话 ID 标识": "Показывать ID диалога",
@@ -444,6 +444,7 @@
       <div class="rcx-row"><span class="rcx-k">${t("授权码")}</span><b>${esc(user_code)}</b></div>
       <div class="rcx-muted" style="word-break:break-all">${esc(verify_url)}</div>
       <button class="rcx-act" id="rcx-open">${t("打开授权页")}</button>
+      <button class="rcx-act sec" id="rcx-login-cancel">${t("取消")}</button>
       <div class="rcx-muted" id="rcx-poll" style="margin-top:8px">${t("等待确认…")}</div>`;
     body().querySelector("#rcx-open").onclick = async () => {
       // verify_url 可能已含 user_code(backend 返回完整地址),避免重复拼接
@@ -462,13 +463,34 @@
       const el = body().querySelector("#rcx-poll");
       if (el) { el.className = "rcx-err"; el.textContent = `${t("无法自动打开,请手动复制地址")}: ${url}`; }
     };
+    // 取消:微信扫码那条流程一直有这个按钮,登录这边一直没有 ——
+    // 用户点开登录之后就没有退路,只能切页签自救。
+    //
+    // 直接重绘账号页即可:登录界面(连同 #rcx-poll)被替换掉,轮询靠下面那个
+    // 节点检查自然停止。曾经另设过一个取消标志,破坏验证时发现删掉它测试照样绿
+    // —— 没有可观察效果,去掉。
+    body().querySelector("#rcx-login-cancel").onclick = () => render();
     // 轮询
     const deadline = Date.now() + 10 * 60 * 1000;
     const tick = async () => {
       // 面板重绘或切走之后这个节点就没了 —— 循环必须跟着停。
       // 原先它会闷头跑满 10 分钟;用户再点一次登录,就是两个循环并行轮询。
       if (!body().querySelector("#rcx-poll")) return;
-      if (Date.now() > deadline) { const el = body().querySelector("#rcx-poll"); if (el) el.textContent = t("授权超时,请重试"); return; }
+      if (Date.now() > deadline) {
+        // 超时后也要给出路。原先只留一句"授权超时,请重试"却没有任何按钮,
+        // 用户同样只能切页签 —— 和微信那条流程的失败处理不一致。
+        const el = body().querySelector("#rcx-poll");
+        if (el) {
+          el.className = "rcx-err";
+          el.innerHTML = `${t("授权超时,请重试")} `;
+          const again = document.createElement("button");
+          again.className = "rcx-act sec";
+          again.textContent = t("重新登录");
+          again.onclick = doLogin;
+          el.appendChild(again);
+        }
+        return;
+      }
       const poll = await bridge("/recodex/login/poll", {});
       if (poll.status === "approved") { showLoginDone(); return; }
       if (poll.status === "error") { const el = body().querySelector("#rcx-poll"); if (el) { el.className = "rcx-err"; el.textContent = poll.error ? poll.error.message : t("登录失败"); } return; }
