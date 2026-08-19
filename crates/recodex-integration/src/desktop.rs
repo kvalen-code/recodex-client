@@ -563,7 +563,9 @@ pub fn recodex_login_poll(state: &ReCodexState) -> Value {
             }
             json!({"status":"approved"})
         }
-        Ok(result) => json!({"status":result.status}),
+        // device_limit 会带上占用名额的设备名单,必须一起透给面板 ——
+        // 只透 status 的话,面板只能显示「等待确认…」,而服务端其实早就说明了原因。
+        Ok(result) => json!({"status":result.status, "devices":result.devices}),
         Err(adapter_error) => error("login", adapter_error.to_string()),
     }
 }

@@ -32,6 +32,7 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -141,6 +142,7 @@ jobs:
   macos:
     name: macOS (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -170,6 +172,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+
+      # CI runner 的登录钥匙串是锁着的,写入会等一个永远不会有人点的授权框
+      # —— 表现是**挂住**而不是失败(实测卡了 76 分钟)。建一个已解锁的专用钥匙串。
+      - name: 准备可写的钥匙串
+        run: |
+          set -euo pipefail
+          security create-keychain -p ci recodex-ci.keychain
+          security set-keychain-settings -lut 21600 recodex-ci.keychain
+          security unlock-keychain -p ci recodex-ci.keychain
+          security list-keychains -d user -s recodex-ci.keychain login.keychain
+          security default-keychain -s recodex-ci.keychain
 
       # 钥匙串那层只能在真 mac 上验。编得过但存不进 = 用户登不上。
       - name: 跑 recodex-integration 测试(含钥匙串往返)

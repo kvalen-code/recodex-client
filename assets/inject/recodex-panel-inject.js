@@ -87,6 +87,8 @@
       "邮箱": "郵箱", "套餐": "套餐", "网关": "網關", "未选": "未選",
       "用最快网关": "用最快網關", "刷新额度": "重新整理額度", "登出": "登出",
       "使用情况": "使用情況", "邀请好友": "邀請好友", "退出登录": "退出登入",
+      "设备数已达上限,请先撤销一台再继续。": "裝置數已達上限,請先撤銷一台再繼續。",
+      "打开设备管理": "開啟裝置管理",
       "无法自动打开,请复制到浏览器:": "無法自動開啟,請複製到瀏覽器:",
       "侧边栏已切换到你的账号。要让官方 Codex 也用上,需要": "側邊欄已切換到你的帳號。要讓官方 Codex 也用上,需要",
       "重启一次": "重新啟動一次", "(无需再登 ChatGPT)。": "(無需再登入 ChatGPT)。",
@@ -167,6 +169,8 @@
       "邮箱": "Почта", "套餐": "Тариф", "网关": "Шлюз", "未选": "не выбран",
       "用最快网关": "Самый быстрый шлюз", "刷新额度": "Обновить квоту", "登出": "Выйти",
       "使用情况": "Использование", "邀请好友": "Пригласить друзей", "退出登录": "Выйти",
+      "设备数已达上限,请先撤销一台再继续。": "Достигнут лимит устройств: сначала отзовите одно.",
+      "打开设备管理": "Открыть управление устройствами",
       "无法自动打开,请复制到浏览器:": "Не удалось открыть автоматически, скопируйте в браузер:",
       "侧边栏已切换到你的账号。要让官方 Codex 也用上,需要": "Боковая панель переключена на ваш аккаунт. Чтобы официальный Codex тоже его использовал, нужно",
       "重启一次": "перезапустить", "(无需再登 ChatGPT)。": " (входить в ChatGPT повторно не нужно).",
@@ -537,6 +541,33 @@
       const poll = await bridge("/recodex/login/poll", {});
       if (poll.status === "approved") { await showLoginDone(); return; }
       if (poll.status === "error") { const el = body().querySelector("#rcx-poll"); if (el) { el.className = "rcx-err"; el.textContent = poll.error ? poll.error.message : t("登录失败"); } return; }
+      // 设备名额满了。服务端**明确**回的是 device_limit + 占用名额的设备名单,
+      // 原先这里把它当成"还没批准"继续等,于是用户在网页上点了同意,
+      // 面板却一直显示「等待确认…」—— 一个已经给出答案的状态被当成了没有答案。
+      //
+      // 不加「刷新」按钮:轮询一直在跑,撤销一台之后下一轮自己就过了。
+      // 真正缺的是把原因说出来,并告诉用户去哪儿撤销。
+      if (poll.status === "device_limit") {
+        const el = body().querySelector("#rcx-poll");
+        if (el) {
+          el.className = "rcx-err";
+          const names = (poll.devices || [])
+            .map((dv) => dv.name || dv.device_id)
+            .filter(Boolean);
+          el.textContent =
+            t("设备数已达上限,请先撤销一台再继续。") +
+            (names.length ? `(${names.join("、")})` : "");
+          if (!body().querySelector("#rcx-devices")) {
+            const go = document.createElement("button");
+            go.className = "rcx-act sec";
+            go.id = "rcx-devices";
+            go.style.marginTop = "8px";
+            go.textContent = t("打开设备管理");
+            go.onclick = () => openWeb("/dashboard/devices", rcxWebUrl);
+            el.parentNode.appendChild(go);
+          }
+        }
+      }
       setTimeout(tick, 5000);
     };
     setTimeout(tick, 5000);
@@ -944,6 +975,9 @@
   // 左下角原本显示 provider 名("ReCodex"),改成上游账号邮箱;并在个人资料菜单里
   // 插入额度进度。全部复用官方的 Tailwind token 类名,不自造样式,跟随明暗主题。
   let rcxAccount = null; // {email, plan, w5, w7}
+  // 站点地址缓存。登录界面也要用它(设备超限时跳设备管理页),
+  // 而那时还没登录、status 不带 data,所以单独存一份,取不到就退回默认域名。
+  let rcxWebUrl = "";
 
   // 邮箱打码:只保留本地部分前两位,与前端展示口径一致(weiyukong550@gmail.com → we***@gmail.com)
   function maskEmail(email) {
@@ -1009,6 +1043,7 @@
     }
     const res = await bridge("/recodex/status", {});
     rcxStatus = computeStatus(res); // 复用这一次请求算状态灯,不额外发请求
+    if (res && res.data && res.data.web_url) rcxWebUrl = res.data.web_url;
     applyStatus();
     if (!res || !res.data) { rcxAccount = null; return; }
     const acc = res.data.account || {};

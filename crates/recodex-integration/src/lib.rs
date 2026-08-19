@@ -189,9 +189,25 @@ impl From<&LoginStart> for PublicLoginStart {
     }
 }
 
+/// 占用设备名额的一台设备。达到上限时服务端会把名单一起回过来,
+/// 好让用户知道该撤销哪一台 —— 光说"超限"没法让人动手。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DeviceSlot {
+    pub device_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub last_seen: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoginPoll {
     pub status: String,
+    /// 只有 `device_limit` 会带:哪几台占着名额。
+    /// 原先这个字段整个被丢掉,于是客户端只知道"不是 approved",
+    /// 面板就一直显示「等待确认…」—— 服务端明说了原因,我们自己吞了。
+    #[serde(default)]
+    pub devices: Vec<DeviceSlot>,
     #[serde(default, skip_serializing)]
     pub token: String,
     #[serde(default)]

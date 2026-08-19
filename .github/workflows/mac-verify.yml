@@ -19,12 +19,28 @@ jobs:
           - arch: arm64
             runner: macos-14
             target: aarch64-apple-darwin
+    # 挂死要快速失败:第一次跑就因为钥匙串弹授权框卡了 76 分钟才被人发现,
+    # 而 mac runner 按 10 倍计费、默认上限 6 小时。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+
+      # CI runner 的登录钥匙串是锁着的,往里写会等一个永远不会有人点的授权框
+      # —— 表现不是失败,是**挂住**。所以建一个专用的、已解锁的钥匙串,
+      # 并设为默认,让 SecItemAdd 直接落进去。
+      - name: 准备可写的钥匙串
+        run: |
+          set -euo pipefail
+          security create-keychain -p ci recodex-ci.keychain
+          security set-keychain-settings -lut 21600 recodex-ci.keychain
+          security unlock-keychain -p ci recodex-ci.keychain
+          security list-keychains -d user -s recodex-ci.keychain login.keychain
+          security default-keychain -s recodex-ci.keychain
+
       # 钥匙串那层只能在真 mac 上验:编得过但存不进 = 用户登不上
       - name: 测试(含钥匙串往返)
         run: cargo test -p recodex-integration --target ${{ matrix.target }}
