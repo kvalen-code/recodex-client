@@ -177,16 +177,38 @@ pub async fn run_weixin_connect(
             long_poll_timeout_ms = updates.longpolling_timeout_ms;
         }
 
+        // 时效按**收到这一批的时刻**判,不能用处理时的时钟。
+        // 一条消息可能让 Codex 跑好几分钟,期间同批后面的消息会"变旧",
+        // 于是被当成积压丢掉 —— 用户发了消息却石沉大海,也没有任何提示。
+        // 这个门槛的本意是"别把离线期间攒下的旧消息一股脑重放",
+        // 而不是"我们处理得慢就不认了"。
+        let batch_seen_at = now_ms();
+
         for message in updates.messages {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
             let message_key = message.dedup_key();
             if !message.is_finished_user_message()
-                || message.is_older_than(now_ms(), MAX_INBOUND_MESSAGE_AGE_MS)
                 || state.is_processed(&message_key)
                 || !is_allowed_peer(&config.allow_from, &message.from_user_id)
             {
+                continue;
+            }
+            // 确实是离线期间攒下的旧消息:告知发送者并记为已处理,
+            // 否则它会在每一轮长轮询里被反复静默跳过。
+            if message.is_older_than(batch_seen_at, MAX_INBOUND_MESSAGE_AGE_MS) {
+                state.mark_processed(&message_key);
+                if !message.context_token.trim().is_empty() {
+                    let _ = client
+                        .send_text_chunks(
+                            &message.from_user_id,
+                            "这条消息发出时 ReCodex 还没连上，已跳过。请重新发一次。",
+                            &message.context_token,
+                        )
+                        .await;
+                }
+                store.save(&state)?;
                 continue;
             }
             let Some(text) = message.text() else {
@@ -431,6 +453,42 @@ mod tests {
     use super::*;
 
     #[test]
+    /// 时效必须按"收到这一批的时刻"判,不能按处理时的时钟。
+    ///
+    /// 场景:一批里两条消息,第一条让 Codex 跑了 6 分钟。如果用处理时的 now(),
+    /// 第二条就会被判成"积压的旧消息"而丢掉 —— 用户发了消息石沉大海,还没有提示。
+    /// 而门槛的本意是"别把离线期间攒下的旧消息一股脑重放"。
+    #[test]
+    fn message_age_is_judged_at_receive_time_not_processing_time() {
+        let created_ms = 1_000_000u64;
+        let batch_seen_at = created_ms + 1_000; // 刚收到,才 1 秒
+        // 结构体字段全带 serde(default),用 JSON 构造最省事
+        let message: crate::connect::weixin::WeixinMessage =
+            serde_json::from_value(serde_json::json!({"create_time_ms": created_ms})).unwrap();
+
+        assert!(
+            !message.is_older_than(batch_seen_at, MAX_INBOUND_MESSAGE_AGE_MS),
+            "刚收到的消息不该被判旧"
+        );
+
+        // 前一条消息跑了 6 分钟之后才轮到它 —— 用处理时的时钟就会误判
+        let after_slow_turn = batch_seen_at + 6 * 60 * 1_000;
+        assert!(
+            message.is_older_than(after_slow_turn, MAX_INBOUND_MESSAGE_AGE_MS),
+            "这正是旧写法会踩的坑:按处理时刻算,它已经'超龄'了"
+        );
+
+        // 真正的积压(离线期间攒下的)仍然要被拦
+        let stale: crate::connect::weixin::WeixinMessage = serde_json::from_value(
+            serde_json::json!({"create_time_ms": batch_seen_at - 10 * 60 * 1_000}),
+        )
+        .unwrap();
+        assert!(
+            stale.is_older_than(batch_seen_at, MAX_INBOUND_MESSAGE_AGE_MS),
+            "离线期间攒下的旧消息仍要拦住"
+        );
+    }
+
     fn allow_from_supports_wildcard_and_comma_separated_ids() {
         // 空白名单必须谁都不许 —— 这是安全默认,不是便利默认
         assert!(!is_allowed_peer("", "a@im.wechat"));
