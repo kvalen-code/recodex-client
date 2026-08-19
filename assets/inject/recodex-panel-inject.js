@@ -8,15 +8,41 @@
   window.__recodexPanelInstalled = "1";
 
   // ── 调桥封装 ───────────────────────────────────────────────
+  // 桥调用超时。没有它的时候,原生侧一旦不应答(launcher 卡住 / binding 只装了一半),
+  // Promise 就永远不落地,页签停在「加载中」——没有报错、没有重试,用户只能重启。
+  // 这个症状真的发生过,根因单独修了;但面板自己也该有防线。
+  const BRIDGE_TIMEOUT_MS = 20000;
+
+  // 这些是**本来就慢**的命令,不能按 20 秒判死:
+  // 自更新要下十几 MB;微信启停内部自带轮询;探测最快网关要逐个测速;
+  // 登录轮询本身就是等人扫码;退出/重启/卸载会把进程带走,不会有回包。
+  const BRIDGE_NO_TIMEOUT = [
+    "/self-update", "/uninstall", "/quit", "/restart-codex",
+    "/weixin/start", "/weixin/stop", "/weixin/qr-start", "/weixin/qr-status",
+    "/recodex/login/poll", "/recodex/gateway/fastest",
+  ];
+
   function bridge(path, payload) {
     const fn = window.__codexSessionDeleteBridge;
     if (typeof fn !== "function") {
       return Promise.resolve({ status: "error", error: { code: "no_bridge", message: t("ReCodex 桥未就绪") } });
     }
-    return Promise.resolve(fn(path, payload || {})).catch((e) => ({
+    const call = Promise.resolve(fn(path, payload || {})).catch((e) => ({
       status: "error",
       error: { code: "bridge_error", message: String(e && e.message ? e.message : e) },
     }));
+    if (BRIDGE_NO_TIMEOUT.indexOf(path) >= 0) return call;
+    let timer = null;
+    const guard = new Promise((resolve) => {
+      timer = setTimeout(
+        () => resolve({ status: "error", error: { code: "bridge_timeout", message: t("ReCodex 桥未响应") } }),
+        BRIDGE_TIMEOUT_MS,
+      );
+    });
+    return Promise.race([call, guard]).then((result) => {
+      if (timer !== null) clearTimeout(timer);
+      return result;
+    });
   }
 
   // ── 多语言 ─────────────────────────────────────────────────
@@ -91,7 +117,7 @@
       "白名单(微信 user id,逗号分隔)": "白名單(微信 user id,逗號分隔)",
       "留空=不响应任何人": "留空=不回應任何人",
       "模型(留空=Codex 默认)": "模型(留空=Codex 預設)",
-      "ReCodex 桥未就绪": "ReCodex 橋未就緒",
+      "ReCodex 桥未就绪": "ReCodex 橋未就緒", "ReCodex 桥未响应": "ReCodex 橋沒有回應",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "未綁定微信。掃碼後可在微信裡直接指揮本機 Codex。",
       "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ 白名單為空:微信連線不會回應任何人。填入你的微信 ID,或填 * 放開所有人。",
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ 白名單為 *:任何人給該微信號發訊息都能在本機執行 Codex。",
@@ -164,7 +190,7 @@
       "白名单(微信 user id,逗号分隔)": "Белый список (user id WeChat, через запятую)",
       "留空=不响应任何人": "Пусто = никто не получит ответа",
       "模型(留空=Codex 默认)": "Модель (пусто = по умолчанию)",
-      "ReCodex 桥未就绪": "Мост ReCodex не готов",
+      "ReCodex 桥未就绪": "Мост ReCodex не готов", "ReCodex 桥未响应": "Мост ReCodex не отвечает",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "WeChat не привязан. После сканирования можно управлять Codex прямо из WeChat.",
       "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ Белый список пуст: бот никому не ответит. Укажите свой WeChat ID или * , чтобы разрешить всем.",
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ Белый список = *: любой, кто напишет боту, сможет запускать Codex на этом компьютере.",
@@ -492,7 +518,8 @@
   function bridgeUnavailable(res) {
     if (!res) return true;
     const code = res.error && res.error.code;
-    return res.status === "error" && (code === "no_bridge" || code === "bridge_error");
+    return res.status === "error" &&
+      (code === "no_bridge" || code === "bridge_error" || code === "bridge_timeout");
   }
 
   function renderBridgeDown(box, retry) {
