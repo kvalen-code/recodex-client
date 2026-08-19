@@ -452,6 +452,46 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    /// 去掉注释、并且只取测试模块**之前**的正文。
+    ///
+    /// 两个坑都踩过:直接 `contains` 会把注释里的字样算进去(sub2api 那边栽过一次);
+    /// 不截断测试模块,守卫还会扫到它自己断言里的字面量。
+    fn source_without_comments(source: &str) -> String {
+        let source = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **调用点**守卫:下面那条 `is_older_than` 单测只验了函数本身,
+    /// 把调用处改回 `now_ms()` 它照样绿 —— 实测过,189 项全过。所以直接盯住调用点。
+    #[test]
+    fn age_check_call_site_uses_batch_receive_time() {
+        let body = source_without_comments(include_str!("mod.rs"));
+        assert!(
+            body.contains("message.is_older_than(batch_seen_at,"),
+            "时效判定必须用 batch_seen_at(收到这一批的时刻)"
+        );
+        assert!(
+            !body.contains("message.is_older_than(now_ms(),"),
+            "不能用处理时的时钟 —— 前一条跑得久,同批后面的消息会被误判成积压丢掉"
+        );
+    }
+
+    /// 空白名单必须在启动时就被挡下并说明原因,
+    /// 否则用户只看到「连接正在运行」却怎么发消息都没反应。
+    #[test]
+    fn empty_allow_list_is_rejected_at_startup() {
+        let body = source_without_comments(include_str!("mod.rs"));
+        assert!(
+            body.contains("config.allow_from.trim().is_empty()")
+                && body.contains("白名单为空,不会响应任何人"),
+            "启动前必须挡下空白名单并给出可操作的提示"
+        );
+    }
+
     #[test]
     /// 时效必须按"收到这一批的时刻"判,不能按处理时的时钟。
     ///

@@ -205,6 +205,40 @@ mod tests {
     ///
     /// 用户可能还单独装着 Codex++,那是别人的自启项 —— 卸我们的东西不该顺手删它。
     /// 这里用一个绝不可能出现在真实 Run 值里的路径,断言我们不会误伤。
+    fn source_without_comments(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **调用点**守卫:下面那两条单测只验了清理函数本身。
+    /// 把 `perform_uninstall` 里的调用删掉,它们照样绿 —— 实测过,189 项全过。
+    /// 清理函数写对了却没人调,和没写是一样的。
+    #[test]
+    fn cleanup_helpers_are_actually_called_by_perform_uninstall() {
+        let body = source_without_comments(include_str!("uninstall.rs"));
+        let perform = body
+            .split("pub fn perform_uninstall")
+            .nth(1)
+            .expect("perform_uninstall 应存在");
+        let perform = &perform[..perform.find("\n#[cfg(test)]").unwrap_or(perform.len())];
+
+        assert!(
+            perform.contains("remove_appdata_dirs(&mut warnings)"),
+            "必须清理 %LOCALAPPDATA%/%APPDATA% 下的 ReCodex 目录 —— 设备 ID 留着重装会用已吊销的身份"
+        );
+        assert!(
+            perform.contains("uninstall_watcher_pointing_at("),
+            "必须清理指向本 exe 的开机自启项,否则卸完每次开机都去拉一个已删除的 exe"
+        );
+        assert!(
+            perform.contains("remove_codex_owned_dir()"),
+            "必须清理 ~/.codex/recodex"
+        );
+    }
+
     /// 设备 ID 留在磁盘上,重装后会拿一个**已被服务端吊销**的身份去登录。
     /// 这条断言把两个一直漏掉的目录钉住。
     #[test]
