@@ -34,7 +34,7 @@
       "请联系管理员,或稍后重新检查。": "請聯絡管理員,或稍後重新檢查。",
       "你不在本次更新的推送名单内。": "你不在本次更新的推送名單內。",
       "服务端尚未配置更新包。": "伺服器尚未設定更新包。",
-      "卸载 ReCodex": "解除安裝 ReCodex", "卸载失败,未做任何改动": "解除安裝失敗,未做任何變更", "确定卸载?此操作不可撤销:": "確定解除安裝?此操作無法復原:",
+      "卸载 ReCodex": "解除安裝 ReCodex", "重新启动连接…": "重新啟動連線…", "停止中…": "停止中…", "首次登录需重启生效:请": "首次登入需重新啟動才生效:請", "完全退出 Codex,再双击桌面 ReCodex 重新打开": "完全結束 Codex,再雙擊桌面 ReCodex 重新開啟", ",官方界面才会用上你的账号(无需再登 ChatGPT)。": ",官方介面才會使用你的帳號(不需再登入 ChatGPT)。", "重启失败": "重新啟動失敗", "如 gpt-5.6-sol": "例如 gpt-5.6-sol", "卸载失败,未做任何改动": "解除安裝失敗,未做任何變更", "确定卸载?此操作不可撤销:": "確定解除安裝?此操作無法復原:",
       "还原 Codex 配置并清除登录凭据": "還原 Codex 設定並清除登入憑據",
       "服务端吊销本设备": "伺服器端撤銷本裝置", "删除快捷方式与程序本体": "刪除捷徑與程式本體", "删除设备标识与用户脚本(不可恢复)": "刪除裝置識別與使用者指令碼(無法復原)",
       "确认卸载": "確認解除安裝", "卸载中…": "解除安裝中…", "卸载完成": "解除安裝完成",
@@ -107,7 +107,7 @@
       "请联系管理员,或稍后重新检查。": "Обратитесь к администратору или проверьте позже.",
       "你不在本次更新的推送名单内。": "Вы не входите в список рассылки этого обновления.",
       "服务端尚未配置更新包。": "Обновление ещё не настроено на сервере.",
-      "卸载 ReCodex": "Удалить ReCodex", "卸载失败,未做任何改动": "Удаление не выполнено, ничего не изменено", "确定卸载?此操作不可撤销:": "Удалить? Действие необратимо:",
+      "卸载 ReCodex": "Удалить ReCodex", "重新启动连接…": "Перезапуск подключения…", "停止中…": "Остановка…", "首次登录需重启生效:请": "Первый вход вступит в силу после перезапуска: ", "完全退出 Codex,再双击桌面 ReCodex 重新打开": "полностью закройте Codex и снова запустите ReCodex с рабочего стола", ",官方界面才会用上你的账号(无需再登 ChatGPT)。": " — тогда официальный интерфейс использует ваш аккаунт (входить в ChatGPT не нужно).", "重启失败": "Не удалось перезапустить", "如 gpt-5.6-sol": "например gpt-5.6-sol", "卸载失败,未做任何改动": "Удаление не выполнено, ничего не изменено", "确定卸载?此操作不可撤销:": "Удалить? Действие необратимо:",
       "还原 Codex 配置并清除登录凭据": "Восстановить конфиг Codex и удалить учётные данные",
       "服务端吊销本设备": "Отозвать это устройство на сервере", "删除快捷方式与程序本体": "Удалить ярлыки и сам файл программы", "删除设备标识与用户脚本(不可恢复)": "Удалить идентификатор устройства и пользовательские скрипты (безвозвратно)",
       "确认卸载": "Подтвердить удаление", "卸载中…": "Удаление…", "卸载完成": "Удаление завершено",
@@ -354,7 +354,7 @@
     // 5h 窗口只在有实际用量时显示;无用量则只显示 7 天(对齐 mdash「隐藏空 5h」)
     if (w5 && w5.used > 0) html += `<div style="padding:6px 0"><div class="rcx-row" style="border:0"><span class="rcx-k">${t("5 小时")}</span><span>${pct(w5)}%</span></div><div class="rcx-bar"><i style="width:${pct(w5)}%"></i></div></div>`;
     if (w7) html += `<div style="padding:6px 0"><div class="rcx-row" style="border:0"><span class="rcx-k">${t("7 天")}</span><span>${pct(w7)}%</span></div><div class="rcx-bar"><i style="width:${pct(w7)}%"></i></div></div>`;
-    html += `<div class="rcx-row"><span class="rcx-k">${t("网关")}</span><span>${esc(sel ? sel.name : "未选")}</span></div>`;
+    html += `<div class="rcx-row"><span class="rcx-k">${t("网关")}</span><span>${esc(sel ? sel.name : t("未选"))}</span></div>`;
     html += `<button class="rcx-act" id="rcx-fastest">${t("用最快网关")}</button>`;
     html += `<button class="rcx-act sec" id="rcx-refresh">${t("刷新额度")}</button>`;
     html += `<button class="rcx-act sec" id="rcx-logout">${t("登出")}</button>`;
@@ -415,9 +415,10 @@
   // 首次登录必须重启整个 ReCodex(setx 已把 key 持久化到用户环境,重开后新起的 Codex 才生效)。
   function showLoginDone() {
     body().innerHTML =
-      `<div style="color:#3ee98a;font-weight:600;font-size:14px">✅ 登录成功</div>` +
-      `<div class="rcx-muted" style="margin-top:8px">首次登录需重启生效:请<b style="color:#e6e9ef">完全退出 Codex,再双击桌面 ReCodex 重新打开</b>,官方界面才会用上你的账号(无需再登 ChatGPT)。</div>` +
-      `<button class="rcx-act sec" id="rcx-recheck" style="margin-top:12px">我已重启,刷新状态</button>`;
+      `<div style="color:#3ee98a;font-weight:600;font-size:14px">${t("✅ 登录成功")}</div>` +
+      // 句中有 <b> 标记,拆成三段分别翻译,避免把 HTML 塞进词条
+      `<div class="rcx-muted" style="margin-top:8px">${t("首次登录需重启生效:请")}<b style="color:#e6e9ef">${t("完全退出 Codex,再双击桌面 ReCodex 重新打开")}</b>${t(",官方界面才会用上你的账号(无需再登 ChatGPT)。")}</div>` +
+      `<button class="rcx-act sec" id="rcx-recheck" style="margin-top:12px">${t("我已重启,刷新状态")}</button>`;
     const btn = body().querySelector("#rcx-recheck");
     if (btn) btn.onclick = render;
   }
@@ -586,7 +587,7 @@
   async function wxStopAndWait(progress) {
     await bridge("/weixin/stop", {});
     for (let i = 0; i < 30; i++) {
-      if (progress) progress(`停止中… ${i * 2}s`);
+      if (progress) progress(`${t("停止中…")} ${i * 2}s`);
       await new Promise((r) => setTimeout(r, 2000));
       const s = await bridge("/weixin/status", {});
       const state = s && s.connect ? s.connect.state : "";
@@ -614,7 +615,7 @@
 
     let html = `<div class="rcx-row"><span class="rcx-k">${t("状态")}</span><span class="rcx-badge ${stateCls}">${esc(stateText)}</span></div>`;
     html += `<div class="rcx-row"><span class="rcx-k">${t("账号")}</span><span>${esc(cfg.accountId || "—")}</span></div>`;
-    if (conn.processedMessages) html += `<div class="rcx-row"><span class="rcx-k">${t("已处理")}</span><span>${esc(conn.processedMessages)} 条</span></div>`;
+    if (conn.processedMessages) html += `<div class="rcx-row"><span class="rcx-k">${t("已处理")}</span><span>${esc(conn.processedMessages)} ${t("条")}</span></div>`;
     if (conn.message) html += `<div class="rcx-muted" style="margin-top:4px">${esc(conn.message)}</div>`;
     const running = conn.state === "running" || conn.state === "starting" || conn.state === "retrying";
     html += running
@@ -637,7 +638,7 @@
     html += `<div class="rcx-field"><label>${t("白名单(微信 user id,逗号分隔)")}</label>
       <input id="wx-allow" value="${esc(cfg.allowFrom || "")}" placeholder="${t("留空=不响应任何人")}"></div>`;
     html += `<div class="rcx-field"><label>${t("模型(留空=Codex 默认)")}</label>
-      <input id="wx-model" value="${esc(cfg.model || "")}" placeholder="如 gpt-5.6-sol"></div>`;
+      <input id="wx-model" value="${esc(cfg.model || "")}" placeholder="${t("如 gpt-5.6-sol")}"></div>`;
     html += `<button class="rcx-act sec" id="wx-save">${t("保存配置")}</button>`;
     c.innerHTML = html;
     const sandboxSel = c.querySelector("#wx-sandbox");
@@ -646,7 +647,7 @@
     if (startBtn) startBtn.onclick = async () => {
       startBtn.disabled = true; startBtn.textContent = t("启动中…");
       const r = await bridge("/weixin/start", {});
-      if (r && r.status !== "ok") { startBtn.disabled = false; startBtn.textContent = "启动连接"; wxNote(r.message || t("启动失败"), true); return; }
+      if (r && r.status !== "ok") { startBtn.disabled = false; startBtn.textContent = t("启动连接"); wxNote(r.message || t("启动失败"), true); return; }
       setTimeout(renderWeixin, 1500);
     };
     const stopBtn = c.querySelector("#wx-stop");
@@ -668,10 +669,10 @@
       // 配置只在启动连接时读取,所以保存后必须重启;这里代劳,免得用户在
       // 「停止中」阶段点启动被静默拒掉(停止要等长轮询结束,最长约 35 秒)。
       const ok = await wxStopAndWait((t) => { saveBtn.textContent = t; });
-      if (!ok) { saveBtn.disabled = false; saveBtn.textContent = "保存配置"; wxNote(t("停止超时,请稍后手动启动"), true); return; }
-      saveBtn.textContent = "重新启动连接…";
+      if (!ok) { saveBtn.disabled = false; saveBtn.textContent = t("保存配置"); wxNote(t("停止超时,请稍后手动启动"), true); return; }
+      saveBtn.textContent = t("重新启动连接…");
       const r = await bridge("/weixin/start", {});
-      if (r && r.status !== "ok") wxNote(r.message || "重启失败", true);
+      if (r && r.status !== "ok") wxNote(r.message || t("重启失败"), true);
       setTimeout(renderWeixin, 1500);
     };
   }
@@ -682,7 +683,7 @@
     const r = await bridge("/weixin/qr-start", { baseUrl: "", routeTag: "" });
     if (!r || r.status !== "ok" || !r.qrSvg) {
       c.innerHTML = `<div class="rcx-err">${esc((r && r.message) || t("生成二维码失败"))}</div>
-        <button class="rcx-act sec" id="wx-retry">重试</button>`;
+        <button class="rcx-act sec" id="wx-retry">${t("重试")}</button>`;
       c.querySelector("#wx-retry").onclick = wxQrLogin;
       return;
     }
@@ -823,8 +824,8 @@
     }
     // 5h 窗口只在有实际用量时显示,7 天窗口常驻
     let html = "";
-    if (rcxAccount.w5 && rcxAccount.w5.used > 0) html += quotaRowHtml("5 小时用量", rcxAccount.w5);
-    if (rcxAccount.w7) html += quotaRowHtml("7 天用量", rcxAccount.w7);
+    if (rcxAccount.w5 && rcxAccount.w5.used > 0) html += quotaRowHtml(t("5 小时用量"), rcxAccount.w5);
+    if (rcxAccount.w7) html += quotaRowHtml(t("7 天用量"), rcxAccount.w7);
     if (html) header.insertAdjacentHTML("afterend", html);
     menu.dataset.recodexPatched = "1";
   }
