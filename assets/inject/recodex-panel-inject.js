@@ -117,7 +117,7 @@
       "白名单(微信 user id,逗号分隔)": "白名單(微信 user id,逗號分隔)",
       "留空=不响应任何人": "留空=不回應任何人",
       "模型(留空=Codex 默认)": "模型(留空=Codex 預設)",
-      "ReCodex 桥未就绪": "ReCodex 橋未就緒", "ReCodex 桥未响应": "ReCodex 橋沒有回應",
+      "ReCodex 桥未就绪": "ReCodex 橋未就緒", "设置没有生效,请重试": "設定沒有生效,請重試", "ReCodex 桥未响应": "ReCodex 橋沒有回應",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "未綁定微信。掃碼後可在微信裡直接指揮本機 Codex。",
       "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ 白名單為空:微信連線不會回應任何人。填入你的微信 ID,或填 * 放開所有人。",
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ 白名單為 *:任何人給該微信號發訊息都能在本機執行 Codex。",
@@ -190,7 +190,7 @@
       "白名单(微信 user id,逗号分隔)": "Белый список (user id WeChat, через запятую)",
       "留空=不响应任何人": "Пусто = никто не получит ответа",
       "模型(留空=Codex 默认)": "Модель (пусто = по умолчанию)",
-      "ReCodex 桥未就绪": "Мост ReCodex не готов", "ReCodex 桥未响应": "Мост ReCodex не отвечает",
+      "ReCodex 桥未就绪": "Мост ReCodex не готов", "设置没有生效,请重试": "Настройка не применилась, попробуйте ещё раз", "ReCodex 桥未响应": "Мост ReCodex не отвечает",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "WeChat не привязан. После сканирования можно управлять Codex прямо из WeChat.",
       "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ Белый список пуст: бот никому не ответит. Укажите свой WeChat ID или * , чтобы разрешить всем.",
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ Белый список = *: любой, кто напишет боту, сможет запускать Codex на этом компьютере.",
@@ -473,6 +473,20 @@
     ["codexAppUpstreamWorktreeCreate", "上游 worktree 创建"],
   ];
   // 开关列表渲染:增强页与高级页共用同一套读写路径
+  // 开关写失败时的提示条。挂在开关列表下方,成功时清空。
+  function toggleNote(container, message) {
+    if (!container) return;
+    let note = container.querySelector(".rcx-toggle-note");
+    if (!message) { if (note) note.remove(); return; }
+    if (!note) {
+      note = document.createElement("div");
+      note.className = "rcx-err rcx-toggle-note";
+      note.style.cssText = "margin-top:6px;font-size:12px";
+      container.appendChild(note);
+    }
+    note.textContent = message;
+  }
+
   function renderToggleList(container, items, settings) {
     container.innerHTML = items
       .map(([k, label]) =>
@@ -480,16 +494,32 @@
         `<input type="checkbox" data-k="${esc(k)}" ${settings[k] ? "checked" : ""}></label>`
       )
       .join("");
+    // 写完必须**回读校验**。原先是发射后不管:不 await、不看结果、不回滚,
+    // 写失败时勾选框仍停在新状态,用户以为生效了 —— 这正是「开关不灵」的体感来源
+    // (界面说开着,后端其实是关的,重开面板才发现又变回去了)。
+    // 回读比"看写入返回值"可靠:两条写入路径(renderer 快通道 / 桥)返回形状并不一致。
     container.querySelectorAll("input[data-k]").forEach((inp) => {
-      inp.onchange = () => {
-        const k = inp.dataset.k, v = inp.checked;
-        if (typeof window.__codexPlusSetBackendSetting === "function") {
-          window.__codexPlusSetBackendSetting(k, v);
-        } else {
-          bridge("/settings/set", { [k]: v });
+      inp.onchange = async () => {
+        const k = inp.dataset.k, want = inp.checked;
+        inp.disabled = true;
+        let ok = false;
+        try {
+          if (typeof window.__codexPlusSetBackendSetting === "function") {
+            await window.__codexPlusSetBackendSetting(k, want);
+          } else {
+            await bridge("/settings/set", { [k]: want });
+          }
+          const after = await readSettings();
+          ok = !!after[k] === want;
+          inp.checked = !!after[k];
+        } catch (e) {
+          inp.checked = !want;
+        } finally {
+          inp.disabled = false;
         }
+        toggleNote(container, ok ? "" : t("设置没有生效,请重试"));
         // 宽度输入框要随「对话居中宽度」开关显隐,所以改完重绘当前页
-        if (k === "codexAppConversationView") setTimeout(renderEnhancements, 500);
+        if (ok && k === "codexAppConversationView") setTimeout(renderEnhancements, 500);
       };
     });
   }
