@@ -111,6 +111,11 @@ pub async fn run_weixin_connect(
     if config.token.is_empty() {
         bail!("请先扫码登录微信");
     }
+    // 白名单空 = 谁都不许(见 is_allowed_peer)。直接在这里挡下并说清楚,
+    // 否则用户会看到「连接正在运行」却怎么发消息都没反应,根本查不到原因。
+    if config.allow_from.trim().is_empty() {
+        bail!("白名单为空,不会响应任何人。请在 ReCodex 面板「微信 → 白名单」里填入你的微信 ID(放开所有人填 *)");
+    }
     // 没配工作目录时不能退回进程 cwd:launcher 是 GUI 程序,cwd 取决于启动方式
     // (双击快捷方式=exe 所在目录,命令行=当时的目录),Codex 会每次在不同地方干活。
     // 退回用户主目录至少是确定的,面板里也看得见。
@@ -368,10 +373,20 @@ fn compact_work_dir(work_dir: &std::path::Path) -> String {
     path.into_owned()
 }
 
+/// 白名单判定。**空 = 谁都不许**,不是"谁都可以"。
+///
+/// 这条以前是反的:空白名单对任何人返回 true。而白名单只在扫码时
+/// 服务端返回了 `ilink_user_id` 才会自动填上本人 —— 那个字段一旦缺失
+/// (字段改名、账号类型不同、接口出错),白名单就是空的,于是**任何人**
+/// 给这个微信号发消息都能在用户电脑上跑 Codex,沙箱级别还是用户配的那个。
+///
+/// 授权判断失败时必须往严了倒。想放开所有人得显式填 `*`,不能靠"没填"。
 fn is_allowed_peer(allow_from: &str, peer: &str) -> bool {
     let allow_from = allow_from.trim();
-    allow_from.is_empty()
-        || allow_from == "*"
+    if allow_from.is_empty() {
+        return false;
+    }
+    allow_from == "*"
         || allow_from
             .split(',')
             .map(str::trim)
@@ -417,7 +432,10 @@ mod tests {
 
     #[test]
     fn allow_from_supports_wildcard_and_comma_separated_ids() {
-        assert!(is_allowed_peer("", "a@im.wechat"));
+        // 空白名单必须谁都不许 —— 这是安全默认,不是便利默认
+        assert!(!is_allowed_peer("", "a@im.wechat"));
+        assert!(!is_allowed_peer("   ", "a@im.wechat"));
+        // 想放开所有人得显式写 *
         assert!(is_allowed_peer("*", "a@im.wechat"));
         assert!(is_allowed_peer("a@im.wechat, b@im.wechat", "b@im.wechat"));
         assert!(!is_allowed_peer("a@im.wechat", "b@im.wechat"));

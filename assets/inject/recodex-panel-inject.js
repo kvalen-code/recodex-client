@@ -89,11 +89,12 @@
       "workspace-write(可改工作目录)": "workspace-write(可改工作目錄)",
       "danger-full-access(完全放开)": "danger-full-access(完全開放)",
       "白名单(微信 user id,逗号分隔)": "白名單(微信 user id,逗號分隔)",
-      "留空=不限制(危险)": "留空=不限制(危險)",
+      "留空=不响应任何人": "留空=不回應任何人",
       "模型(留空=Codex 默认)": "模型(留空=Codex 預設)",
       "ReCodex 桥未就绪": "ReCodex 橋未就緒",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "未綁定微信。掃碼後可在微信裡直接指揮本機 Codex。",
-      "⚠ 白名单为空:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ 白名單為空:任何人給該微信號發訊息都能在本機執行 Codex。",
+      "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ 白名單為空:微信連線不會回應任何人。填入你的微信 ID,或填 * 放開所有人。",
+      "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ 白名單為 *:任何人給該微信號發訊息都能在本機執行 Codex。",
     },
     ru: {
       "版本与更新": "Версия и обновление", "当前版本": "Текущая версия", "最新版本": "Последняя версия",
@@ -161,11 +162,12 @@
       "workspace-write(可改工作目录)": "workspace-write (запись в рабочую папку)",
       "danger-full-access(完全放开)": "danger-full-access (полный доступ)",
       "白名单(微信 user id,逗号分隔)": "Белый список (user id WeChat, через запятую)",
-      "留空=不限制(危险)": "Пусто = без ограничений (опасно)",
+      "留空=不响应任何人": "Пусто = никто не получит ответа",
       "模型(留空=Codex 默认)": "Модель (пусто = по умолчанию)",
       "ReCodex 桥未就绪": "Мост ReCodex не готов",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "WeChat не привязан. После сканирования можно управлять Codex прямо из WeChat.",
-      "⚠ 白名单为空:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ Белый список пуст: любой, кто напишет боту, сможет запускать Codex на этом компьютере.",
+      "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ Белый список пуст: бот никому не ответит. Укажите свой WeChat ID или * , чтобы разрешить всем.",
+      "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ Белый список = *: любой, кто напишет боту, сможет запускать Codex на этом компьютере.",
     },
   };
 
@@ -605,9 +607,13 @@
     html += running
       ? `<button class="rcx-act sec" id="wx-stop">${t("停止连接")}</button>`
       : `<button class="rcx-act" id="wx-start">${t("启动连接")}</button>`;
-    // 白名单为空 = 任何人都能驱动本机 Codex,必须显式警告
-    if (!String(cfg.allowFrom || "").trim() || String(cfg.allowFrom).trim() === "*") {
-      html += `<div class="rcx-err" style="margin-top:8px;font-size:12px">${t("⚠ 白名单为空:任何人给该微信号发消息都能在本机运行 Codex。")}</div>`;
+    // 空和 * 是两回事,不能合成一句:空 = 谁都不响应(连接根本起不来),
+    // * = 任何人都能驱动本机 Codex。说反了会把用户往危险方向引。
+    const allowFrom = String(cfg.allowFrom || "").trim();
+    if (!allowFrom) {
+      html += `<div class="rcx-err" style="margin-top:8px;font-size:12px">${t("⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。")}</div>`;
+    } else if (allowFrom === "*") {
+      html += `<div class="rcx-err" style="margin-top:8px;font-size:12px">${t("⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。")}</div>`;
     }
     html += `<div class="rcx-field"><label>${t("工作目录(Codex 在此目录执行)")}</label>
       <input id="wx-workdir" value="${esc(cfg.workDir || "")}" placeholder="${t("留空 = 启动器当前目录")}"></div>`;
@@ -616,7 +622,7 @@
       <option value="workspace-write">${t("workspace-write(可改工作目录)")}</option>
       <option value="danger-full-access">${t("danger-full-access(完全放开)")}</option></select></div>`;
     html += `<div class="rcx-field"><label>${t("白名单(微信 user id,逗号分隔)")}</label>
-      <input id="wx-allow" value="${esc(cfg.allowFrom || "")}" placeholder="${t("留空=不限制(危险)")}"></div>`;
+      <input id="wx-allow" value="${esc(cfg.allowFrom || "")}" placeholder="${t("留空=不响应任何人")}"></div>`;
     html += `<div class="rcx-field"><label>${t("模型(留空=Codex 默认)")}</label>
       <input id="wx-model" value="${esc(cfg.model || "")}" placeholder="如 gpt-5.6-sol"></div>`;
     html += `<button class="rcx-act sec" id="wx-save">${t("保存配置")}</button>`;
