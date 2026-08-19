@@ -430,8 +430,6 @@
     html += `<div class="rcx-row"><span class="rcx-k">${t("网关")}</span><span>${esc(sel ? sel.name : t("未选"))}</span></div>`;
     html += `<button class="rcx-act" id="rcx-fastest">${t("用最快网关")}</button>`;
     html += `<button class="rcx-act sec" id="rcx-refresh">${t("刷新额度")}</button>`;
-    html += `<button class="rcx-act sec" id="rcx-usage">${t("使用情况")}</button>`;
-    html += `<button class="rcx-act sec" id="rcx-invite">${t("邀请好友")}</button>`;
     html += `<button class="rcx-act sec" id="rcx-logout">${t("退出登录")}</button>`;
     body().innerHTML = html;
     // 桥可能带回 warning(例如官方模式下网关只记进快照、切回后才生效)。
@@ -449,8 +447,6 @@
       }
     };
     body().querySelector("#rcx-refresh").onclick = async () => { await bridge("/recodex/refresh-usage", {}); render(); };
-    body().querySelector("#rcx-usage").onclick = () => openWeb("/dashboard/history", d.web_url);
-    body().querySelector("#rcx-invite").onclick = () => openWeb("/dashboard/invites", d.web_url);
     body().querySelector("#rcx-logout").onclick = async () => {
       await bridge("/recodex/logout", {});
       // 登出后官方侧边栏还挂着我们写的邮箱,得立刻还原,否则看着像"没退成功"
@@ -1072,19 +1068,48 @@
     }
   }
 
-  // 官方菜单项的类名,照抄自实时 DOM,保证视觉与原生一致
-  const RCX_MENU_ROW =
-    "no-drag outline-hidden rounded-lg px-[var(--padding-row-x)] py-[var(--padding-row-y)] text-sm text-default cursor-default flex flex-col";
+  // 官方菜单项的类名,照抄自实时 DOM,保证视觉与原生一致。
+  // 两种:不可点的信息行,和可点的动作行(多了 group/hover/focus/cursor-interaction)。
+  const RCX_MENU_BASE =
+    "no-drag outline-hidden rounded-lg px-[var(--padding-row-x)] py-[var(--padding-row-y)] text-sm text-default";
+  const RCX_MENU_ROW = `${RCX_MENU_BASE} cursor-default flex flex-col`;
+  const RCX_MENU_ACTION =
+    `${RCX_MENU_BASE} group hover:bg-primary-ghost-hover focus:bg-primary-ghost-hover cursor-interaction flex flex-col`;
+  const RCX_ICON_CLS = "icon-xs shrink-0 opacity-75 group-focus:opacity-100 group-hover:opacity-100";
 
   function quotaRowHtml(label, w) {
     const p = pct(w);
+    // 填充条的颜色**必须写行内样式**。原先用的是 `bg-text/60` —— 官方样式表里
+    // 根本没有这个类:Tailwind 只编译源码里出现过的透明度变体,`/10`(轨道)恰好
+    // 有人用过,`/60` 没有。于是宽度算对了(实测 4% = 9.39px),颜色却是
+    // rgba(0,0,0,0),看上去就是"有百分比、没进度"。
+    // 照抄类名只对**确实出现在实时 DOM 里**的类安全,自己拼的变体不算。
     return (
       `<div class="${RCX_MENU_ROW}" data-recodex-quota="1" role="menuitem" aria-disabled="true" data-disabled="" tabindex="-1">` +
       `<div class="flex w-full items-center gap-1.5">` +
       `<span class="flex-1 min-w-0 truncate opacity-70">${esc(t(label))}</span>` +
       `<span class="opacity-70 tabular-nums">${p}%</span></div>` +
-      `<div class="mt-1 h-[3px] w-full overflow-hidden rounded-full bg-text/10">` +
-      `<div class="h-full rounded-full bg-text/60" style="width:${p}%"></div></div></div>`
+      `<div class="mt-1 h-[3px] w-full overflow-hidden rounded-full" style="background:currentColor;opacity:.12">` +
+      `<div style="height:100%;border-radius:9999px;background:currentColor;opacity:1;width:${p}%"></div></div></div>`
+    );
+  }
+
+  // 官方菜单里的动作项。图标用 currentColor,跟着官方主题走。
+  const RCX_MENU_ICONS = {
+    usage:
+      '<path d="M4 20V10h3v10H4zm6.5 0V4h3v16h-3zM17 20v-7h3v7h-3z" fill="currentColor"/>',
+    invite:
+      '<path d="M9 12a4 4 0 100-8 4 4 0 000 8zm0 2c-3.3 0-6 1.8-6 4v2h12v-2c0-2.2-2.7-4-6-4zm10-5h-2v2h-2v2h2v2h2v-2h2v-2h-2V9z" fill="currentColor"/>',
+    logout:
+      '<path d="M10 4H6a2 2 0 00-2 2v12a2 2 0 002 2h4v-2H6V6h4V4zm5.5 3.5L14 9l2 2H9v2h7l-2 2 1.5 1.5L20 12l-4.5-4.5z" fill="currentColor"/>',
+  };
+
+  function actionRowHtml(key, label) {
+    return (
+      `<div class="${RCX_MENU_ACTION}" data-recodex-action="${key}" role="menuitem" tabindex="-1" data-orientation="vertical">` +
+      `<div class="flex w-full items-center gap-1.5">` +
+      `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" class="${RCX_ICON_CLS}">${RCX_MENU_ICONS[key]}</svg>` +
+      `<span class="flex-1 min-w-0 truncate">${esc(t(label))}</span></div></div>`
     );
   }
 
@@ -1108,8 +1133,37 @@
     let html = "";
     if (rcxAccount.w5 && rcxAccount.w5.used > 0) html += quotaRowHtml(t("5 小时用量"), rcxAccount.w5);
     if (rcxAccount.w7) html += quotaRowHtml(t("7 天用量"), rcxAccount.w7);
+    // 三个动作项放在官方菜单里(而不是我们自己的浮窗):用户找账号相关的东西
+    // 本来就会点左下角这个头像,再让他去右下角开一个面板是多一道弯。
+    html += actionRowHtml("usage", t("使用情况"));
+    html += actionRowHtml("invite", t("邀请好友"));
+    html += actionRowHtml("logout", t("退出登录"));
     if (html) header.insertAdjacentHTML("afterend", html);
+    bindMenuActions(menu);
     menu.dataset.recodexPatched = "1";
+  }
+
+  // 动作项是我们自己插的节点,所以直接挂监听。用 pointerdown 而不是 click:
+  // Radix 菜单在 pointerup 就会关闭并移除节点,等到 click 有时已经没人接了。
+  function bindMenuActions(menu) {
+    menu.querySelectorAll("[data-recodex-action]").forEach((el) => {
+      if (el.dataset.recodexBound === "1") return;
+      el.dataset.recodexBound = "1";
+      el.addEventListener("pointerdown", async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const key = el.dataset.recodexAction;
+        if (key === "usage") return openWeb("/dashboard/history", rcxWebUrl);
+        if (key === "invite") return openWeb("/dashboard/invites", rcxWebUrl);
+        if (key === "logout") {
+          await bridge("/recodex/logout", {});
+          rcxAccount = null;
+          removeOfficialUiPatches();
+          // 面板可能正开着账号页,一并刷新,免得两处说法不一致
+          try { await render(); } catch (e) {}
+        }
+      });
+    });
   }
 
   // 官方模式下必须彻底退出官方 UI —— 用户切过去就是想用 ChatGPT 自己的账号,
@@ -1117,6 +1171,9 @@
   function removeOfficialUiPatches() {
     document.querySelectorAll("[data-recodex-quota]").forEach((node) => node.remove());
     document.querySelectorAll("[data-recodex-plan]").forEach((node) => node.remove());
+    // 动作行也是我们插的,官方模式下必须一并撤走,否则菜单里还挂着「退出登录」
+    // 这种只对 ReCodex 有意义的项
+    document.querySelectorAll("[data-recodex-action]").forEach((node) => node.remove());
     document
       .querySelectorAll('[role="menu"][data-recodex-patched]')
       .forEach((menu) => menu.removeAttribute("data-recodex-patched"));
