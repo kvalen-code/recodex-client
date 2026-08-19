@@ -483,9 +483,30 @@
     ["custom", "自定义"],
   ];
 
+  // ── 桥不可用时的统一降级 ────────────────────────────────────
+  // 桥断了(launcher 没起来 / CDP binding 掉了)时,各页签原先各自"就地编造":
+  //   增强页照常画出 11 个开关 —— 点了没反应,也不说为什么;
+  //   微信页说"未绑定微信" —— 其实是不知道,把"没答复"当成了"答复是没绑定";
+  //   高级页少画几块也不吭声。
+  // 只有账号页做对了。把它那套统一出来:说清楚桥没就绪,给一个重试。
+  function bridgeUnavailable(res) {
+    if (!res) return true;
+    const code = res.error && res.error.code;
+    return res.status === "error" && (code === "no_bridge" || code === "bridge_error");
+  }
+
+  function renderBridgeDown(box, retry) {
+    if (!box) return;
+    box.innerHTML = `<div class="rcx-err">${t("ReCodex 桥未就绪")}</div>` +
+      `<button class="rcx-act sec" id="rcx-bridge-retry">${t("重试")}</button>`;
+    box.querySelector("#rcx-bridge-retry").onclick = retry;
+  }
+
   async function renderEnhancements() {
     const c = panel.querySelector("#recodex-enh");
     if (!c) return;
+    const probe = await bridge("/backend/settings", {});
+    if (bridgeUnavailable(probe)) { renderBridgeDown(c, renderEnhancements); return; }
     const settings = await readSettings();
     c.innerHTML = `<div id="rcx-enh-toggles"></div>` +
       `<div id="rcx-enh-width" style="margin-top:10px"></div>` +
@@ -601,6 +622,7 @@
     if (!c) return;
     wxStopPolling();
     const res = await bridge("/weixin/status", {});
+    if (bridgeUnavailable(res)) { renderBridgeDown(c, renderWeixin); return; }
     const cfg = (res && res.config) || {};
     const conn = (res && res.connect) || {};
     const [stateKey, stateCls] = WX_STATE_TEXT[conn.state] || WX_STATE_TEXT.idle;
@@ -1034,6 +1056,9 @@
     const c = panel.querySelector("#recodex-adv");
     if (!c) return;
     const cur = currentLang();
+    // 界面语言纯本地,桥断了也该能切;其余模块要如实说明不可用
+    const probe = await bridge("/recodex/official-mode", {});
+    const down = bridgeUnavailable(probe);
     let html = `<div class="rcx-field"><label>${t("界面语言")}</label>` +
       `<select id="rcx-lang">` +
       `<option value="zh"${cur === "zh" ? " selected" : ""}>简体中文</option>` +
@@ -1041,6 +1066,16 @@
       `<option value="ru"${cur === "ru" ? " selected" : ""}>Русский</option>` +
       `</select></div>`;
     html += `<div class="rcx-muted" style="margin-top:6px;font-size:12px">${t("跟随 Codex 语言;英语等未支持语种显示简体中文。")}</div>`;
+    if (down) {
+      html += `<div class="rcx-err" style="margin-top:10px;font-size:12px">${
+        t("ReCodex 桥未就绪")}</div>` +
+        `<button class="rcx-act sec" id="rcx-adv-retry">${t("重试")}</button>`;
+      c.innerHTML = html;
+      c.querySelector("#rcx-adv-retry").onclick = renderAdvanced;
+      const langSel = c.querySelector("#rcx-lang");
+      if (langSel) langSel.onchange = () => { setLang(langSel.value); renderTabLabels(); renderAdvanced(); };
+      return;
+    }
     html += `<div style="margin-top:14px;border-top:1px solid #23272f;padding-top:10px">`;
     html += `<div class="rcx-k" style="margin-bottom:4px">${t("系统集成")}</div>`;
     html += `<div id="rcx-adv-toggles"></div></div>`;
