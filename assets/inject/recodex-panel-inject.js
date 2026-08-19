@@ -389,7 +389,12 @@
       // 光说"可能不是最新"帮不上忙。把数据的时间点显示出来,用户点完刷新一看时间
       // 有没有动,就能自己判断是"没更新"还是"本来就没变化"。
       const at = u.refreshed_at ? fmtTime(u.refreshed_at) : "";
-      html += `<div class="rcx-err" style="font-size:12px;margin-bottom:6px">${
+      // 红字留给真故障。服务端把"距上游观测超过 5 分钟"就算 stale,
+      // 而那个观测时间取自上游探测的 FetchedAt —— 探测不前进,点多少次刷新
+      // 时间戳都不动。这是常态,不是错误;永远红着只会让人对红色脱敏。
+      // 有 why(读取/刷新真的失败了)才红,否则只是平静地告诉你数据截止到什么时候。
+      const cls = why ? "rcx-err" : "rcx-muted";
+      html += `<div class="${cls}" style="font-size:12px;margin-bottom:6px">${
         t("数据可能不是最新的")}${at ? `(${t("数据截至")} ${esc(at)})` : ""}${
         why ? `:${esc(why)}` : ""}</div>`;
     }
