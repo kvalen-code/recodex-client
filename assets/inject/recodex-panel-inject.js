@@ -498,30 +498,7 @@
     // 写失败时勾选框仍停在新状态,用户以为生效了 —— 这正是「开关不灵」的体感来源
     // (界面说开着,后端其实是关的,重开面板才发现又变回去了)。
     // 回读比"看写入返回值"可靠:两条写入路径(renderer 快通道 / 桥)返回形状并不一致。
-    container.querySelectorAll("input[data-k]").forEach((inp) => {
-      inp.onchange = async () => {
-        const k = inp.dataset.k, want = inp.checked;
-        inp.disabled = true;
-        let ok = false;
-        try {
-          if (typeof window.__codexPlusSetBackendSetting === "function") {
-            await window.__codexPlusSetBackendSetting(k, want);
-          } else {
-            await bridge("/settings/set", { [k]: want });
-          }
-          const after = await readSettings();
-          ok = !!after[k] === want;
-          inp.checked = !!after[k];
-        } catch (e) {
-          inp.checked = !want;
-        } finally {
-          inp.disabled = false;
-        }
-        toggleNote(container, ok ? "" : t("设置没有生效,请重试"));
-        // 宽度输入框要随「对话居中宽度」开关显隐,所以改完重绘当前页
-        if (ok && k === "codexAppConversationView") setTimeout(renderEnhancements, 500);
-      };
-    });
+    bindToggles(container);
   }
 
   async function readSettings() {
@@ -583,10 +560,20 @@
     box.innerHTML = `<div class="rcx-field"><label>${t("居中宽度(px)")}</label>` +
       `<input id="rcx-width" type="number" min="320" max="4000" step="10" value="${width}"></div>`;
     const input = box.querySelector("#rcx-width");
-    input.onchange = () => {
+    input.onchange = async () => {
       const v = Math.max(320, Math.min(4000, Math.round(Number(input.value) || 900)));
       input.value = v;
-      if (typeof window.__codexPlusSetSetting === "function") window.__codexPlusSetSetting("conversationViewMaxWidth", v);
+      if (typeof window.__codexPlusSetSetting !== "function") {
+        toggleNote(box, t("设置没有生效,请重试"));
+        return;
+      }
+      await window.__codexPlusSetSetting("conversationViewMaxWidth", v);
+      // 同样回读:写了不等于生效
+      const now = typeof window.__codexPlusGetSettings === "function" ? window.__codexPlusGetSettings() : {};
+      const actual = Number(now.conversationViewMaxWidth);
+      if (actual === v) { toggleNote(box, ""); return; }
+      input.value = actual || width;
+      toggleNote(box, t("设置没有生效,请重试"));
     };
   }
 
@@ -625,16 +612,35 @@
     });
   }
 
+  // 开关写入的**唯一**实现。这里一度有两份:`renderToggleList` 里一份、`bindToggles`
+  // 里一份,修了前者漏了后者 —— 服务模式那个开关走的正是后者,还留着老毛病。
+  // 合成一个,新增调用点自然带上校验。
   function bindToggles(box) {
     box.querySelectorAll("input[data-k]").forEach((inp) => {
-      inp.onchange = () => {
-        const k = inp.dataset.k, v = inp.checked;
-        if (typeof window.__codexPlusSetBackendSetting === "function") {
-          window.__codexPlusSetBackendSetting(k, v);
-        } else {
-          bridge("/settings/set", { [k]: v });
+      inp.onchange = async () => {
+        const k = inp.dataset.k, want = inp.checked;
+        inp.disabled = true;
+        let ok = false;
+        try {
+          if (typeof window.__codexPlusSetBackendSetting === "function") {
+            await window.__codexPlusSetBackendSetting(k, want);
+          } else {
+            await bridge("/settings/set", { [k]: want });
+          }
+          // 回读校验:写入返回值不可靠(两条路径形状不一,快通道干脆没有返回值)
+          const after = await readSettings();
+          ok = !!after[k] === want;
+          inp.checked = !!after[k];
+        } catch (e) {
+          inp.checked = !want;
+        } finally {
+          inp.disabled = false;
         }
-        setTimeout(renderEnhancements, 500);
+        toggleNote(box, ok ? "" : t("设置没有生效,请重试"));
+        // 这两个开关会改变页面结构(宽度框显隐 / 服务模式面板),生效了才重绘
+        if (ok && (k === "codexAppConversationView" || k === "codexAppServiceTierControls")) {
+          setTimeout(renderEnhancements, 500);
+        }
       };
     });
   }
