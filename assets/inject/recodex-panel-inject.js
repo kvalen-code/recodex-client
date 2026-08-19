@@ -1011,7 +1011,13 @@
   async function ensureAccountSoon(attempt) {
     await refreshAccountCache();
     scanOfficialAccountUi();
-    if ((!rcxAccount || !rcxAccount.email) && (attempt || 0) < 40) {
+    // 只在**还没拿到答复**时重试(桥没就绪 → 状态灯是 off)。
+    // 原条件是"没拿到 email",于是未登录的用户每次启动都会把 40 次重试跑满 ——
+    // 30 秒里往服务端打 40 发,而每发在服务端要拉账号+额度+网关三份数据。
+    // 「未登录」是个确定答复,不是"还没准备好",没有重试的意义。
+    const noAnswerYet = rcxStatus.cls === "off";
+    const stillWaiting = noAnswerYet || (rcxAccount && !rcxAccount.email);
+    if (stillWaiting && (attempt || 0) < 40) {
       setTimeout(() => ensureAccountSoon((attempt || 0) + 1), 750);
     }
   }
