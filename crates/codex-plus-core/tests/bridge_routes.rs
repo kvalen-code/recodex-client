@@ -253,7 +253,7 @@ async fn runtime_routes_keep_user_script_inventory_shape() {
 }
 
 #[tokio::test]
-async fn runtime_status_devtools_repair_and_ads_routes_are_dispatched() {
+async fn runtime_status_devtools_and_repair_routes_are_dispatched() {
     let ctx = test_context();
 
     assert_eq!(
@@ -272,9 +272,11 @@ async fn runtime_status_devtools_repair_and_ads_routes_are_dispatched() {
         handle_bridge_request(ctx.clone(), "/backend/status", json!({})).await,
         json!({"status": "ok", "message": "后端已连接", "version": codex_plus_core::version::VERSION, "hideOfficialUsageAlert": false})
     );
+    // 广告链路在瘦身时整条删掉了。这里从"期待它返回广告"改成"确认它已经不存在" ——
+    // 直接删掉断言的话,哪天有人把广告加回来也没人拦。
     assert_eq!(
-        handle_bridge_request(ctx.clone(), "/ads", json!({})).await,
-        json!({"version": 1, "ads": [{"id": "runtime-ad"}]})
+        handle_bridge_request(ctx.clone(), "/ads", json!({})).await["message"],
+        json!("Unknown bridge path")
     );
     assert_eq!(
         handle_bridge_request(ctx.clone(), "/zed-remote/status", json!({})).await,
@@ -1064,10 +1066,6 @@ impl BridgeRuntimeService for FakeRuntime {
             "models": ["qwen3-coder"],
             "sources": []
         }))
-    }
-
-    async fn ads(&self) -> anyhow::Result<Value> {
-        Ok(json!({"version": 1, "ads": [{"id": "runtime-ad"}]}))
     }
 
     async fn zed_remote_status(&self) -> anyhow::Result<Value> {

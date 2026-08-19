@@ -1195,6 +1195,12 @@ mod tests {
                 ),
             )),
             bridge_context: Arc::new(Mutex::new(None)),
+            // 桥迁到 launcher 之后新增的字段。这个测试验的是 watchdog 复用桥上下文,
+            // 用不到 ReCodex 状态;`from_env()` 在没有配置时会带着 init_error 构造出来,
+            // 不会 panic,拿来占位正合适。
+            recodex: Arc::new(LauncherRecodexBridge {
+                state: recodex_integration::desktop::ReCodexState::from_env(),
+            }),
         };
 
         hooks.bridge_context(9229, &test_dir).await.unwrap();
