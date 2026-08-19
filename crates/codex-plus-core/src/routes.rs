@@ -252,7 +252,11 @@ pub async fn handle_bridge_request(
                 Some(recodex) => recodex.handle("/recodex/prepare-uninstall", &payload),
                 None => json!({"status": "ready"}),
             };
-            let mut result = crate::uninstall::perform_uninstall(|| Ok(()));
+            // `perform_uninstall` 的整个设计是「还原失败就中止」。原先这里传的是
+            // `|| Ok(())` —— 恒真,那道防线等于不存在:配置还原失败照样删程序,
+            // 用户被扔在"配置被改过而程序没了"的死局。改成把桥的结果接进去。
+            let mut result =
+                crate::uninstall::perform_uninstall(|| uninstall_restore_result(&prepared));
             if let (Some(warning), Some(list)) = (
                 prepared.get("warning").and_then(Value::as_str),
                 result.get_mut("warnings").and_then(Value::as_array_mut),
@@ -697,6 +701,20 @@ async fn settings_value(
 
 // 全流程失败都返回结构化结果而不是 Err —— 更新失败要让用户看到原因,
 // 而不是一个笼统的桥错误。
+/// 把 `/recodex/prepare-uninstall` 的结果翻译成「配置是否还原成功」。
+/// 只有明确 `status == "failed"` 才算失败 —— 没有 ReCodex 桥时(`{"status":"ready"}`)
+/// 本就没有我们写的配置要还原。
+fn uninstall_restore_result(prepared: &Value) -> Result<(), String> {
+    if prepared.get("status").and_then(Value::as_str) != Some("failed") {
+        return Ok(());
+    }
+    Err(prepared
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("ReCodex 侧的卸载准备失败")
+        .to_string())
+}
+
 /// 从 `/recodex/check-client` 的返回里取出服务端下发的 manifest 地址。
 /// 只在 `available` 为真时才认 —— 没有可用更新就不该有任何下载动作。
 fn server_manifest_url(checked: &Value) -> Option<String> {
@@ -996,6 +1014,41 @@ fn empty_user_script_inventory() -> Value {
         "enabled": true,
         "scripts": []
     })
+}
+
+#[cfg(test)]
+mod uninstall_guard_tests {
+    use super::*;
+
+    /// `perform_uninstall` 的中止防线只有在真的收到失败时才有意义。
+    /// 这里原先传的是 `|| Ok(())`,防线形同虚设 —— 这几条断言把它钉住。
+    #[test]
+    fn restore_failure_is_reported_so_uninstall_can_abort() {
+        let prepared = json!({"status": "failed", "message": "还原 Codex 配置失败:拒绝访问"});
+        let error = uninstall_restore_result(&prepared).unwrap_err();
+        assert!(
+            error.contains("拒绝访问"),
+            "失败原因要透传给用户,而不是吞掉:{error}"
+        );
+    }
+
+    #[test]
+    fn missing_message_still_aborts() {
+        let prepared = json!({"status": "failed"});
+        assert!(uninstall_restore_result(&prepared).is_err(), "没有 message 也得中止");
+    }
+
+    #[test]
+    fn ready_and_unknown_shapes_allow_uninstall() {
+        // 没有 ReCodex 桥时是 {"status":"ready"} —— 本就没有我们写的配置要还原
+        assert!(uninstall_restore_result(&json!({"status": "ready"})).is_ok());
+        // 登出的服务端吊销失败只是 warning,不该拦住卸载
+        assert!(
+            uninstall_restore_result(&json!({"status": "ready", "warning": "服务端会话未能吊销"}))
+                .is_ok()
+        );
+        assert!(uninstall_restore_result(&json!({})).is_ok());
+    }
 }
 
 #[cfg(test)]

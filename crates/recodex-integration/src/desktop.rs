@@ -573,6 +573,15 @@ pub fn recodex_official_mode_disable() -> Value {
 /// 避免本 crate 反向依赖 codex-plus-core。
 pub fn recodex_prepare_uninstall(state: &ReCodexState) -> Value {
     let logout = recodex_logout(state);
+    // 登出里的 restore_all() 是 best-effort(登出本身不该被配置写入失败卡住),
+    // 但卸载不一样:配置没还原就删程序,用户会被扔在"配置被改过而程序没了"的死局。
+    // 所以这里**显式**再还原一次并把结果报上去,由 core 决定中止。
+    if let Err(restore_error) = crate::codexcfg::restore_all() {
+        return json!({
+            "status": "failed",
+            "message": format!("还原 Codex 配置失败:{restore_error}")
+        });
+    }
     // 这里必须是**丢弃**而不是 switch_to_recodex():后者会把登出刚撤掉的托管块和
     // RECODEX_KEY 重新装回去,程序随即自删 —— 用户剩下一个指向已吊销网关的 Codex。
     // (recodex_logout 内部已经丢过一次,这里兜底,顺序换了也不会漏。)
