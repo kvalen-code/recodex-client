@@ -1,0 +1,40 @@
+name: macOS verify
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/recodex-integration/**"
+      - "scripts/installer/macos/**"
+permissions:
+  contents: read
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # 钥匙串那层只能在真 mac 上验:编得过但存不进 = 用户登不上
+      - name: 测试(含钥匙串往返)
+        run: cargo test -p recodex-integration --target ${{ matrix.target }}
+      - name: 构建
+        run: cargo build --release --target ${{ matrix.target }} -p codex-plus-launcher
+      - name: 打 DMG 并自检
+        run: |
+          BINARY_DIR="$PWD/target/${{ matrix.target }}/release" \
+            bash scripts/installer/macos/package-recodex-dmg.sh 1.2.50 ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recodex-macos-${{ matrix.arch }}-dmg
+          path: dist/macos/*.dmg
