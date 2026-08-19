@@ -27,6 +27,9 @@ pub struct ReCodexState {
     /// 而且**没有任何解释**,只能重新登录一次 —— 如果原因是凭据存储本身坏了,
     /// 重新登录也白搭,他会一直循环。
     credential_notice: Option<String>,
+    /// 用户端站点地址。面板里「使用情况 / 邀请好友」要跳到网页,
+    /// 地址放在这里而不是写死在注入脚本里 —— 指向测试环境时链接要跟着走。
+    web_url: String,
 }
 
 fn parallel_snapshot_requests<UsageResult, AccountResult, GatewayResult>(
@@ -55,6 +58,9 @@ impl ReCodexState {
     pub fn from_env() -> Self {
         let api_url = std::env::var("RECODEX_API_URL")
             .unwrap_or_else(|_| "https://api.recodex.dev".to_owned());
+        let web_url = std::env::var("RECODEX_WEB_URL")
+            .map(|value| value.trim_end_matches('/').to_owned())
+            .unwrap_or_else(|_| "https://recodex.dev".to_owned());
         let result = HttpTransport::new(&api_url, std::time::Duration::from_secs(10))
             .and_then(|transport| Adapter::new(transport, &api_url))
             .and_then(|adapter| {
@@ -90,6 +96,7 @@ impl ReCodexState {
                     auth_epoch: AtomicU64::new(0),
                     init_error: None,
                     credential_notice,
+                    web_url,
                 }
             }
             Err(error) => Self {
@@ -101,6 +108,7 @@ impl ReCodexState {
                 auth_epoch: AtomicU64::new(0),
                 init_error: Some(error.to_string()),
                 credential_notice: None,
+                web_url,
             },
         }
     }
@@ -236,7 +244,7 @@ fn snapshot(state: &ReCodexState, refresh: bool) -> Value {
     }
     drop(guard);
     let stale = usage.stale || account_error.is_some() || gateway_error.is_some();
-    json!({"status": if stale { "stale" } else { "ready" }, "data":{"account":account.ok(),"usage":usage,"gateways":gateways,"selected_gateway":selected,"account_error":account_error,"gateway_error":gateway_error}})
+    json!({"status": if stale { "stale" } else { "ready" }, "data":{"account":account.ok(),"usage":usage,"gateways":gateways,"selected_gateway":selected,"account_error":account_error,"gateway_error":gateway_error,"web_url":state.web_url}})
 }
 
 pub fn recodex_status(state: &ReCodexState) -> Value {

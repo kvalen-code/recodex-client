@@ -86,6 +86,13 @@
       "增强功能": "增強功能", "微信连接": "微信連接", "加载中…": "載入中…",
       "邮箱": "郵箱", "套餐": "套餐", "网关": "網關", "未选": "未選",
       "用最快网关": "用最快網關", "刷新额度": "重新整理額度", "登出": "登出",
+      "使用情况": "使用情況", "邀请好友": "邀請好友", "退出登录": "退出登入",
+      "无法自动打开,请复制到浏览器:": "無法自動開啟,請複製到瀏覽器:",
+      "侧边栏已切换到你的账号。要让官方 Codex 也用上,需要": "側邊欄已切換到你的帳號。要讓官方 Codex 也用上,需要",
+      "重启一次": "重新啟動一次", "(无需再登 ChatGPT)。": "(無需再登入 ChatGPT)。",
+      "立即重启生效": "立即重新啟動生效", "稍后手动重启": "稍後手動重新啟動",
+      "正在重启…": "正在重新啟動…",
+      "重启失败,请手动退出后重新打开": "重新啟動失敗,請手動結束後重新開啟",
       "5 小时": "5 小時", "7 天": "7 天", "5 小时用量": "5 小時用量", "7 天用量": "7 天用量",
       "未登录 ReCodex。": "未登入 ReCodex。", "登录 ReCodex": "登入 ReCodex",
       "无法读取状态": "無法讀取狀態", "重试": "重試",
@@ -159,6 +166,13 @@
       "增强功能": "Улучшения", "微信连接": "WeChat", "加载中…": "Загрузка…",
       "邮箱": "Почта", "套餐": "Тариф", "网关": "Шлюз", "未选": "не выбран",
       "用最快网关": "Самый быстрый шлюз", "刷新额度": "Обновить квоту", "登出": "Выйти",
+      "使用情况": "Использование", "邀请好友": "Пригласить друзей", "退出登录": "Выйти",
+      "无法自动打开,请复制到浏览器:": "Не удалось открыть автоматически, скопируйте в браузер:",
+      "侧边栏已切换到你的账号。要让官方 Codex 也用上,需要": "Боковая панель переключена на ваш аккаунт. Чтобы официальный Codex тоже его использовал, нужно",
+      "重启一次": "перезапустить", "(无需再登 ChatGPT)。": " (входить в ChatGPT повторно не нужно).",
+      "立即重启生效": "Перезапустить сейчас", "稍后手动重启": "Перезапущу позже вручную",
+      "正在重启…": "Перезапуск…",
+      "重启失败,请手动退出后重新打开": "Перезапуск не удался, закройте и откройте приложение вручную",
       "5 小时": "5 часов", "7 天": "7 дней", "5 小时用量": "Расход за 5 ч", "7 天用量": "Расход за 7 дн",
       "未登录 ReCodex。": "Вы не вошли в ReCodex.", "登录 ReCodex": "Войти в ReCodex",
       "无法读取状态": "Не удалось получить статус", "重试": "Повторить",
@@ -412,7 +426,9 @@
     html += `<div class="rcx-row"><span class="rcx-k">${t("网关")}</span><span>${esc(sel ? sel.name : t("未选"))}</span></div>`;
     html += `<button class="rcx-act" id="rcx-fastest">${t("用最快网关")}</button>`;
     html += `<button class="rcx-act sec" id="rcx-refresh">${t("刷新额度")}</button>`;
-    html += `<button class="rcx-act sec" id="rcx-logout">${t("登出")}</button>`;
+    html += `<button class="rcx-act sec" id="rcx-usage">${t("使用情况")}</button>`;
+    html += `<button class="rcx-act sec" id="rcx-invite">${t("邀请好友")}</button>`;
+    html += `<button class="rcx-act sec" id="rcx-logout">${t("退出登录")}</button>`;
     body().innerHTML = html;
     // 桥可能带回 warning(例如官方模式下网关只记进快照、切回后才生效)。
     // 原先直接丢掉,用户点完只看到界面刷新一下,不知道到底生没生效。
@@ -429,7 +445,34 @@
       }
     };
     body().querySelector("#rcx-refresh").onclick = async () => { await bridge("/recodex/refresh-usage", {}); render(); };
-    body().querySelector("#rcx-logout").onclick = async () => { await bridge("/recodex/logout", {}); render(); };
+    body().querySelector("#rcx-usage").onclick = () => openWeb("/dashboard/history", d.web_url);
+    body().querySelector("#rcx-invite").onclick = () => openWeb("/dashboard/invites", d.web_url);
+    body().querySelector("#rcx-logout").onclick = async () => {
+      await bridge("/recodex/logout", {});
+      // 登出后官方侧边栏还挂着我们写的邮箱,得立刻还原,否则看着像"没退成功"
+      rcxAccount = null;
+      removeOfficialUiPatches();
+      render();
+    };
+  }
+
+  // 打开用户端网页。注入页里 window.open 常被 Electron 拦掉,所以先走桥;
+  // 桥不通再退回 window.open,两条都不行就把地址显示出来让用户自己复制 ——
+  // 点了毫无反应是最差的结果。
+  // 站点地址来自服务端下发(status.data.web_url),不写死在脚本里。
+  const WEB_FALLBACK = "https://recodex.dev";
+  async function openWeb(path, base) {
+    const url = String(base || WEB_FALLBACK).replace(/\/+$/, "") + path;
+    const r = await bridge("/open-external", { url });
+    if (r && r.status !== "error") return;
+    try {
+      if (window.open(url, "_blank")) return;
+    } catch (e) {}
+    const line = document.createElement("div");
+    line.className = "rcx-err";
+    line.style.cssText = "font-size:12px;margin-top:6px;word-break:break-all";
+    line.textContent = `${t("无法自动打开,请复制到浏览器:")}${url}`;
+    body().appendChild(line);
   }
 
   async function doLogin() {
@@ -492,7 +535,7 @@
         return;
       }
       const poll = await bridge("/recodex/login/poll", {});
-      if (poll.status === "approved") { showLoginDone(); return; }
+      if (poll.status === "approved") { await showLoginDone(); return; }
       if (poll.status === "error") { const el = body().querySelector("#rcx-poll"); if (el) { el.className = "rcx-err"; el.textContent = poll.error ? poll.error.message : t("登录失败"); } return; }
       setTimeout(tick, 5000);
     };
@@ -500,15 +543,43 @@
   }
 
   // 登录已批准:config/auth/key 已写入,但官方 Codex 早在登录前就启动了,读不到新配置。
-  // 首次登录必须重启整个 ReCodex(setx 已把 key 持久化到用户环境,重开后新起的 Codex 才生效)。
-  function showLoginDone() {
+  // 所以**要重启**才能让 Codex 用上你的账号。
+  //
+  // 但左下角侧边栏那个名字是另一回事 —— 它是我们纯 DOM 改写的,不需要重启,
+  // 只要刷新一次账号缓存就能立刻变。原先这里两件事没分开:登录成功后既不刷缓存,
+  // 未登录时轮询又已经退避到 5 分钟,于是用户看到"登录成功了,左下角还是官方账号",
+  // 最坏要干等 5 分钟。把能立刻做的事立刻做掉,只有真需要重启的才叫用户重启。
+  async function showLoginDone() {
     body().innerHTML =
       `<div style="color:#3ee98a;font-weight:600;font-size:14px">${t("✅ 登录成功")}</div>` +
       // 句中有 <b> 标记,拆成三段分别翻译,避免把 HTML 塞进词条
-      `<div class="rcx-muted" style="margin-top:8px">${t("首次登录需重启生效:请")}<b style="color:#e6e9ef">${t("完全退出 Codex,再双击桌面 ReCodex 重新打开")}</b>${t(",官方界面才会用上你的账号(无需再登 ChatGPT)。")}</div>` +
-      `<button class="rcx-act sec" id="rcx-recheck" style="margin-top:12px">${t("我已重启,刷新状态")}</button>`;
+      `<div class="rcx-muted" style="margin-top:8px">${t("侧边栏已切换到你的账号。要让官方 Codex 也用上,需要")}<b style="color:#e6e9ef">${t("重启一次")}</b>${t("(无需再登 ChatGPT)。")}</div>` +
+      `<button class="rcx-act" id="rcx-restart" style="margin-top:12px">${t("立即重启生效")}</button>` +
+      `<button class="rcx-act sec" id="rcx-recheck">${t("稍后手动重启")}</button>`;
+    const restart = body().querySelector("#rcx-restart");
+    if (restart) {
+      restart.onclick = async () => {
+        restart.disabled = true;
+        restart.textContent = t("正在重启…");
+        const r = await bridge("/restart-codex", {});
+        // 重启成功的话这个进程就没了,下面这段只有失败时才会跑到
+        if (r && r.status === "error") {
+          restart.disabled = false;
+          restart.textContent = t("立即重启生效");
+          const line = document.createElement("div");
+          line.className = "rcx-err";
+          line.style.cssText = "font-size:12px;margin-top:6px";
+          line.textContent = (r.error && r.error.message) || t("重启失败,请手动退出后重新打开");
+          body().appendChild(line);
+        }
+      };
+    }
     const btn = body().querySelector("#rcx-recheck");
     if (btn) btn.onclick = render;
+    // 侧边栏能立刻变的部分,立刻变 —— 并把退避了的轮询拉回正常节奏
+    pollDelay = POLL_BASE_MS;
+    await refreshAccountCache();
+    scanOfficialAccountUi();
   }
 
   // ── 增强开关(Codex++ 增强,经 /settings 桥,与 recodex 登录无关)──
