@@ -98,6 +98,33 @@ fn error(code: &str, message: impl Into<String>) -> Value {
 // Point Codex at the just-selected gateway by rewriting the managed config
 // block in ~/.codex/config.toml. Returns a warning string if the rewrite failed
 // (the server-side selection still succeeded); an empty endpoint routes nothing.
+// ── 写 `~/.codex` 的两个入口 ─────────────────────────────────────────────
+//
+// 「官方模式」是个状态机,而往 `~/.codex` 写 ReCodex 配置的地方不止一处 ——
+// 各写各的,就会出现"面板显示官方模式、Codex 却已走回 ReCodex"这类无声的不一致。
+// (已经因此踩过四次:快照漏 auth.json / 卸载时被还原回来 / 登出不清快照 / 换网关破坏模式。)
+//
+// 所以本文件只允许**这两个函数**碰 `codexcfg` 的安装类接口,策略在各自处写死:
+//   - `install_login_config`  登录 = 用户明确要用 ReCodex → 丢弃快照,写活配置
+//   - `route_codex_through_gateway` 换网关 = 不表态用哪个模式 → 官方模式下只记快照
+//
+// 下面的 `config_writers_are_centralised` 测试会盯着这条约束,免得再冒出第三个写入口。
+
+/// 登录成功后把服务端下发的配置装进 `~/.codex`。
+///
+/// **登录即表态**:用户在官方模式下重新登录 ReCodex,意思就是现在要用 ReCodex。
+/// 所以先丢掉官方模式快照 —— 留着的话 `is_official_mode()` 仍为真,
+/// 状态灯不显示、按钮显示"切回 ReCodex",一点就用陈旧的网关和 key 盖掉刚登录的配置。
+fn install_login_config(
+    config: &str,
+    auth_json: &str,
+    env_key: &str,
+    env_value: &str,
+) -> std::io::Result<()> {
+    let _ = crate::officialmode::discard_snapshot();
+    crate::codexcfg::apply_login(config, auth_json, env_key, env_value)
+}
+
 fn route_codex_through_gateway(endpoint: &str) -> Option<String> {
     let endpoint = endpoint.trim().trim_end_matches('/');
     if endpoint.is_empty() {
@@ -499,7 +526,7 @@ pub fn recodex_login_poll(state: &ReCodexState) -> Value {
             // Route Codex through ReCodex: write the config.toml block, auth.json
             // and RECODEX_KEY env var the server just handed us, so the launched
             // Codex uses ReCodex. Non-fatal — the session is valid regardless.
-            if let Err(config_error) = crate::codexcfg::apply_login(
+            if let Err(config_error) = install_login_config(
                 &result.config,
                 &result.auth_json,
                 &result.env_key,
@@ -624,5 +651,40 @@ pub fn handle_bridge(state: &ReCodexState, path: &str, payload: &Value) -> Value
         "/recodex/official-mode/disable" => recodex_official_mode_disable(),
         "/recodex/prepare-uninstall" => recodex_prepare_uninstall(state),
         _ => error("not_found", format!("unknown recodex path: {path}")),
+    }
+}
+
+#[cfg(test)]
+mod config_writer_tests {
+    /// 写 `~/.codex` 的入口必须只有两个,而且各自带着官方模式的策略。
+    ///
+    /// 这条约束靠人记是记不住的 —— 已经因此踩过四次(快照漏 auth.json /
+    /// 卸载时被还原回来 / 登出不清快照 / 换网关破坏模式)。所以直接读自己的源码断言:
+    /// `apply_login` 和 `route_through_gateway` 各自只能出现一次,
+    /// 也就是只能待在 `install_login_config` 和 `route_codex_through_gateway` 里面。
+    /// 谁想加第三个写入口,这条测试会先红给他看。
+    #[test]
+    fn config_writers_are_centralised() {
+        let source = include_str!("desktop.rs");
+        // 去掉本测试模块自身,否则下面这些字面量会被算进去
+        let body = source
+            .split("mod config_writer_tests")
+            .next()
+            .expect("测试模块之前的正文");
+
+        for symbol in ["crate::codexcfg::apply_login(", "crate::codexcfg::route_through_gateway("] {
+            let count = body.matches(symbol).count();
+            assert_eq!(
+                count, 1,
+                "{symbol} 只应出现在唯一的受管写入口里,实际出现 {count} 次 —— \
+                 新增写入口请走 install_login_config / route_codex_through_gateway,\
+                 它们各自处理了官方模式"
+            );
+        }
+
+        assert!(
+            body.contains("fn install_login_config"),
+            "登录写入口应保留具名函数,策略写在它的文档注释里"
+        );
     }
 }

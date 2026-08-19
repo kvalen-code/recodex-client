@@ -119,6 +119,23 @@ fn switching_to_official_and_back_keeps_the_user_logged_in() {
         "非官方模式下不该接管写入"
     );
 
+    // 7) 官方模式下重新登录 = 用户明确要用 ReCodex,快照必须被丢掉。
+    //    留着的话 is_official_mode() 仍为真,一点"切回 ReCodex"就用陈旧的
+    //    网关和 key 盖掉刚登录的配置。(login 路径走的就是这两步。)
+    officialmode::switch_to_official().unwrap();
+    assert!(officialmode::is_official_mode());
+    officialmode::discard_snapshot().unwrap();
+    codexcfg::apply_login(GATEWAY_BLOCK, OUR_AUTH, codexcfg::SUB2API_ENV_KEY, "sk-recodex2").unwrap();
+    assert!(
+        !officialmode::is_official_mode(),
+        "登录之后不该还被认为在官方模式"
+    );
+    let after_login = std::fs::read_to_string(codex_config()).unwrap();
+    assert!(
+        after_login.contains("model_providers.recodex"),
+        "登录应把托管块写进活配置:{after_login}"
+    );
+
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 
