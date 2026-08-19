@@ -524,6 +524,10 @@ pub fn recodex_logout(state: &ReCodexState) -> Value {
     // Revert the Codex config we own so Codex stops using ReCodex. Best-effort:
     // a failure here must not block sign-out.
     let _ = crate::codexcfg::restore_all();
+    // 快照里的托管块和 key 都是这次会话的,登出后已经作废。
+    // 留着的话:下次登录后 `is_official_mode()` 仍为真(灯不显示、按钮显示"切回"),
+    // 用户一点"切回 ReCodex",陈旧的网关和 key 就会盖掉刚登录的正确配置。
+    let _ = crate::officialmode::discard_snapshot();
     if state
         .credentials
         .as_ref()
@@ -569,7 +573,10 @@ pub fn recodex_official_mode_disable() -> Value {
 /// 避免本 crate 反向依赖 codex-plus-core。
 pub fn recodex_prepare_uninstall(state: &ReCodexState) -> Value {
     let logout = recodex_logout(state);
-    let _ = crate::officialmode::switch_to_recodex();
+    // 这里必须是**丢弃**而不是 switch_to_recodex():后者会把登出刚撤掉的托管块和
+    // RECODEX_KEY 重新装回去,程序随即自删 —— 用户剩下一个指向已吊销网关的 Codex。
+    // (recodex_logout 内部已经丢过一次,这里兜底,顺序换了也不会漏。)
+    let _ = crate::officialmode::discard_snapshot();
     json!({
         "status": "ready",
         "warning": logout.get("error").and_then(|v| v.get("message")).cloned()

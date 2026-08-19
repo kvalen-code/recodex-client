@@ -133,6 +133,18 @@ pub fn switch_to_official() -> io::Result<()> {
     Ok(())
 }
 
+/// 丢弃快照,**不写回任何东西**。
+///
+/// 与 `switch_to_recodex()` 的区别是决定性的:那个会把托管块和 `RECODEX_KEY`
+/// 重新装回 `~/.codex`。登出和卸载都不能用它 ——
+/// 登出后快照里的 key 已经失效,卸载更是要把我们的配置**清干净**。
+/// 卸载路径上一度就是用 `switch_to_recodex()` 做"清理"的,结果是:
+/// 登出刚撤掉的托管块又被装回去,程序随即自删,
+/// 用户剩下一个指向已吊销网关的 Codex,连能修它的程序都没了。
+pub fn discard_snapshot() -> io::Result<()> {
+    clear_snapshot()
+}
+
 /// 切回 ReCodex:按快照原样写回,不需要重新登录。
 pub fn switch_to_recodex() -> io::Result<()> {
     let Some(snapshot) = load_snapshot()? else {

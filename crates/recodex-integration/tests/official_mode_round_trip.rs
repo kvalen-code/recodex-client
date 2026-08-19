@@ -73,5 +73,29 @@ fn switching_to_official_and_back_keeps_the_user_logged_in() {
         "第二轮往返同样要保住登录态"
     );
 
+    // 5) 卸载/登出走的是**丢弃**,不是还原 —— 两者结果必须相反
+    officialmode::switch_to_official().unwrap();
+    let after_switch = std::fs::read_to_string(codex_config()).unwrap_or_default();
+    assert!(
+        !after_switch.contains("model_providers.recodex"),
+        "切到官方后托管块应已撤掉"
+    );
+
+    officialmode::discard_snapshot().unwrap();
+    assert!(!officialmode::is_official_mode(), "丢弃后不该再认为在官方模式");
+    let after_discard = std::fs::read_to_string(codex_config()).unwrap_or_default();
+    assert!(
+        !after_discard.contains("model_providers.recodex"),
+        "丢弃**不能**把托管块装回去 —— 卸载路径上装回去就等于留了个指向已吊销网关的 Codex:{after_discard}"
+    );
+    assert!(
+        !officialmode::load_snapshot().unwrap().is_some(),
+        "快照文件应已删除"
+    );
+
     let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+fn codex_config() -> std::path::PathBuf {
+    codexcfg::config_path().unwrap()
 }
