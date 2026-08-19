@@ -1089,8 +1089,12 @@
       `<div class="flex w-full items-center gap-1.5">` +
       `<span class="flex-1 min-w-0 truncate opacity-70">${esc(t(label))}</span>` +
       `<span class="opacity-70 tabular-nums">${p}%</span></div>` +
-      `<div class="mt-1 h-[3px] w-full overflow-hidden rounded-full" style="background:currentColor;opacity:.12">` +
-      `<div style="height:100%;border-radius:9999px;background:currentColor;opacity:1;width:${p}%"></div></div></div>`
+      // 轨道保持 `bg-text/10`:这个类**实测存在**(计算值 oklab(... / 0.1))。
+      // 千万别改成行内 `opacity:.12` —— CSS 的 opacity 会连子元素一起乘,
+      // 填充条会被压成 12% 透明度、几乎看不见。而 `getComputedStyle(fill).opacity`
+      // 读到的仍是 1(逐元素属性),量属性量不出这个问题,必须量画面。
+      `<div class="mt-1 h-[3px] w-full overflow-hidden rounded-full bg-text/10">` +
+      `<div style="height:100%;border-radius:9999px;background:currentColor;width:${p}%"></div></div></div>`
     );
   }
 
