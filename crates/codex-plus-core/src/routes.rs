@@ -223,14 +223,27 @@ pub async fn handle_bridge_request(
         // recodex-overlay: 卸载后退出 —— 与 /restart-codex 的区别是**不拉接班进程**,
         // 否则新进程会重新锁住待删的 exe,自删脚本必然失败
         "/quit" => ctx.runtime.quit().await,
-        // recodex-overlay: 自更新 —— 下载并校验后就位,由前端接着触发重启
+        // recodex-overlay: 自更新 —— 下载并校验后就位,由前端接着触发重启。
+        //
+        // **更新地址只认服务端下发的,不接受页面传参**。这条桥暴露在渲染进程里,
+        // 而注入目标只要求"是个 page",并不限制来源 —— 一旦注入落到非官方页面,
+        // 让页面指定 manifest 地址就等于把「安装任意 exe」的权限交出去。
+        // 所以这里现问一次带认证的 check-client,用它给的地址。
         "/self-update" => {
-            let manifest_url = payload
-                .get("manifestUrl")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            Ok(self_update_value(manifest_url).await)
+            let manifest_url = match ctx.recodex.as_ref() {
+                Some(recodex) => {
+                    let checked = recodex.handle("/recodex/check-client", &json!({}));
+                    server_manifest_url(&checked)
+                }
+                None => None,
+            };
+            match manifest_url {
+                Some(url) => Ok(self_update_value(url).await),
+                None => Ok(json!({
+                    "status": "failed",
+                    "message": "服务端没有下发可用的更新地址,已拒绝更新"
+                })),
+            }
         }
         // recodex-overlay: 卸载 —— 先让 ReCodex 桥做登出与凭据清理(它持有账号状态),
         // 再由本模块删目录/快捷方式并安排 exe 自删。面板侧已二次确认。
@@ -684,6 +697,17 @@ async fn settings_value(
 
 // 全流程失败都返回结构化结果而不是 Err —— 更新失败要让用户看到原因,
 // 而不是一个笼统的桥错误。
+/// 从 `/recodex/check-client` 的返回里取出服务端下发的 manifest 地址。
+/// 只在 `available` 为真时才认 —— 没有可用更新就不该有任何下载动作。
+fn server_manifest_url(checked: &Value) -> Option<String> {
+    let channel = checked.get("data")?.get("update_channel")?;
+    if !channel.get("available").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let url = channel.get("manifest_url").and_then(Value::as_str)?.trim();
+    (!url.is_empty()).then(|| url.to_string())
+}
+
 async fn self_update_value(manifest_url: String) -> Value {
     if manifest_url.trim().is_empty() {
         return json!({"status": "failed", "message": "服务端未提供更新清单地址"});
@@ -972,4 +996,58 @@ fn empty_user_script_inventory() -> Value {
         "enabled": true,
         "scripts": []
     })
+}
+
+#[cfg(test)]
+mod self_update_source_tests {
+    use super::*;
+
+    /// 更新地址必须来自服务端。这条桥暴露在渲染进程里,而注入目标只要求"是个 page",
+    /// 页面能指定 manifest 就等于把「安装任意 exe」的权限交出去。
+    #[test]
+    fn only_the_server_can_name_the_update_source() {
+        let served = json!({
+            "status": "ok",
+            "data": {
+                "update_channel": {
+                    "available": true,
+                    "latest_version": "1.2.50",
+                    "manifest_url": "https://oss.example.com/recodex/1.2.50/manifest.json"
+                }
+            }
+        });
+        assert_eq!(
+            server_manifest_url(&served).as_deref(),
+            Some("https://oss.example.com/recodex/1.2.50/manifest.json")
+        );
+    }
+
+    #[test]
+    fn no_available_update_means_no_download() {
+        // 没有可用更新时不该有任何下载动作,哪怕响应里还带着地址
+        let served = json!({
+            "status": "ok",
+            "data": {
+                "update_channel": {
+                    "available": false,
+                    "reason": "not_in_rollout",
+                    "manifest_url": "https://oss.example.com/stale/manifest.json"
+                }
+            }
+        });
+        assert!(server_manifest_url(&served).is_none());
+    }
+
+    #[test]
+    fn malformed_or_signed_out_responses_yield_nothing() {
+        assert!(server_manifest_url(&json!({})).is_none());
+        assert!(server_manifest_url(&json!({"status": "signed_out", "data": {}})).is_none());
+        // 空地址不算地址
+        assert!(
+            server_manifest_url(&json!({
+                "data": {"update_channel": {"available": true, "manifest_url": "  "}}
+            }))
+            .is_none()
+        );
+    }
 }

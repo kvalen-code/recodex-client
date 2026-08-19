@@ -923,7 +923,9 @@
 
   async function startUpdate(box, channel) {
     box.innerHTML = `<div class="rcx-muted">${t("正在下载…")}</div>`;
-    const r = await bridge("/self-update", { manifestUrl: channel.manifest_url || "" });
+    // 不传 manifest 地址:更新源由服务端说了算,桥会自己去问一次带认证的接口。
+    // 页面能指定安装包地址 = 把「安装任意 exe」的权限交给渲染进程。
+    const r = await bridge("/self-update", {});
     if (!r || r.status !== "ok") {
       box.innerHTML = `<div class="rcx-err" style="font-size:12px">${
         esc((r && r.message) || t("更新失败"))}</div>` +
