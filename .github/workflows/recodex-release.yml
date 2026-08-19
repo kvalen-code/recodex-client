@@ -134,6 +134,38 @@ jobs:
           Invoke-WebRequest -Uri "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/ReCodex-$v-windows-x64-setup.exe" -Method Head -UseBasicParsing -TimeoutSec 30 | Out-Null
           Write-Host "回读校验通过:manifest 与两个包体公网可取"
 
+      # 官网下载页读的就是这个指针。放在 windows job 的最后:
+      # mac 的 DMG 由 macos job 各自上传,这里只需要把地址算出来 ——
+      # 写死版本号在前端,每发一版都要重新部署一次前端。
+      - name: 更新 latest.json(官网下载页的指针)
+        shell: pwsh
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_REGION: ${{ vars.OSS_REGION }}
+          OSS_ENDPOINT: ${{ vars.OSS_ENDPOINT }}
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $base = "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v"
+          $latest = [ordered]@{
+            version = $v
+            assets  = [ordered]@{
+              windows    = "$base/ReCodex-$v-windows-x64-setup.exe"
+              macos_arm64 = "$base/ReCodex-$v-macos-arm64.dmg"
+              macos_x64   = "$base/ReCodex-$v-macos-x64.dmg"
+            }
+          }
+          [System.IO.File]::WriteAllText("latest.json",
+            ($latest | ConvertTo-Json -Depth 4),
+            (New-Object System.Text.UTF8Encoding($false)))
+          $oss = (Get-ChildItem ossutil -Recurse -Filter ossutil.exe | Select-Object -First 1).FullName
+          & $oss cp latest.json "${{ vars.OSS_TARGET }}/latest.json" --acl public-read --force
+          if ($LASTEXITCODE -ne 0) { throw "latest.json 上传失败" }
+          # 回读:下载页拿不到它就整页显示"尚未发布"
+          $back = Invoke-RestMethod -Uri "${{ vars.RECODEX_CLIENT_BASE_URL }}/latest.json" -TimeoutSec 30
+          if ($back.version -ne $v) { throw "线上 latest.json 版本是 $($back.version),不是 $v" }
+          Write-Host "latest.json 已就位:$v"
+
       - uses: actions/upload-artifact@v4
         with:
           name: recodex-${{ steps.ver.outputs.version }}-windows
