@@ -137,6 +137,34 @@ mod tests {
         );
     }
 
+    /// 卸载成功后面板必须调 `/quit` 而不是 `/restart-codex`。
+    ///
+    /// 这条曾经是错的:`/restart-codex` 会拉一个接班 launcher,把刚安排自删的 exe
+    /// 重新锁住,清理脚本重试 60 次全部失败后放弃 —— 用户点了卸载,配置还了、
+    /// 设备吊销了、快捷方式删了,程序却还在跑、exe 还躺在磁盘上。
+    /// 这个断言直接钉住注入脚本,免得以后有人图省事改回去。
+    #[test]
+    fn panel_quits_instead_of_restarting_after_uninstall() {
+        let panel = include_str!("../../../assets/inject/recodex-panel-inject.js");
+        let uninstall_block = panel
+            .split("function confirmUninstall")
+            .nth(1)
+            .expect("面板里应有 confirmUninstall");
+        // 只看卸载这一段:文件别处用 /restart-codex 是正常的(切换运行模式等)
+        let uninstall_block = &uninstall_block[..uninstall_block
+            .find("function ")
+            .unwrap_or(uninstall_block.len())];
+        assert!(
+            uninstall_block.contains("bridge(\"/quit\""),
+            "卸载后必须调 /quit"
+        );
+        assert!(
+            // 只匹配真正的桥调用 —— 注释里提到 /restart-codex 是在解释为什么不能用它
+            !uninstall_block.contains("bridge(\"/restart-codex\""),
+            "卸载后不能调 /restart-codex —— 接班进程会锁住待删的 exe"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn self_delete_retries_until_the_running_binary_exits() {

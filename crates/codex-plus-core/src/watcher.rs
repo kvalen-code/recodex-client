@@ -689,3 +689,20 @@ pub fn restart_with_fresh_launcher() -> std::io::Result<()> {
     std::process::Command::new(exe).arg("--await-guard").spawn()?;
     Ok(())
 }
+
+// recodex-overlay: 卸载专用的收尾 —— 杀掉 Codex 但**绝不接班**。
+//
+// 这里刻意不复用 `restart_with_fresh_launcher()`。卸载时它会要命:
+// 自删脚本靠「反复重试删 exe」等待映像锁释放,而接班的 launcher 会**立刻把同一个
+// exe 重新锁上**,清理脚本重试到超时放弃 —— 用户点了卸载,配置还了、设备吊销了、
+// 快捷方式删了,程序却还在跑、exe 还躺在磁盘上。
+//
+// 调用方在本函数返回后应尽快退出当前进程,让映像锁释放。
+pub fn shutdown_for_uninstall() {
+    for process_id in find_codex_processes() {
+        #[cfg(windows)]
+        let _ = crate::windows_integration::terminate_process(process_id);
+        #[cfg(not(windows))]
+        let _ = terminate_macos_process(process_id);
+    }
+}

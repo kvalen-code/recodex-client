@@ -846,6 +846,18 @@ impl BridgeRuntimeService for LauncherRuntimeService {
         Ok(json!({ "status": "ok", "message": "Codex 正在重启" }))
     }
 
+    // recodex-overlay: 卸载专用退出 —— 杀 Codex 但**不拉接班进程**。
+    // 接班进程会重新锁住待删的 exe,自删脚本必然失败(见 watcher::shutdown_for_uninstall)。
+    async fn quit(&self) -> anyhow::Result<Value> {
+        codex_plus_core::watcher::shutdown_for_uninstall();
+        tokio::spawn(async {
+            // 给桥调用留出回包时间,面板才能显示卸载结果
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            std::process::exit(0);
+        });
+        Ok(json!({ "status": "ok", "message": "ReCodex 正在退出" }))
+    }
+
     async fn open_devtools(&self) -> anyhow::Result<Value> {
         let debug_port = *self.debug_port.lock().unwrap();
         let targets = codex_plus_core::cdp::list_targets(debug_port).await?;

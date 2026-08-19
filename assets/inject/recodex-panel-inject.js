@@ -931,8 +931,10 @@
       box.innerHTML = `<div class="rcx-muted" style="font-size:12px">${
         esc((r && r.message) || t("卸载完成"))}</div>` +
         (warns.length ? `<div class="rcx-err" style="font-size:12px;margin-top:4px">${esc(warns.join(" / "))}</div>` : "");
-      // 程序退出后清理进程才会删 exe,所以这里主动退出
-      setTimeout(() => bridge("/restart-codex", {}), 1500);
+      // 必须用 /quit 而不是 /restart-codex:后者会拉一个接班进程,
+      // 把刚安排自删的 exe 重新锁住,清理脚本重试到超时放弃 ——
+      // 结果是配置还了、设备吊销了,程序却还在跑、exe 还在磁盘上。
+      setTimeout(() => bridge("/quit", {}), 1500);
     };
   }
 

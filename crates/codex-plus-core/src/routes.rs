@@ -101,6 +101,10 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn restart_codex(&self) -> anyhow::Result<Value> {
         anyhow::bail!("restarting Codex is unavailable")
     }
+    // recodex-overlay: 卸载后退出。默认不支持,由 launcher 覆盖
+    async fn quit(&self) -> anyhow::Result<Value> {
+        anyhow::bail!("quitting is unavailable")
+    }
     // recodex-overlay: 默认拒绝,由 launcher 覆盖实现
     async fn open_external(&self, _url: String) -> anyhow::Result<Value> {
         anyhow::bail!("opening external URLs is unavailable")
@@ -216,6 +220,9 @@ pub async fn handle_bridge_request(
         "/devtools/open" => ctx.runtime.open_devtools().await,
         // recodex-overlay: 切换官方模式 / 更新配置后需要 Codex 重新起来才生效
         "/restart-codex" => ctx.runtime.restart_codex().await,
+        // recodex-overlay: 卸载后退出 —— 与 /restart-codex 的区别是**不拉接班进程**,
+        // 否则新进程会重新锁住待删的 exe,自删脚本必然失败
+        "/quit" => ctx.runtime.quit().await,
         // recodex-overlay: 自更新 —— 下载并校验后就位,由前端接着触发重启
         "/self-update" => {
             let manifest_url = payload
