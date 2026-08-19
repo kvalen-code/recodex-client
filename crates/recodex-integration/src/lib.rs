@@ -438,12 +438,24 @@ impl<T: Transport> Adapter<T> {
             {
                 let mut cached = self.cached_usage.clone().expect("checked above");
                 cached.stale = true;
-                if refresh {
-                    cached.refresh_error = Some(UsageError {
+                // 非刷新读取失败时原先只标 stale、不写原因,于是面板拿到
+                // 「数据过期」却说不出为什么 —— 排查额度不刷新时就卡在这里:
+                // stale=true + refresh_error=null 这个组合看着像"谁都没干过",
+                // 实际是一次失败的 GET。两条路径都记原因,只是 code 不同。
+                cached.refresh_error = Some(if refresh {
+                    UsageError {
                         code: "refresh_unavailable".into(),
                         message: "latest usage could not be synchronized".into(),
-                    });
-                }
+                    }
+                } else {
+                    UsageError {
+                        code: "usage_unavailable".into(),
+                        message: "usage could not be read, showing the last known values".into(),
+                    }
+                });
+                // 注:不必把这份 stale 副本写回缓存 —— 每次回落都会重新置 stale,
+                // 写回与不写回从外部观察不到差别。试过加写回并给它配了条测试,
+                // 结果删掉写回测试照样绿,说明那条守卫是假的,两样一起去掉。
                 Ok(cached)
             }
             Err(error) => Err(error),
