@@ -1,11 +1,16 @@
 //! recodex-overlay: 「切到官方 ChatGPT 模式」的状态机。
 //!
 //! 登出会把 ReCodex 拥有的 Codex 配置**清掉**,想回来就得重新登录;而"临时切到官方"
-//! 应当是可逆的。所以切走之前先把我们写进 `~/.codex` 的两样东西存成快照:
+//! 应当是可逆的。所以切走之前先把我们写进 `~/.codex` 的三样东西存成快照:
 //!   - `config.toml` 里的托管块正文
 //!   - `RECODEX_KEY` 的值
-//! 切回来时按快照原样写回。ReCodex 的登录凭据本身存在 Windows 凭据管理器,与
-//! `~/.codex` 无关,所以**切回来不需要重新登录**。
+//!   - 我们写的 `auth.json`
+//! 切回来时按快照原样写回,**不需要重新登录**。
+//!
+//! ⚠️ `auth.json` 曾经漏在快照之外,那是个真会咬人的 bug:切走时 `restore_auth()`
+//! 会把我们的 `auth.json` 连同备份、归属标记一起删掉 —— 删完就找不回来了。
+//! 切回来只写 config 和 env,Codex 要么完全没有登录态(用户此前没用过官方 Codex),
+//! 要么拿着用户自己的 ChatGPT 凭据去连我们的网关。两种都与上面那句承诺矛盾。
 //!
 //! 快照放在应用数据目录(不是 `~/.codex/recodex/`)—— 后者在卸载流程里会被整个删掉。
 
@@ -25,6 +30,12 @@ pub struct OfficialModeSnapshot {
     /// `RECODEX_KEY` 的值,空表示当时没设。
     #[serde(default)]
     pub env_value: String,
+    /// 我们写的 `auth.json` 正文,空表示切走时它并不归我们所有。
+    ///
+    /// 令牌落在 `%LOCALAPPDATA%` 明文里 —— 与它原本待的 `~/.codex/auth.json`
+    /// 是同一个暴露面,没有更差;卸载时随数据目录一起删。
+    #[serde(default)]
+    pub auth_json: String,
 }
 
 fn state_dir() -> io::Result<PathBuf> {
@@ -108,6 +119,10 @@ pub fn switch_to_official() -> io::Result<()> {
     let snapshot = OfficialModeSnapshot {
         config_body: current_managed_body()?,
         env_value: std::env::var(SUB2API_ENV_KEY).unwrap_or_default(),
+        // 必须在 restore_all() 之前读 —— 那一步会把它删掉
+        auth_json: codexcfg::read_managed_auth()?
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default(),
     };
     save_snapshot(&snapshot)?;
     if let Err(error) = codexcfg::restore_all() {
@@ -126,6 +141,9 @@ pub fn switch_to_recodex() -> io::Result<()> {
     if !snapshot.config_body.is_empty() {
         codexcfg::apply_config(&snapshot.config_body)?;
     }
+    if !snapshot.auth_json.is_empty() {
+        codexcfg::write_auth(snapshot.auth_json.as_bytes())?;
+    }
     if !snapshot.env_value.is_empty() {
         codexcfg::set_user_env(SUB2API_ENV_KEY, &snapshot.env_value)?;
     }
@@ -141,6 +159,7 @@ mod tests {
         let snapshot = OfficialModeSnapshot {
             config_body: "model_provider = \"recodex\"".to_string(),
             env_value: "sk-test".to_string(),
+            auth_json: "{\"tokens\":{\"access_token\":\"x\"}}".to_string(),
         };
         let text = serde_json::to_string(&snapshot).unwrap();
         let parsed: OfficialModeSnapshot = serde_json::from_str(&text).unwrap();
@@ -153,5 +172,6 @@ mod tests {
         let parsed: OfficialModeSnapshot = serde_json::from_str("{}").unwrap();
         assert!(parsed.config_body.is_empty());
         assert!(parsed.env_value.is_empty());
+        assert!(parsed.auth_json.is_empty());
     }
 }

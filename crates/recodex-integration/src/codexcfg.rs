@@ -262,6 +262,24 @@ pub fn write_auth(data: &[u8]) -> io::Result<()> {
     write_atomic(&path, data)
 }
 
+/// Reads back the `auth.json` **we** wrote, if we still own it.
+///
+/// Returns `None` when the ownership marker is absent — that file belongs to the
+/// user's own Codex login and is none of our business to copy around.
+/// Used by the official-mode snapshot: `restore_auth` deletes our auth outright,
+/// so anything that wants it back has to grab it first.
+pub fn read_managed_auth() -> io::Result<Option<Vec<u8>>> {
+    let path = auth_path()?;
+    if !with_suffix(&path, AUTH_MANAGED_SUFFIX).exists() {
+        return Ok(None);
+    }
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Restores the pre-ReCodex `auth.json` from backup if present, otherwise removes
 /// the file we wrote.
 pub fn restore_auth() -> io::Result<()> {
