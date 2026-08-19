@@ -85,8 +85,36 @@ fn with_extension(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// 下载的东西**必须真的是个可执行文件**才允许替换。
+///
+/// sha256 只能证明「拿到的和 manifest 说的一致」,证明不了「manifest 说的是对的」。
+/// 现实里最容易犯的错:manifest.json 和 exe 传在同一个 OSS 目录下,
+/// 管理后台把 manifest 地址粘进了安装包地址 —— 哈希一致、https 一致、一路绿灯,
+/// 然后用一个 JSON 文件覆盖掉 exe。
+///
+/// 而这一步是**不可逆**的:替换成功后面板就去重启,拉起一个非可执行文件必然失败,
+/// `.old` 明明躺在旁边却没有任何代码会去还原它 —— 客户端直接死透,用户无路可走。
+/// 所以宁可在这里挑剔一点。
+fn ensure_executable_payload(bytes: &[u8]) -> anyhow::Result<()> {
+    // 真实包体是十几 MB;几百字节的东西一定不是我们要的(多半是 JSON 或错误页)
+    const MIN_PLAUSIBLE_SIZE: usize = 64 * 1024;
+    if bytes.len() < MIN_PLAUSIBLE_SIZE {
+        anyhow::bail!(
+            "安装包只有 {} 字节,不像可执行文件,已拒绝替换(检查 manifest 里的 url 是不是填成了 manifest 自己)",
+            bytes.len()
+        );
+    }
+    #[cfg(windows)]
+    if !bytes.starts_with(b"MZ") {
+        anyhow::bail!("安装包不是 Windows 可执行文件(缺少 MZ 头),已拒绝替换");
+    }
+    Ok(())
+}
+
 /// 把新包就位。返回被保留的旧文件路径(供调用方在下次启动时清理)。
 pub fn stage_replacement(exe: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    // 放在最前面:这个函数往后每一步都是不可逆的
+    ensure_executable_payload(bytes)?;
     let new_path = with_extension(exe, ".new");
     let old_path = with_extension(exe, ".old");
 
@@ -136,6 +164,43 @@ mod tests {
         );
     }
 
+    /// 一个真实会发生的误配:manifest 里的 url 指向了 manifest 自己。
+    /// 哈希对得上、https 也对,但装进去就是把 exe 换成 JSON —— 必须在替换前拦下。
+    #[test]
+    fn json_payload_is_rejected_before_the_point_of_no_return() {
+        let dir = std::env::temp_dir().join(format!("recodex-badpayload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("app.exe");
+        std::fs::write(&exe, b"original binary").unwrap();
+
+        let manifest_json = br#"{"version":"1.2.50","url":"https://oss.example.com/app.exe","sha256":"deadbeef"}"#;
+        assert!(stage_replacement(&exe, manifest_json).is_err(), "JSON 不该被当成安装包");
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            b"original binary",
+            "拒绝之后原程序必须原封不动"
+        );
+        assert!(!exe.with_extension("exe.old").exists(), "不该留下半截的 .old");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn payload_without_mz_header_is_rejected() {
+        // 够大但不是 PE —— 比如 OSS 返回的 HTML 错误页
+        let junk = vec![b'<'; 128 * 1024];
+        assert!(ensure_executable_payload(&junk).is_err());
+    }
+
+    #[test]
+    fn plausible_executable_passes() {
+        let mut payload = vec![b'M', b'Z'];
+        payload.resize(128 * 1024, 0);
+        assert!(ensure_executable_payload(&payload).is_ok());
+    }
+
     #[test]
     fn staging_keeps_old_binary_for_rollback() {
         let dir = std::env::temp_dir().join(format!("recodex-stage-{}", std::process::id()));
@@ -144,8 +209,12 @@ mod tests {
         let exe = dir.join("app.exe");
         std::fs::write(&exe, b"old").unwrap();
 
-        let old = stage_replacement(&exe, b"new").unwrap();
-        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        // 形态检查在最前面,所以这里得给一个像样的包体(MZ 头 + 足够大)
+        let mut payload = vec![b'M', b'Z'];
+        payload.resize(128 * 1024, 7);
+
+        let old = stage_replacement(&exe, &payload).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), payload);
         assert_eq!(std::fs::read(&old).unwrap(), b"old", "旧版本要留着以便回退");
 
         let _ = std::fs::remove_dir_all(&dir);
