@@ -1025,7 +1025,21 @@
       subtree: true,
     });
   }
-  setInterval(() => refreshAccountCache().then(scanOfficialAccountUi), 60000);
+  // 保底轮询。原先是 setInterval 60 秒**无条件**打一次,而每次 /recodex/status
+  // 在服务端要拉账号+额度+网关三份数据 —— 一台机器开一天就是 1440 轮。
+  // 未登录、或者桥/服务端不通时,这些数据不会自己变好,继续每分钟敲没有意义,
+  // 所以逐步退避到 5 分钟;一旦恢复正常立刻回到 60 秒。
+  const POLL_BASE_MS = 60000;
+  const POLL_MAX_MS = 5 * 60 * 1000;
+  let pollDelay = POLL_BASE_MS;
+  async function pollTick() {
+    await refreshAccountCache();
+    scanOfficialAccountUi();
+    const idle = !rcxAccount || rcxStatus.cls === "anon" || rcxStatus.cls === "off";
+    pollDelay = idle ? Math.min(pollDelay * 2, POLL_MAX_MS) : POLL_BASE_MS;
+    setTimeout(pollTick, pollDelay);
+  }
+  setTimeout(pollTick, POLL_BASE_MS);
 
   // ── 版本与更新 ─────────────────────────────────────────────
   // 服务端用两个信号控制:
