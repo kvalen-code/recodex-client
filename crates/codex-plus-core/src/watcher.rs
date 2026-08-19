@@ -665,6 +665,10 @@ pub fn restart_with_fresh_launcher() -> std::io::Result<()> {
     }
     // 给 Codex 一点时间真正退出,否则接班的 launcher 会看到"已在运行"
     std::thread::sleep(std::time::Duration::from_millis(1500));
+    // 注:这里 DETACHED_PROCESS 是安全的 —— launcher 是 GUI 子系统程序,不需要控制台。
+    // 但**不要把同样的标志用在 cmd 上**:cmd 拿到 DETACHED_PROCESS 会直接退出
+    // (卸载的自删脚本就栽在这上面,见 uninstall.rs 的注释)。
+    //
     // --await-guard:告诉接班的 launcher「旧实例正在退出,请等锁释放再判断」。
     // 否则它会看到锁还被占,以为已有实例在跑,走「激活已存在」分支后立刻退出 ——
     // 结果页面里的 CDP binding 没人应答,面板永远停在「加载中」。
