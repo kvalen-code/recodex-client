@@ -22,3 +22,7 @@ windows-sys = { version = "0.59", features = [
     # recodex-overlay: 读 HKCU\Environment,把 setx 写入的新 key 回填进本进程
     "Win32_System_Registry",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 已经在依赖树里(macOS 上 reqwest 的传递依赖),不新增第三方来源。
+security-framework = "3"

@@ -7,14 +7,14 @@ use std::sync::{
 use std::sync::{MutexGuard, TryLockError};
 
 use crate::{
-    credential::{credential_target_for_api_url, CredentialStore, WindowsCredentialStore},
+    credential::{credential_target_for_api_url, CredentialStore, PlatformCredentialStore},
     Adapter, DiagnosticReport, HttpTransport, PublicLoginStart,
 };
 use serde_json::{json, Value};
 
 pub struct ReCodexState {
     adapter: Mutex<Option<Adapter<HttpTransport>>>,
-    credentials: Option<WindowsCredentialStore>,
+    credentials: Option<PlatformCredentialStore>,
     refresh_lock: Mutex<()>,
     snapshot_lock: Mutex<()>,
     pending_device_code: Mutex<Option<String>>,
@@ -63,7 +63,7 @@ impl ReCodexState {
                         "invalid credential origin".into(),
                     )
                 })?;
-                let credentials = WindowsCredentialStore::new(target).map_err(|_| {
+                let credentials = PlatformCredentialStore::new(target).map_err(|_| {
                     crate::AdapterError::InvalidConfiguration(
                         "invalid credential target".into(),
                     )

@@ -8,11 +8,12 @@
 #   codex-plus-plus.exe            自更新用。客户端下载后校验 sha256 再替换自身。
 #   ReCodex-<版本>-windows-x64-setup.exe   首次安装用。放到官网下载页。
 #
-# 只有 Windows。这个客户端靠注入官方 ChatGPT 桌面版工作:
-#   - Linux 没有官方 ChatGPT 桌面版,注入对象不存在;
-#   - macOS 上游支持,但 ReCodex 自己的凭据存储在非 Windows 是永远返回
-#     StoreUnavailable 的桩(crates/recodex-integration/src/credential.rs),
-#     登录状态存不下来。要加 macOS,先把 Keychain 那层真正实现,再往矩阵里加。
+# Windows + macOS(x64/arm64)。**没有 Linux**:这个客户端靠注入官方 ChatGPT
+# 桌面版工作,Linux 上没有官方桌面版,注入对象根本不存在 —— 出包也是废包。
+#
+# macOS 的凭据走钥匙串(crates/recodex-integration/src/credential.rs)。
+# 这一层只能在 mac runner 上验证,所以 mac job 必须**跑测试**而不只是编译:
+# 编得过但存不进钥匙串 = 用户登不上,而这恰恰是 mac 支持最容易悄悄坏掉的地方。
 
 name: ReCodex release
 
@@ -136,3 +137,78 @@ jobs:
         with:
           name: recodex-${{ steps.ver.outputs.version }}-windows
           path: dist/upload/${{ steps.ver.outputs.version }}/
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析并校验版本号
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ github.event.inputs.version }}"
+          [ -n "$v" ] || v="${GITHUB_REF_NAME#client-v}"
+          echo "$v" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'             || { echo "版本号不合法:$v" >&2; exit 1; }
+          cargo_v="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          [ "$cargo_v" = "$v" ]             || { echo "tag 版本 $v 与 Cargo.toml 的 $cargo_v 不一致" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      # 钥匙串那层只能在真 mac 上验。编得过但存不进 = 用户登不上。
+      - name: 跑 recodex-integration 测试(含钥匙串往返)
+        run: cargo test -p recodex-integration --target ${{ matrix.target }}
+
+      - name: 构建
+        run: cargo build --release --target ${{ matrix.target }} -p codex-plus-launcher
+
+      - name: 打 DMG
+        run: |
+          BINARY_DIR="$PWD/target/${{ matrix.target }}/release"             bash scripts/installer/macos/package-recodex-dmg.sh             "${{ steps.ver.outputs.version }}" "${{ matrix.arch }}"
+
+      - name: 上传到 OSS
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_REGION: ${{ vars.OSS_REGION }}
+          OSS_ENDPOINT: ${{ vars.OSS_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          v="${{ steps.ver.outputs.version }}"
+          curl -fsSL -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.2/ossutil-2.1.2-mac-$([ "${{ matrix.arch }}" = "arm64" ] && echo arm64 || echo amd64).zip
+          unzip -q ossutil.zip -d ossutil
+          oss="$(find ossutil -name ossutil -type f | head -1)"
+          chmod +x "$oss"
+          dmg="dist/macos/ReCodex-$v-macos-${{ matrix.arch }}.dmg"
+          "$oss" cp "$dmg" "${{ vars.OSS_TARGET }}/$v/$(basename "$dmg")" --acl public-read
+
+      - name: 回读校验
+        run: |
+          set -euo pipefail
+          v="${{ steps.ver.outputs.version }}"
+          url="${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/ReCodex-$v-macos-${{ matrix.arch }}.dmg"
+          remote="$(curl -fsSLI "$url" | grep -i '^content-length:' | tail -1 | tr -dc '0-9')"
+          local_size="$(wc -c < "dist/macos/ReCodex-$v-macos-${{ matrix.arch }}.dmg")"
+          [ "$remote" = "$local_size" ] || { echo "线上大小 $remote != 本地 $local_size" >&2; exit 1; }
+          echo "回读校验通过"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recodex-${{ steps.ver.outputs.version }}-macos-${{ matrix.arch }}
+          path: dist/macos/*.dmg

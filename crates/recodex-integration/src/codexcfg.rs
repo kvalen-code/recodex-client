@@ -401,9 +401,51 @@ pub fn refresh_key_env_from_user_scope() -> bool {
         unsafe { std::env::set_var(SUB2API_ENV_KEY, &stored) };
         true
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let Some(stored) = mac_env::load(SUB2API_ENV_KEY) else {
+            return false;
+        };
+        if std::env::var(SUB2API_ENV_KEY).ok().as_deref() == Some(stored.as_str()) {
+            return false;
+        }
+        // Safe here: called once at startup, before any Codex child is spawned.
+        unsafe { std::env::set_var(SUB2API_ENV_KEY, &stored) };
+        true
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         false
+    }
+}
+
+/// mac 侧「用户级环境变量」的替身。Windows 有 setx+注册表,mac 没有对应物;
+/// 这里存的又是密钥,所以复用凭据模块那套钥匙串,而不是自己造一个明文文件。
+#[cfg(target_os = "macos")]
+mod mac_env {
+    use super::io;
+    use crate::credential::keychain;
+
+    /// 与登录令牌分开的 service,免得清理其中一个误删另一个。
+    const SERVICE: &str = "com.recodex.desktop/env";
+
+    fn unavailable(what: &str) -> io::Error {
+        io::Error::other(format!("keychain {what} failed"))
+    }
+
+    pub(super) fn save(name: &str, value: &str) -> io::Result<()> {
+        keychain::set(SERVICE, name, value.as_bytes()).map_err(|_| unavailable("write"))
+    }
+
+    pub(super) fn clear(name: &str) -> io::Result<()> {
+        keychain::delete(SERVICE, name).map_err(|_| unavailable("delete"))
+    }
+
+    /// 读不到就当没设过 —— 与 Windows 侧 `read_user_env_from_registry` 的语义一致。
+    pub(super) fn load(name: &str) -> Option<String> {
+        let bytes = keychain::get(SERVICE, name).ok().flatten()?;
+        let text = String::from_utf8(bytes).ok()?;
+        (!text.trim().is_empty()).then_some(text)
     }
 }
 
@@ -418,7 +460,13 @@ pub fn set_user_env(name: &str, value: &str) -> io::Result<()> {
     {
         return setx(name, value);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // mac 没有 setx/注册表这一层。这个值是 sub2api 的 API key —— 是**密钥**,
+        // 所以落钥匙串,而不是往 ~/.zshrc 或明文文件里写。
+        return mac_env::save(name, value);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(())
     }
@@ -433,7 +481,12 @@ pub fn unset_user_env(name: &str) -> io::Result<()> {
     {
         return setx(name, "");
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // 钥匙串能真删,不像 setx 只能置空
+        return mac_env::clear(name);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(())
     }
