@@ -92,7 +92,7 @@
       "正在发起登录…": "正在發起登入…", "登录发起失败": "登入發起失敗",
       "在浏览器打开并输入授权码:": "在瀏覽器開啟並輸入授權碼:",
       "授权码": "授權碼", "打开授权页": "開啟授權頁", "等待确认…": "等待確認…",
-      "授权超时,请重试": "授權逾時,請重試", "登录失败": "登入失敗",
+      "授权超时,请重试": "授權逾時,請重試", "无法自动打开,请手动复制地址": "無法自動開啟,請手動複製網址", "登录失败": "登入失敗",
       "✅ 登录成功": "✅ 登入成功",
       "我已重启,刷新状态": "我已重啟,重新整理狀態",
       "会话删除": "工作階段刪除", "Markdown 导出": "Markdown 匯出", "会话 ID 标识": "工作階段 ID 標識",
@@ -165,7 +165,7 @@
       "正在发起登录…": "Запуск входа…", "登录发起失败": "Не удалось начать вход",
       "在浏览器打开并输入授权码:": "Откройте в браузере и введите код:",
       "授权码": "Код", "打开授权页": "Открыть страницу входа", "等待确认…": "Ожидание подтверждения…",
-      "授权超时,请重试": "Время вышло, повторите", "登录失败": "Ошибка входа",
+      "授权超时,请重试": "Время вышло, повторите", "无法自动打开,请手动复制地址": "Не удалось открыть автоматически, скопируйте ссылку вручную", "登录失败": "Ошибка входа",
       "✅ 登录成功": "✅ Вход выполнен",
       "我已重启,刷新状态": "Я перезапустил — обновить",
       "会话删除": "Удаление диалогов", "Markdown 导出": "Экспорт в Markdown", "会话 ID 标识": "Показывать ID диалога",
@@ -445,18 +445,29 @@
       <div class="rcx-muted" style="word-break:break-all">${esc(verify_url)}</div>
       <button class="rcx-act" id="rcx-open">${t("打开授权页")}</button>
       <div class="rcx-muted" id="rcx-poll" style="margin-top:8px">${t("等待确认…")}</div>`;
-    body().querySelector("#rcx-open").onclick = () => {
+    body().querySelector("#rcx-open").onclick = async () => {
+      // verify_url 可能已含 user_code(backend 返回完整地址),避免重复拼接
+      const url = /[?&]user_code=/.test(verify_url)
+        ? verify_url
+        : verify_url + (verify_url.includes("?") ? "&" : "?") + "user_code=" + encodeURIComponent(user_code);
+      // 注入页里 window.open 常被 Electron 拦掉。原先直接调它并且把异常 catch 掉,
+      // 于是用户点「打开授权页」什么都不会发生、也没有提示 —— 新用户在这一步就卡死了。
+      // UI 助手那个按钮早因为同样原因改走桥了,登录这里漏了。
+      const r = await bridge("/open-external", { url });
+      if (r && r.status !== "error") return;
       try {
-        // verify_url 可能已含 user_code(backend 返回完整地址),避免重复拼接
-        const url = /[?&]user_code=/.test(verify_url)
-          ? verify_url
-          : verify_url + (verify_url.includes("?") ? "&" : "?") + "user_code=" + encodeURIComponent(user_code);
-        window.open(url, "_blank");
+        if (window.open(url, "_blank")) return;
       } catch (e) {}
+      // 两条路都不通:把地址亮出来,至少用户能自己复制
+      const el = body().querySelector("#rcx-poll");
+      if (el) { el.className = "rcx-err"; el.textContent = `${t("无法自动打开,请手动复制地址")}: ${url}`; }
     };
     // 轮询
     const deadline = Date.now() + 10 * 60 * 1000;
     const tick = async () => {
+      // 面板重绘或切走之后这个节点就没了 —— 循环必须跟着停。
+      // 原先它会闷头跑满 10 分钟;用户再点一次登录,就是两个循环并行轮询。
+      if (!body().querySelector("#rcx-poll")) return;
       if (Date.now() > deadline) { const el = body().querySelector("#rcx-poll"); if (el) el.textContent = t("授权超时,请重试"); return; }
       const poll = await bridge("/recodex/login/poll", {});
       if (poll.status === "approved") { showLoginDone(); return; }
