@@ -1104,3 +1104,48 @@ mod self_update_source_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod call_site_tests {
+    /// 只取第一个测试模块**之前**的正文,并剔掉注释行。
+    /// 两个坑都栽过:注释里的字样会被算数;守卫还会扫到自己断言里的字面量。
+    fn body() -> String {
+        let source = include_str!("routes.rs");
+        let source = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `uninstall_restore_result` 的单测只验了函数本身 —— 把调用处改回 `|| Ok(())`
+    /// 照样全绿(实测过)。那道「还原失败就中止」的防线就是这么变成摆设的,
+    /// 而且它曾经**真的**是摆设。
+    #[test]
+    fn uninstall_abort_guard_is_wired() {
+        let body = body();
+        assert!(
+            body.contains("perform_uninstall(|| uninstall_restore_result(&prepared))"),
+            "卸载必须把桥的还原结果喂给中止防线"
+        );
+        assert!(
+            !body.contains("perform_uninstall(|| Ok(()))"),
+            "恒真的闭包等于没有防线 —— 配置还原失败照样删程序"
+        );
+    }
+
+    /// 更新地址只能来自服务端。页面能指定 manifest = 把「安装任意 exe」的权限交给渲染进程。
+    #[test]
+    fn update_source_comes_from_the_server_not_the_page() {
+        let body = body();
+        assert!(
+            body.contains("server_manifest_url(&checked)"),
+            "更新地址必须取自带认证的 check-client"
+        );
+        assert!(
+            !body.contains("\"manifestUrl\""),
+            "不得再从页面 payload 里读 manifestUrl"
+        );
+    }
+}

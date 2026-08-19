@@ -663,14 +663,63 @@ mod config_writer_tests {
     /// `apply_login` 和 `route_through_gateway` 各自只能出现一次,
     /// 也就是只能待在 `install_login_config` 和 `route_codex_through_gateway` 里面。
     /// 谁想加第三个写入口,这条测试会先红给他看。
-    #[test]
-    fn config_writers_are_centralised() {
+    /// 正文(剔注释、截断测试模块)—— 否则守卫会把注释和自己的断言算进去。
+    fn body() -> String {
         let source = include_str!("desktop.rs");
-        // 去掉本测试模块自身,否则下面这些字面量会被算进去
-        let body = source
+        let source = source
             .split("mod config_writer_tests")
             .next()
             .expect("测试模块之前的正文");
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("
+")
+    }
+
+    /// 官方模式下换网关只能改快照。把这个判断拿掉,官方模式会被悄悄破坏 ——
+    /// 而 round-trip 测试直接调 `stage_config_for_return`,拿掉调用它照样绿(实测过)。
+    #[test]
+    fn gateway_change_consults_official_mode() {
+        assert!(
+            body().contains("officialmode::stage_config_for_return(&block)"),
+            "换网关必须先问官方模式,否则会把托管块悄悄写进活配置"
+        );
+    }
+
+    /// 登出与卸载都必须**丢弃**快照(不是还原)。
+    /// 同样地,round-trip 测试直接调 `discard_snapshot`,把这两个调用删掉照样绿。
+    #[test]
+    fn logout_and_uninstall_discard_the_official_mode_snapshot() {
+        let body = body();
+        assert_eq!(
+            body.matches("officialmode::discard_snapshot()").count(),
+            3,
+            "登录/登出/卸载各一处 —— 少一处就会留下会覆盖新配置的陈旧快照"
+        );
+        // 注意范围:`switch_to_recodex()` 本身是正当的 —— 面板「切回 ReCodex」就靠它。
+        // 不能一刀切禁掉,只能盯住**卸载准备**这个函数:那里用它会把登出刚撤掉的
+        // 托管块重新装回去,程序随即自删。
+        let prepare = body
+            .split("pub fn recodex_prepare_uninstall")
+            .nth(1)
+            .expect("recodex_prepare_uninstall 应存在");
+        let prepare = &prepare[..prepare.find("
+pub fn ").unwrap_or(prepare.len())];
+        assert!(
+            !prepare.contains("switch_to_recodex()"),
+            "卸载准备里用 switch_to_recodex 会把配置重新装回去"
+        );
+        assert!(
+            prepare.contains("discard_snapshot()"),
+            "卸载准备必须丢弃快照"
+        );
+    }
+
+    #[test]
+    fn config_writers_are_centralised() {
+        let body = body();
 
         for symbol in ["crate::codexcfg::apply_login(", "crate::codexcfg::route_through_gateway("] {
             let count = body.matches(symbol).count();
