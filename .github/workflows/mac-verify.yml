@@ -49,10 +49,16 @@ jobs:
         run: cargo test -p recodex-integration --target ${{ matrix.target }}
       - name: 构建
         run: cargo build --release --target ${{ matrix.target }} -p codex-plus-launcher
+      # 版本号从 Cargo.toml 取,**不要写死**:写死会产出文件名与实际内容不符的包
+      #(踩过一次 —— 源码 1.2.54,包却叫 1.2.50)。装完自报版本与文件名对不上,
+      # 自更新会陷入死循环。Windows 侧专门加了校验防这件事,mac 侧却写死了。
       - name: 打 DMG 并自检
         run: |
+          set -euo pipefail
+          v="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "版本: $v"
           BINARY_DIR="$PWD/target/${{ matrix.target }}/release" \
-            bash scripts/installer/macos/package-recodex-dmg.sh 1.2.50 ${{ matrix.arch }}
+            bash scripts/installer/macos/package-recodex-dmg.sh "$v" ${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
         with:
           name: recodex-macos-${{ matrix.arch }}-dmg
