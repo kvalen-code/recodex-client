@@ -45,9 +45,16 @@ fn switching_to_official_and_back_keeps_the_user_logged_in() {
         "切到官方后应还原用户自己的 auth.json"
     );
     let config = std::fs::read_to_string(codexcfg::config_path().unwrap()).unwrap_or_default();
+    // 注意这里钉的是**默认选择**没了,而不是定义没了。
+    //
+    // 原先钉的是「整块都不该留」,而那正是实测到的坏例:Codex 把每个会话当时用的
+    // provider 名记在 rollout 文件里,定义一删,用户切回官方账号之后所有历史对话
+    // 都打不开,报「Model provider `recodex` not found」。所以要改的是意图本身 ——
+    // 定义留着(旧对话能继续),默认选择摘掉(新对话回官方)。
+    // 详见 official_mode_keeps_history.rs。
     assert!(
-        !config.contains("model_providers.recodex"),
-        "切到官方后不该还留着我们的 provider:{config}"
+        !config.contains("model_provider = \"recodex\""),
+        "切到官方后默认 provider 不该还指着 recodex:{config}"
     );
 
     // 3) 切回 ReCodex —— 这是缺陷曾经暴露的地方
@@ -76,9 +83,10 @@ fn switching_to_official_and_back_keeps_the_user_logged_in() {
     // 5) 卸载/登出走的是**丢弃**,不是还原 —— 两者结果必须相反
     officialmode::switch_to_official().unwrap();
     let after_switch = std::fs::read_to_string(codex_config()).unwrap_or_default();
+    // 同上:撤掉的是**默认选择**,不是定义 —— 定义要留给历史对话。
     assert!(
-        !after_switch.contains("model_providers.recodex"),
-        "切到官方后托管块应已撤掉"
+        !after_switch.contains("model_provider = \"recodex\""),
+        "切到官方后默认 provider 应已撤掉"
     );
 
     officialmode::discard_snapshot().unwrap();

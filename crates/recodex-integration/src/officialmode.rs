@@ -125,7 +125,15 @@ pub fn switch_to_official() -> io::Result<()> {
             .unwrap_or_default(),
     };
     save_snapshot(&snapshot)?;
-    if let Err(error) = codexcfg::restore_all() {
+    // 只摘掉默认 provider,**保留定义和密钥**。
+    //
+    // 整块删掉会让历史对话打不开:每个会话都把当时的 provider 名记在 rollout 文件里
+    // (payload.model_provider = "recodex"),定义没了就报「Model provider `recodex`
+    // not found」并拒绝打开。保留定义则旧对话仍可继续,新对话回到官方 provider。
+    // 密钥也一并保留 —— 否则旧对话打得开却发不出去,只是把报错时机往后挪了一步。
+    //
+    // 这不削弱官方模式:除非某个会话**显式指名** recodex,否则不会有任何流量走过去。
+    if let Err(error) = codexcfg::demote_managed_provider().and_then(|()| codexcfg::restore_auth()) {
         // 撤销失败就把快照删掉,避免状态卡在"以为在官方模式但配置还在"
         let _ = clear_snapshot();
         return Err(error);
@@ -159,6 +167,16 @@ pub fn stage_config_for_return(config_body: &str) -> io::Result<bool> {
 /// 登出刚撤掉的托管块又被装回去,程序随即自删,
 /// 用户剩下一个指向已吊销网关的 Codex,连能修它的程序都没了。
 pub fn discard_snapshot() -> io::Result<()> {
+    // 丢弃 = ReCodex 要走了(登出 / 卸载 / 重新安装登录),所以这里要把托管块
+    // **整块**撤掉,而不只是摘掉默认 provider。
+    //
+    // 与 switch_to_official 的区别正在这里:切官方时定义要留着,让历史对话还能打开;
+    // 而登出/卸载之后网关和密钥都作废了,留着定义就等于给用户剩一个指向已吊销
+    // 网关的 Codex 配置。
+    //
+    // 以前不需要这一步,因为 switch_to_official 会整块删掉;现在它只降级,
+    // 这里就必须自己补上。
+    let _ = codexcfg::restore_config();
     clear_snapshot()
 }
 

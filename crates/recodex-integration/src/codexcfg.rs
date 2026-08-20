@@ -234,6 +234,35 @@ pub fn apply_config(body: &str) -> io::Result<()> {
 
 /// Removes our managed block from `~/.codex/config.toml`. Deletes the file if we
 /// created it (nothing else left).
+/// 切到官方模式用:**保留 provider 定义,只摘掉默认选择那一行**。
+///
+/// 为什么不能像 `restore_config` 那样整块删掉:Codex 的每个会话都把当时用的
+/// provider 名记在 rollout 文件里(`payload.model_provider = "recodex"`)。
+/// 把定义删了之后,恢复旧对话时它找不到这个 provider,直接拒绝打开并报
+/// 「Model provider `recodex` not found」—— 用户切回官方账号,**历史对话就全打不开了**
+/// (新对话没事,因为新对话用的是官方 provider)。这是实测到的。
+///
+/// 只摘掉 `model_provider = "recodex"`:新对话回到官方 provider,
+/// 旧对话仍然解析得到定义、能继续打开。
+pub fn demote_managed_provider() -> io::Result<()> {
+    let path = config_path()?;
+    let cur = read_or_empty(&path)?;
+    if !has_managed_block(&cur) {
+        return Ok(());
+    }
+    let next: String = cur
+        .lines()
+        .filter(|line| line.trim() != "model_provider = \"recodex\"")
+        .collect::<Vec<_>>()
+        .join("\n");
+    // 行过滤会吃掉末尾换行,补回去,免得下次拼接把两行黏在一起
+    let next = if cur.ends_with('\n') { format!("{next}\n") } else { next };
+    if next == cur {
+        return Ok(());
+    }
+    write_atomic(&path, next.as_bytes())
+}
+
 pub fn restore_config() -> io::Result<()> {
     let path = config_path()?;
     let cur = read_or_empty(&path)?;
