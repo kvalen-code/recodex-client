@@ -30,8 +30,16 @@ permissions:
   contents: read
 
 jobs:
+
+# 为什么 OSS 上传是**可选**的:这个仓库是公开的,而对象存储的密钥是主账号级的 ——
+# 把它放进公开仓库的 Secrets,风险面比省下的那点手工操作大得多。
+# 没配密钥时 CI 只产出 artifact(构建与测试照跑),再由掌握密钥的机器取回上传。
   windows:
     runs-on: windows-latest
+    env:
+      # 提到 job 级只为一件事:让下面几个步骤的 `if:` 能看见它。
+      # step 自己的 env 对同一个 step 的 if 不可见,写在那儿条件会恒假。
+      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -105,6 +113,7 @@ jobs:
           Get-Content "dist/upload/$v/manifest.json"
 
       - name: 上传到 OSS
+        if: env.OSS_ACCESS_KEY_ID != ''
         shell: pwsh
         env:
           OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
@@ -123,6 +132,7 @@ jobs:
           }
 
       - name: 回读校验 —— 公网真的取得到,且哈希与本地一致
+        if: env.OSS_ACCESS_KEY_ID != ''
         shell: pwsh
         run: |
           $v = "${{ steps.ver.outputs.version }}"
@@ -138,6 +148,7 @@ jobs:
       # mac 的 DMG 由 macos job 各自上传,这里只需要把地址算出来 ——
       # 写死版本号在前端,每发一版都要重新部署一次前端。
       - name: 更新 latest.json(官网下载页的指针)
+        if: env.OSS_ACCESS_KEY_ID != ''
         shell: pwsh
         env:
           OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
@@ -167,6 +178,7 @@ jobs:
           Write-Host "latest.json 已就位:$v"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: recodex-${{ steps.ver.outputs.version }}-windows
           path: dist/upload/${{ steps.ver.outputs.version }}/
@@ -174,6 +186,10 @@ jobs:
   macos:
     name: macOS (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    env:
+      # 提到 job 级只为一件事:让下面几个步骤的 `if:` 能看见它。
+      # step 自己的 env 对同一个 step 的 if 不可见,写在那儿条件会恒假。
+      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -228,6 +244,7 @@ jobs:
           BINARY_DIR="$PWD/target/${{ matrix.target }}/release"             bash scripts/installer/macos/package-recodex-dmg.sh             "${{ steps.ver.outputs.version }}" "${{ matrix.arch }}"
 
       - name: 上传到 OSS
+        if: env.OSS_ACCESS_KEY_ID != ''
         env:
           OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
@@ -244,6 +261,7 @@ jobs:
           "$oss" cp "$dmg" "${{ vars.OSS_TARGET }}/$v/$(basename "$dmg")" --acl public-read
 
       - name: 回读校验
+        if: env.OSS_ACCESS_KEY_ID != ''
         run: |
           set -euo pipefail
           v="${{ steps.ver.outputs.version }}"
@@ -254,6 +272,7 @@ jobs:
           echo "回读校验通过"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: recodex-${{ steps.ver.outputs.version }}-macos-${{ matrix.arch }}
           path: dist/macos/*.dmg
