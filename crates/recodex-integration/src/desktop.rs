@@ -8,7 +8,7 @@ use std::sync::{MutexGuard, TryLockError};
 
 use crate::{
     credential::{credential_target_for_api_url, CredentialStore, PlatformCredentialStore},
-    Adapter, DiagnosticReport, HttpTransport, PublicLoginStart,
+    Adapter, AdapterError, DiagnosticReport, HttpTransport, PublicLoginStart,
 };
 use serde_json::{json, Value};
 
@@ -118,6 +118,29 @@ fn error(code: &str, message: impl Into<String>) -> Value {
     json!({"status":"error", "error":{"code":code,"message":message.into()}})
 }
 
+/// 这一批请求里有没有 401。
+///
+/// 只看 usage 不够:在网页端撤销设备之后 account 一样会 401,而它的错误原先只是
+/// 被塞进 `account_error` 当成「数据陈旧」展示 —— 用户看到的是一份过期额度,
+/// 而不是"你需要重新登录"。
+pub fn any_unauthorized(errors: &[Option<&AdapterError>]) -> bool {
+    errors
+        .iter()
+        .any(|error| matches!(error, Some(AdapterError::Unauthorized)))
+}
+
+/// 服务端不认这份凭据了 —— 最常见的原因是用户在网页端把这台设备撤销了。
+///
+/// 必须回 `signed_out` 而**不是** error:面板的 error 分支只画一个「重试」按钮,
+/// 而这里重试多少次都是同一个 401,用户永远走不到登录入口,等于被锁死在面板里。
+/// `signed_out` 才会渲染「登录 ReCodex」。
+pub fn credentials_rejected() -> Value {
+    json!({
+        "status": "signed_out",
+        "notice": "设备已在网页端被撤销,或凭据已失效。请重新登录。",
+    })
+}
+
 // Point Codex at the just-selected gateway by rewriting the managed config
 // block in ~/.codex/config.toml. Returns a warning string if the rewrite failed
 // (the server-side selection still succeeded); an empty endpoint routes nothing.
@@ -224,6 +247,9 @@ fn snapshot(state: &ReCodexState, refresh: bool) -> Value {
         move || account_worker.account(),
         move || gateway_worker.gateways(),
     );
+    if any_unauthorized(&[usage.as_ref().err(), account.as_ref().err(), gateways.as_ref().err()]) {
+        return credentials_rejected();
+    }
     let usage = match usage {
         Ok(value) => value,
         Err(adapter_error) => return error("usage", adapter_error.to_string()),
