@@ -1914,3 +1914,28 @@ impl LaunchHooks for FakeHooks {
         }
     }
 }
+
+/// 微信连接跑的是 `codex app-server`。原先没配路径时直接用 PATH 上的 "codex",
+/// 而 macOS 的 .app 和 Windows 的 MSIX 都不会把它放进 PATH —— 一发消息就报
+/// 「无法启动 Codex app-server」。用户显式配了路径的话必须原样用他的。
+#[test]
+fn wechat_uses_the_configured_codex_path_verbatim() {
+    use codex_plus_core::app_paths::codex_cli_command;
+
+    assert_eq!(codex_cli_command("/opt/my/codex"), "/opt/my/codex");
+    assert_eq!(codex_cli_command("  /opt/my/codex  "), "/opt/my/codex");
+}
+
+/// 没配路径时不能是空字符串 —— 空的会让 Command::new("") 直接失败,
+/// 错误信息还什么都看不出来。
+#[test]
+fn wechat_falls_back_to_something_runnable_when_unconfigured() {
+    use codex_plus_core::app_paths::codex_cli_command;
+
+    let resolved = codex_cli_command("");
+    assert!(!resolved.is_empty(), "回落值不能是空的");
+    assert!(
+        resolved.ends_with("codex") || resolved.ends_with("codex.exe"),
+        "回落值应指向 codex 二进制:{resolved}"
+    );
+}

@@ -678,3 +678,39 @@ fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'
     let (head, rest) = value.split_at(prefix.len());
     head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
+
+/// 找到官方 Codex **命令行**二进制(`codex`),而不是 GUI 应用。
+///
+/// 微信连接跑的是 `codex app-server`,原先直接 `Command::new("codex")` 靠 PATH 找 ——
+/// 而这条路在两个最常见的装法上都走不通:
+///   - macOS:客户端装在 `/Applications/*.app` 里,codex 在应用包内部,从来不在 PATH;
+///     而且启动器是 GUI 进程,继承的 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`,
+///     用户在 shell 里配的路径它一概看不到。
+///   - Windows:从商店(MSIX)装的在 `WindowsApps\...\app\resources\codex.exe`,同样不在 PATH。
+/// 结果就是微信一发消息就报「无法启动 Codex app-server」。
+///
+/// 我们本来就知道 Codex 客户端装在哪 —— 直接去它旁边取,取不到再回落 PATH。
+pub fn find_codex_cli(app_dir: Option<&Path>) -> Option<PathBuf> {
+    let app_dir = resolve_codex_app_dir_with_saved(app_dir, None)?;
+    let exe_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    // 两种布局:macOS 的 .app 包,和 Windows 的 app 目录
+    let candidates = [
+        app_dir.join("Contents").join("Resources").join(exe_name),
+        app_dir.join("Contents").join("MacOS").join(exe_name),
+        app_dir.join("resources").join(exe_name),
+        app_dir.join(exe_name),
+    ];
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// 微信连接要用的 codex 命令:用户显式配了就用他的,否则去 Codex 客户端旁边找,
+/// 再不行才回落 PATH 上的 `codex`(留着这一层是因为有人确实单独装过 CLI)。
+pub fn codex_cli_command(configured: &str) -> String {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    find_codex_cli(None)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "codex".to_string())
+}

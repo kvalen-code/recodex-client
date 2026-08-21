@@ -141,7 +141,9 @@ pub async fn run_weixin_connect(
     let store = ConnectSessionStore::default_for_account(&config.account_id);
     let mut state = store.load().unwrap_or_default();
     let app_config = AppServerConfig {
-        executable: config.codex_path.clone(),
+        // 空值不再直接落到 PATH 上的 "codex" —— 见 app_paths::codex_cli_command,
+        // 两个最常见的装法(macOS 的 .app、Windows 的 MSIX)都不会把它放进 PATH。
+        executable: crate::app_paths::codex_cli_command(&config.codex_path),
         work_dir,
         model: config.model.clone(),
         sandbox: config.sandbox.clone(),
