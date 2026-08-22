@@ -1939,3 +1939,45 @@ fn wechat_falls_back_to_something_runnable_when_unconfigured() {
         "回落值应指向 codex 二进制:{resolved}"
     );
 }
+
+/// 上面两条微信测试**抓不住**它们本来要防的 bug:回落值是字面量 "codex",
+/// 断言只要求「以 codex 结尾」,所以把 find_codex_cli 改成永远找不到,它们照样全绿
+/// (2026-08-22 实测过)。真正要钉的是「能在 Codex 客户端的安装包里找到 codex」。
+///
+/// 用户 mac 上的真实路径是 /Applications/ChatGPT.app/Contents/Resources/codex ——
+/// 第一个用例就照着它摆。
+#[test]
+fn wechat_finds_codex_inside_the_client_app_bundle() {
+    use codex_plus_core::app_paths::find_codex_cli;
+
+    let exe = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let root = std::env::temp_dir().join(format!("recodex-findcodex-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+
+    // 布局一:macOS 的 .app 包 —— Contents/Resources 下(线上用户就是这种)
+    let bundle = root.join("ChatGPT.app");
+    let resources = bundle.join("Contents").join("Resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    let expected = resources.join(exe);
+    std::fs::write(&expected, b"#!/bin/sh\n").unwrap();
+    assert_eq!(
+        Some(expected.clone()),
+        find_codex_cli(Some(&bundle)),
+        "没能在 .app 包里找到 codex —— 微信一发消息就会报「无法启动 Codex app-server」"
+    );
+
+    // 布局二:同一个包里只有 Contents/MacOS/codex 时也要找得到
+    std::fs::remove_file(&expected).unwrap();
+    let macos_dir = bundle.join("Contents").join("MacOS");
+    std::fs::create_dir_all(&macos_dir).unwrap();
+    let alt = macos_dir.join(exe);
+    std::fs::write(&alt, b"#!/bin/sh\n").unwrap();
+    assert_eq!(Some(alt), find_codex_cli(Some(&bundle)), "Contents/MacOS 布局没覆盖到");
+
+    // 包里根本没有 codex 时必须如实返回 None,而不是瞎给一个不存在的路径
+    let empty = root.join("Empty.app");
+    std::fs::create_dir_all(empty.join("Contents").join("Resources")).unwrap();
+    assert_eq!(None, find_codex_cli(Some(&empty)), "找不到就该是 None");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
