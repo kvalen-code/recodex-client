@@ -1,0 +1,18 @@
+model = "gpt-5.6-terra"
+
+# >>> recodex managed block, do not edit >>>
+model_provider = "recodex"
+
+[model_providers.recodex]
+name = "ReCodex"
+base_url = "https://gw.example.dev/backend-api/codex"
+wire_api = "responses"
+env_key = "RECODEX_KEY"
+# <<< recodex managed block <<<
+
+[profiles.work]
+model_provider = "recodex"
+model = "gpt-5.6-terra"
+
+[profiles.personal]
+model_provider = "custom"

@@ -1,0 +1,21 @@
+model = "gpt-5.6-terra"
+model_reasoning_effort = "xhigh"
+
+# >>> recodex managed block, do not edit >>>
+# recodex-previous-model-provider = "custom"
+model_provider = "recodex"
+
+[model_providers.recodex]
+name = "ReCodex"
+base_url = "https://gw.example.dev/backend-api/codex"
+wire_api = "responses"
+env_key = "RECODEX_KEY"
+# <<< recodex managed block <<<
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://example.invalid/v1"
+wire_api = "responses"
+
+[mcp_servers.context7]
+command = "npx"

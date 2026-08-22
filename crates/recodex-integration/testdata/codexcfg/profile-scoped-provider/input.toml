@@ -1,0 +1,8 @@
+model = "gpt-5.6-terra"
+
+[profiles.work]
+model_provider = "recodex"
+model = "gpt-5.6-terra"
+
+[profiles.personal]
+model_provider = "custom"

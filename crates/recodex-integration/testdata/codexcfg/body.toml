@@ -1,0 +1,7 @@
+model_provider = "recodex"
+
+[model_providers.recodex]
+name = "ReCodex"
+base_url = "https://gw.example.dev/backend-api/codex"
+wire_api = "responses"
+env_key = "RECODEX_KEY"

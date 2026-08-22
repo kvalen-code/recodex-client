@@ -11,6 +11,7 @@
 //!   - `~/.codex/auth.json` (backed up once so the original can be restored);
 //!   - the `RECODEX_KEY` user environment variable Codex reads the key from.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -66,9 +67,54 @@ pub fn has_managed_block(content: &str) -> bool {
     content.contains(START_MARKER) && content.contains(END_MARKER)
 }
 
-fn render_marked_block(body: &str) -> String {
+/// 用户原有默认 provider 的存放行,写在托管块**内部**。
+///
+/// 我们的块拥有顶层 `model_provider`,安装时必须把用户原来那行摘掉 —— 否则顶层出现
+/// 重复键,Codex 连整个 config.toml 都解析不了(线上就是这么炸的:日志里
+/// `duplicate key model_provider in document root`)。摘掉不等于可以吞掉:
+/// 把原值停在这里,卸载时还回去。
+///
+/// 不另开状态文件:多一份跨实现的共享状态,就是多一个「同一份状态两个主人」。
+/// ponytail: 会重新序列化 config.toml 的写入方(Codex++ 就会)会丢掉注释,那种情况下
+/// 降级成「还不回去」,不影响正确性;真需要更硬的保存再上状态文件。
+const SAVED_PROVIDER_PREFIX: &str = "# recodex-previous-model-provider = ";
+
+/// 解析一行顶层 `model_provider = "x"`,返回去引号的值。
+/// 只认这个精确的键:`model_provider_extra = 1`、`model_providers = ...` 都不匹配。
+fn model_provider_value(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("model_provider")?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim();
+    Some(rest.trim_matches('"'))
+}
+
+/// 顶层区域的长度 —— 即第一个表头之前。TOML 里表头之后的裸键属于那张表,
+/// 我们只拥有顶层那一个 `model_provider`,绝不能碰 `[profiles.x]` 里的同名键。
+fn top_level_len(content: &str) -> usize {
+    first_table_header_offset(content).unwrap_or(content.len())
+}
+
+fn render_marked_block(body: &str, saved: Option<&str>) -> String {
     let body = body.trim_matches('\n');
-    format!("{START_MARKER}\n{body}\n{END_MARKER}\n")
+    match saved {
+        Some(prev) => {
+            format!("{START_MARKER}\n{SAVED_PROVIDER_PREFIX}\"{prev}\"\n{body}\n{END_MARKER}\n")
+        }
+        None => format!("{START_MARKER}\n{body}\n{END_MARKER}\n"),
+    }
+}
+
+// Byte offset of the first TOML table header (a line whose first non-space char
+// is `[`). The managed block's top-level `model_provider` key must sit before any
+// table, so we insert there rather than at EOF.
+fn first_table_header_offset(content: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        if line.trim_start().starts_with('[') {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 // Locates the managed block's byte span [start, end): start is the beginning of
@@ -87,30 +133,96 @@ fn marked_block_span(content: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-// Byte offset of the first TOML table header (a line whose first non-space char
-// is `[`). The managed block's top-level `model_provider` key must sit before any
-// table, so we insert there rather than at EOF.
-fn first_table_header_offset(content: &str) -> Option<usize> {
-    let mut offset = 0usize;
-    for line in content.split_inclusive('\n') {
-        if line.trim_start().starts_with('[') {
-            return Some(offset);
+/// 块体自己定义的顶层键。托管块的内容是**可变的**(服务端可以下发别的模板),
+/// 所以「我们拥有哪些顶层键」必须从块体推导,不能写死一张表 ——
+/// 写死的那天块体一变,漏掉的键就会在下次安装时变成顶层重复键。
+fn top_level_keys_of(body: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    keys.insert("model_provider".to_string());
+    for line in body.split_inclusive('\n') {
+        let t = line.trim();
+        if t.starts_with('[') {
+            break;
         }
-        offset += line.len();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some(i) = t.find('=') {
+            keys.insert(t[..i].trim().to_string());
+        }
+    }
+    keys
+}
+
+/// 从一段托管块里取出之前存下的用户默认 provider。
+fn saved_provider_in(span: &str) -> Option<String> {
+    for line in span.split_inclusive('\n') {
+        if let Some(rest) = line.trim().strip_prefix(SAVED_PROVIDER_PREFIX) {
+            let value = rest.trim().trim_matches('"');
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
     }
     None
 }
 
-// Strips every trace of a prior ReCodex managed region, marker-based or not.
-// Codex++ re-serialises config.toml and drops our comment markers, so relying on
-// them alone would let a stale `[model_providers.recodex]` table survive and get
-// duplicated on the next write. This removes: our markers, a top-level
-// `model_provider = "recodex"` line, and the whole `[model_providers.recodex]`
-// table (header through the line before the next table / EOF).
-fn strip_recodex_config(content: &str) -> String {
+/// 把连续多个空行收拢成一个。
+///
+/// 不能用 `replace("\n\n\n", "\n\n")`:config.toml 可能是 CRLF 的,而我们插入的
+/// 分隔符是 LF,于是 `"\r\n\r\n\n"` 里根本没有三个连续的 `\n`,收拢不掉 ——
+/// 安装再卸载就会比原文多出一个换行,往返不再逐字节一致。
+/// 按行判断,空行就是 trim 后为空的行,两种行尾都认。
+fn collapse_blank_runs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_blank = false;
+    for line in s.split_inclusive('\n') {
+        let blank = line.trim().is_empty();
+        if blank && prev_blank {
+            continue;
+        }
+        prev_blank = blank;
+        out.push_str(line);
+    }
+    out
+}
+
+// 剥离上一轮 ReCodex 的痕迹,并把用户自己的默认 provider 带出来。
+//
+// 两段式:
+//  1. 标记还在 —— 整段切掉。那是我们写进去的**全部**内容,不管块体当时是什么模板,
+//     这是唯一精确的删法。
+//  2. 标记没了 —— config.toml 还有第三个写入方,Codex++ 会重新序列化整份文件并丢掉
+//     我们的注释标记。这时只能按内容清残留:[model_providers.recodex] 表、
+//     块体拥有的顶层键、孤儿标记行。少了这一步,残留会在下次安装时被复制一份,
+//     顶层重复键让 Codex 连整份文件都解析不了。
+//
+// `owned` 为块体拥有的顶层键;None 时只认 model_provider(卸载路径拿不到块体,
+// 但那条路上标记通常还在,走的是第 1 段)。
+//
+// 返回值第二项是**用户的**默认 provider(不是我们的 "recodex"):来自块内保存行,
+// 或用户当前真的写在顶层的那一行 —— 后者优先,因为那代表用户此刻的选择。
+fn strip_recodex_config(
+    content: &str,
+    owned: Option<&BTreeSet<String>>,
+) -> (String, Option<String>) {
+    let fallback: BTreeSet<String> = ["model_provider".to_string()].into_iter().collect();
+    let owned = owned.unwrap_or(&fallback);
+
+    let mut saved: Option<String> = None;
+    let mut content = content.to_string();
+    if let Some((s, e)) = marked_block_span(&content) {
+        saved = saved_provider_in(&content[s..e]);
+        content = format!("{}{}", &content[..s], &content[e..]);
+    }
+
+    let top_len = top_level_len(&content);
     let mut out = String::with_capacity(content.len());
     let mut in_recodex_table = false;
+    let mut offset = 0usize;
     for line in content.split_inclusive('\n') {
+        let at = offset;
+        offset += line.len();
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             in_recodex_table = trimmed == "[model_providers.recodex]";
@@ -121,21 +233,59 @@ fn strip_recodex_config(content: &str) -> String {
             continue;
         }
         if in_recodex_table {
-            continue; // a key belonging to [model_providers.recodex]
+            continue; // 属于 [model_providers.recodex] 的键
         }
-        if trimmed == START_MARKER
-            || trimmed == END_MARKER
-            || trimmed == "model_provider = \"recodex\""
-        {
+        if trimmed == START_MARKER || trimmed == END_MARKER {
+            continue; // 孤儿标记(另一半被别的写入方吃掉了)
+        }
+        if let Some(rest) = trimmed.strip_prefix(SAVED_PROVIDER_PREFIX) {
+            if saved.is_none() {
+                let value = rest.trim().trim_matches('"');
+                if !value.is_empty() {
+                    saved = Some(value.to_string());
+                }
+            }
             continue;
+        }
+        // 顶层的键才可能是我们的;表头之后的同名键属于那张表,不许碰
+        // (比如 [profiles.work] 里的 model_provider)。
+        if at < top_len {
+            if let Some(value) = model_provider_value(trimmed) {
+                if value != "recodex" && !value.is_empty() {
+                    saved = Some(value.to_string()); // 用户此刻的选择,压过块内旧值
+                }
+                continue;
+            }
+            if let Some(i) = trimmed.find('=') {
+                if owned.contains(trimmed[..i].trim()) {
+                    continue;
+                }
+            }
         }
         out.push_str(line);
     }
-    // Collapse any blank-line run we may have opened up into a single newline.
-    while out.contains("\n\n\n") {
-        out = out.replace("\n\n\n", "\n\n");
+    // 把剥离开出来的空行收拢成一个
+    (collapse_blank_runs(&out), saved)
+}
+
+// 把一行顶层 `model_provider` 插回第一个表头之前 —— 追加到 EOF 会让它落进最后一张表。
+fn insert_top_level_model_provider(content: &str, value: &str) -> String {
+    // 尾部带一个空行:还回去的这行紧贴表头虽然合法,但配置是给人看的。
+    let line = format!("model_provider = \"{value}\"\n\n");
+    match first_table_header_offset(content) {
+        Some(idx) => {
+            let (before, after) = content.split_at(idx);
+            format!("{before}{line}{after}")
+        }
+        None => {
+            let mut out = content.to_string();
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&line);
+            out
+        }
     }
-    out
 }
 
 /// Returns content with a fresh managed block installed. Any previous ReCodex
@@ -144,9 +294,13 @@ fn strip_recodex_config(content: &str) -> String {
 /// appending at EOF would strand the block's top-level `model_provider` key
 /// inside the file's last table, so Codex (and Codex++'s config re-serialiser)
 /// would silently drop it. With no table the block is appended.
+///
+/// 用户原本的顶层 `model_provider` 会被摘掉并存进块内 —— 留着它就是顶层重复键,
+/// Codex 会整份 config.toml 解析失败,比「设置没生效」严重得多。
 pub fn install_block(content: &str, body: &str) -> String {
-    let block = render_marked_block(body);
-    let cleaned = strip_recodex_config(content);
+    let owned = top_level_keys_of(body);
+    let (cleaned, saved) = strip_recodex_config(content, Some(&owned));
+    let block = render_marked_block(body, saved.as_deref());
     if cleaned.trim().is_empty() {
         return block;
     }
@@ -162,20 +316,27 @@ pub fn install_block(content: &str, body: &str) -> String {
         out.push_str(after);
         return out;
     }
-    let mut base = cleaned;
-    if !base.ends_with('\n') {
-        base.push('\n');
-    }
+    // 没有表头就追加在末尾。必须先削平尾部空行再补一个空行分隔 —— 否则每装一次
+    // 就多一个空行(剥离会留下空行,collapse 只压到两个),安装就不幂等了。
+    // 语料测试的 no-tables 用例盯着这一点。
+    let mut base = cleaned.trim_end_matches('\n').to_string();
+    base.push('\n');
     base.push('\n');
     base.push_str(&block);
     base
 }
 
 /// Returns content with every ReCodex-managed region removed (marker-based or a
-/// bare surviving `[model_providers.recodex]` table).
+/// bare surviving `[model_providers.recodex]` table),并把安装时接管掉的
+/// 用户默认 provider 还回顶层 —— 我们借走的东西要还,否则用户卸载后
+/// 默认 provider 就被我们静默吃掉了。
 pub fn remove_block(content: &str) -> String {
-    let stripped = strip_recodex_config(content);
-    stripped.trim_end_matches('\n').to_string() + if stripped.ends_with('\n') { "\n" } else { "" }
+    let (stripped, saved) = strip_recodex_config(content, None);
+    let restored = match saved {
+        Some(prev) => insert_top_level_model_provider(&stripped, &prev),
+        None => stripped,
+    };
+    restored.trim_end_matches('\n').to_string() + if restored.ends_with('\n') { "\n" } else { "" }
 }
 
 fn read_or_empty(path: &Path) -> io::Result<String> {
@@ -247,29 +408,41 @@ pub fn apply_config(body: &str) -> io::Result<()> {
 pub fn demote_managed_provider() -> io::Result<()> {
     let path = config_path()?;
     let cur = read_or_empty(&path)?;
-    if !has_managed_block(&cur) {
+    // 不再以「标记还在」为前提:Codex++ 重新序列化后标记就没了,
+    // 那时旧实现直接返回,`model_provider = "recodex"` 会永久留在用户配置里。
+    // 也不再全文件匹配字面量 —— 那会连 [profiles.x] 里的同名键一起删掉。
+    let top_len = top_level_len(&cur);
+    let mut out = String::with_capacity(cur.len());
+    let mut offset = 0usize;
+    let mut changed = false;
+    for line in cur.split_inclusive('\n') {
+        let at = offset;
+        offset += line.len();
+        if at < top_len && model_provider_value(line.trim()) == Some("recodex") {
+            changed = true;
+            continue;
+        }
+        out.push_str(line);
+    }
+    if !changed {
         return Ok(());
     }
-    let next: String = cur
-        .lines()
-        .filter(|line| line.trim() != "model_provider = \"recodex\"")
-        .collect::<Vec<_>>()
-        .join("\n");
-    // 行过滤会吃掉末尾换行,补回去,免得下次拼接把两行黏在一起
-    let next = if cur.ends_with('\n') { format!("{next}\n") } else { next };
-    if next == cur {
-        return Ok(());
-    }
-    write_atomic(&path, next.as_bytes())
+    write_atomic(&path, out.as_bytes())
 }
 
 pub fn restore_config() -> io::Result<()> {
     let path = config_path()?;
     let cur = read_or_empty(&path)?;
-    if !has_managed_block(&cur) {
-        return Ok(());
+    // 按内容判断而不是看标记:Codex++ 重新序列化会丢掉注释标记,
+    // 旧实现那时会直接返回,把我们的 provider 永久留在用户的配置里。
+    let (stripped, _) = strip_recodex_config(&cur, None);
+    if stripped == cur {
+        return Ok(()); // 这份文件里没有我们的东西
     }
     let next = remove_block(&cur);
+    if next == cur {
+        return Ok(());
+    }
     if next.trim().is_empty() {
         return remove_if_exists(&path);
     }
@@ -369,7 +542,7 @@ fn read_user_env_from_registry(name: &str) -> Option<String> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
-        HKEY_CURRENT_USER, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
     };
 
     let subkey: Vec<u16> = "Environment\0".encode_utf16().collect();
@@ -408,8 +581,13 @@ fn read_user_env_from_registry(name: &str) -> Option<String> {
     if status != ERROR_SUCCESS {
         return None;
     }
-    let len = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
-    let text = OsString::from_wide(&buffer[..len]).to_string_lossy().into_owned();
+    let len = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    let text = OsString::from_wide(&buffer[..len])
+        .to_string_lossy()
+        .into_owned();
     (!text.trim().is_empty()).then_some(text)
 }
 
@@ -544,7 +722,12 @@ pub fn unset_user_env(name: &str) -> io::Result<()> {
 /// Materialises everything the auth `approved` response carries so the launched
 /// Codex uses ReCodex: the rendered config block, `auth.json`, and the key env
 /// var. Empty fields are skipped. Mirrors the CLI's `writeCredentials`.
-pub fn apply_login(config: &str, auth_json: &str, env_key: &str, env_value: &str) -> io::Result<()> {
+pub fn apply_login(
+    config: &str,
+    auth_json: &str,
+    env_key: &str,
+    env_value: &str,
+) -> io::Result<()> {
     if !config.is_empty() {
         apply_config(config)?;
     }
@@ -594,7 +777,9 @@ mod tests {
         assert!(with.contains("[mcp_servers.foo]\ncmd = \"bar\""));
         // The crux: model_provider must land above the first table, else TOML
         // parses it as a key of that table and it is silently lost.
-        let mp = with.find("model_provider = \"recodex\"").expect("model_provider present");
+        let mp = with
+            .find("model_provider = \"recodex\"")
+            .expect("model_provider present");
         let table = with.find("[mcp_servers.foo]").expect("user table present");
         assert!(mp < table, "model_provider must precede the first table");
     }
@@ -615,7 +800,10 @@ mod tests {
         // Simulate Codex++ re-serialising away our comment markers: only the bare
         // table + a stray top-level model_provider survive.
         let mangled = "model = \"x\"\nmodel_provider = \"recodex\"\n[t]\nk = 1\n[model_providers.recodex]\nbase_url = \"https://old/backend-api/codex\"\n";
-        let with = install_block(mangled, &render_sub2api_block("https://new/backend-api/codex"));
+        let with = install_block(
+            mangled,
+            &render_sub2api_block("https://new/backend-api/codex"),
+        );
         assert_eq!(with.matches("[model_providers.recodex]").count(), 1);
         assert_eq!(with.matches("model_provider = \"recodex\"").count(), 1);
         assert!(with.contains("https://new/backend-api/codex"));
