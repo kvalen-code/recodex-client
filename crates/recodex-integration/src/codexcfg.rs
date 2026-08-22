@@ -40,7 +40,7 @@ fn home_dir() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "no home directory is available"))
 }
 
-fn codex_dir() -> io::Result<PathBuf> {
+pub(crate) fn codex_dir() -> io::Result<PathBuf> {
     Ok(home_dir()?.join(".codex"))
 }
 
