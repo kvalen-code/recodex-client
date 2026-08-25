@@ -62,6 +62,53 @@ pub fn render_sub2api_block(base_url: &str) -> String {
         .replace("{{ENV_KEY}}", SUB2API_ENV_KEY)
 }
 
+/// 托管配置的体检结果。全部只看文件内容,不联网。
+///
+/// 这三项对应的都是**静默故障** —— 出问题时 Codex 不报错,只是悄悄不走 ReCodex：
+///   - 块不在 → 用户以为在用 ReCodex,其实走的官方 provider
+///   - 块在但排在表头之后 → 块里的顶层 `model_provider` 被 TOML 归给上面那张表,
+///     顶层等于没设,效果同上(2026-08-26 在用户机器上实际发生,1.2.54 装在了第 185 行)
+///   - 顶层 `model_provider` 出现两次 → 整份 config.toml 解析失败,日志里是
+///     `duplicate key model_provider in document root`,而用户看到的是
+///     `Model provider 'recodex' not found`,两者对不上号
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigHealth {
+    pub managed: bool,
+    pub before_first_table: bool,
+    pub top_level_model_provider: usize,
+}
+
+impl ConfigHealth {
+    /// 三项全过才算真的在托管中。
+    pub fn is_healthy(&self) -> bool {
+        self.managed && self.before_first_table && self.top_level_model_provider == 1
+    }
+}
+
+/// 体检 `config.toml` 的内容。
+pub fn inspect_config(content: &str) -> ConfigHealth {
+    let managed = has_managed_block(content);
+    let before_first_table = match (marked_block_span(content), first_table_header_offset(content))
+    {
+        // 没有表头时,块无论在哪都还在顶层区域
+        (Some(_), None) => true,
+        (Some((start, _)), Some(table)) => start < table,
+        (None, _) => false,
+    };
+    let top_level_model_provider = content[..top_level_len(content)]
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#') && model_provider_value(trimmed).is_some()
+        })
+        .count();
+    ConfigHealth {
+        managed,
+        before_first_table,
+        top_level_model_provider,
+    }
+}
+
 /// Reports whether content already carries our managed block.
 pub fn has_managed_block(content: &str) -> bool {
     content.contains(START_MARKER) && content.contains(END_MARKER)
@@ -505,12 +552,38 @@ pub fn restore_auth() -> io::Result<()> {
     }
 }
 
+/// 测试沙箱:置了它就不碰注册表,改在它指向的目录里读写同名文件。
+///
+/// `USERPROFILE` / `HOME` 能把**文件**写入关进沙箱 —— mac 的持久化正好落在
+/// `codex_dir()` 下,天然被关住。但 Windows 走 `setx`,写的是注册表
+/// `HKCU\Environment`,**不受任何环境变量重定向约束**。于是集成测试里一句
+/// `apply_login(..., "sk-recodex2")` 会把开发者本机真实的 `RECODEX_KEY`
+/// **永久**改成假值 —— 2026-08-26 就这么发生过:本机 Codex 一路 401,
+/// 而且因为坏的是持久值,重启、重新登录都好不了,只能手工改回来。
+///
+/// 光让测试改传空 env_key 修不掉:`officialmode` 还会自己调 `set_user_env`。
+/// 所以挡在**唯一那两个碰注册表的函数**里 —— 谁调都逃不掉。
+#[cfg(windows)]
+const ENV_SANDBOX: &str = "RECODEX_ENV_SANDBOX";
+
+#[cfg(windows)]
+fn env_sandbox_path(name: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os(ENV_SANDBOX)?;
+    Some(PathBuf::from(dir).join(format!("{name}.env")))
+}
+
 // Runs `setx NAME VALUE`, persisting to HKCU\Environment. Newly started
 // processes pick the change up; the running Codex++ does not, which is why the
 // caller surfaces a "restart the desktop app" hint after first login — the same
 // contract the CLI documents.
 #[cfg(windows)]
 fn setx(name: &str, value: &str) -> io::Result<()> {
+    if let Some(path) = env_sandbox_path(name) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        return fs::write(path, value);
+    }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let out = std::process::Command::new("setx")
@@ -539,6 +612,9 @@ fn setx(name: &str, value: &str) -> io::Result<()> {
 /// `SUBSCRIPTION_NOT_FOUND`. The registry is the authoritative copy.
 #[cfg(windows)]
 fn read_user_env_from_registry(name: &str) -> Option<String> {
+    if let Some(path) = env_sandbox_path(name) {
+        return fs::read_to_string(path).ok();
+    }
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{

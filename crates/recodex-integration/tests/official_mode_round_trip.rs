@@ -25,6 +25,9 @@ fn switching_to_official_and_back_keeps_the_user_logged_in() {
         std::env::set_var("HOME", &sandbox);
         std::env::set_var("LOCALAPPDATA", sandbox.join("localappdata"));
         std::env::set_var("APPDATA", sandbox.join("appdata"));
+        // 没有这一句,下面的 apply_login 会用 setx 把**本机真实的** RECODEX_KEY
+        // 永久写成 "sk-recodex" —— USERPROFILE 重定向管不到注册表。
+        std::env::set_var("RECODEX_ENV_SANDBOX", sandbox.join("env"));
     }
 
     // 用户此前用过官方 Codex —— 留着他自己的 auth.json,切走时要能还原成它

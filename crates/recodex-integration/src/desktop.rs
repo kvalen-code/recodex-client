@@ -141,6 +141,19 @@ pub fn credentials_rejected() -> Value {
     })
 }
 
+/// 把一次**带凭据**的上游调用失败翻成面板能处理的 Value。
+///
+/// `Unauthorized` 必须走 `credentials_rejected` —— 理由见它的文档注释。
+/// 这条规则属于每一个带凭据的入口,不只是 snapshot:1.2.53 就是因为
+/// 只有 usage 一处照做,设备被撤销后面板停在「重试」上再也走不到登录入口。
+/// 登录相关的两个入口不在此列 —— 它们本来就不带凭据,那里的 401 另有含义。
+pub fn adapter_failure(code: &str, adapter_error: &AdapterError) -> Value {
+    if matches!(adapter_error, AdapterError::Unauthorized) {
+        return credentials_rejected();
+    }
+    error(code, adapter_error.to_string())
+}
+
 // Point Codex at the just-selected gateway by rewriting the managed config
 // block in ~/.codex/config.toml. Returns a warning string if the rewrite failed
 // (the server-side selection still succeeded); an empty endpoint routes nothing.
@@ -284,7 +297,7 @@ fn snapshot(state: &ReCodexState, refresh: bool) -> Value {
     }
     let usage = match usage {
         Ok(value) => value,
-        Err(adapter_error) => return error("usage", adapter_error.to_string()),
+        Err(adapter_error) => return adapter_failure("usage", &adapter_error),
     };
     let account_error = account.as_ref().err().map(ToString::to_string);
     let gateway_error = gateways.as_ref().err().map(ToString::to_string);
@@ -339,7 +352,7 @@ pub fn recodex_refresh_token(state: &ReCodexState) -> Value {
     drop(guard);
     let token = match worker.refresh_token() {
         Ok(value) => value,
-        Err(adapter_error) => return error("refresh", adapter_error.to_string()),
+        Err(adapter_error) => return adapter_failure("refresh", &adapter_error),
     };
     let secret = match crate::credential::Secret::new(token.clone()) {
         Ok(value) => value,
@@ -399,14 +412,14 @@ pub fn recodex_check_client(state: &ReCodexState) -> Value {
     drop(guard);
     let compatibility = match adapter.compatibility(env!("CARGO_PKG_VERSION")) {
         Ok(value) => value,
-        Err(adapter_error) => return error("compatibility", adapter_error.to_string()),
+        Err(adapter_error) => return adapter_failure("compatibility", &adapter_error),
     };
     if !authenticated {
         return json!({"status":"signed_out", "data":{"compatibility":compatibility}});
     }
     let update_channel = match adapter.update_channel("stable") {
         Ok(value) => value,
-        Err(adapter_error) => return error("update", adapter_error.to_string()),
+        Err(adapter_error) => return adapter_failure("update", &adapter_error),
     };
     json!({"status":"ready", "data":{"compatibility":compatibility,"update_channel":update_channel}})
 }
@@ -439,7 +452,7 @@ pub fn recodex_report_diagnostics(state: &ReCodexState) -> Value {
     };
     match adapter.report_diagnostic(&report) {
         Ok(value) => json!({"status":"ready", "data":{"diagnostics":value}}),
-        Err(adapter_error) => error("diagnostics", adapter_error.to_string()),
+        Err(adapter_error) => adapter_failure("diagnostics", &adapter_error),
     }
 }
 
@@ -467,7 +480,7 @@ pub fn recodex_select_gateway(state: &ReCodexState, id: String) -> Value {
             Some(warning) => json!({"status":"ready", "data":{"selected_gateway":gateway}, "warning":{"code":"codex_config","message":warning}}),
             None => json!({"status":"ready", "data":{"selected_gateway":gateway}}),
         },
-        Err(adapter_error) => error("gateway", adapter_error.to_string()),
+        Err(adapter_error) => adapter_failure("gateway", &adapter_error),
     }
 }
 
@@ -495,7 +508,7 @@ pub fn recodex_use_fastest_gateway(state: &ReCodexState) -> Value {
             Some(warning) => json!({"status":"ready", "data":{"selected_gateway":gateway}, "warning":{"code":"codex_config","message":warning}}),
             None => json!({"status":"ready", "data":{"selected_gateway":gateway}}),
         },
-        Err(adapter_error) => error("gateway", adapter_error.to_string()),
+        Err(adapter_error) => adapter_failure("gateway", &adapter_error),
     }
 }
 
@@ -717,6 +730,114 @@ pub fn recodex_prepare_uninstall(state: &ReCodexState) -> Value {
     })
 }
 
+// ── 自诊断 ──────────────────────────────────────────────────────────────
+//
+// 为什么桌面端非有不可：命令行有 `recodex doctor [--fix]`，桌面端一直没有，
+// 于是「配置被清掉 / key 被清空」这类故障只能去命令行救 —— 而安装包**只装
+// codex-plus-plus.exe，不带 recodex.exe**（scripts/installer/windows/ReCodex.nsi），
+// 纯桌面端用户根本没有那个命令可跑。
+//
+// 检查全部本地可算（不联网），因为要诊断的恰恰是「联不上」之前的那一层。
+
+fn check(id: &str, ok: bool, detail: &str) -> Value {
+    json!({"id": id, "status": if ok { "ok" } else { "fail" }, "detail": detail})
+}
+
+/// 读 `~/.codex/config.toml` 并体检托管块。
+fn doctor_config_checks(checks: &mut Vec<Value>) -> bool {
+    let content = crate::codexcfg::config_path()
+        .and_then(std::fs::read_to_string)
+        .unwrap_or_default();
+    let health = crate::codexcfg::inspect_config(&content);
+    checks.push(check(
+        "config_managed",
+        health.managed,
+        if health.managed { "config.toml 已由 ReCodex 托管" } else { "config.toml 没有托管块 —— Codex 走的是官方 provider，不经过 ReCodex" },
+    ));
+    checks.push(check(
+        "config_top_level",
+        !health.managed || health.before_first_table,
+        if health.before_first_table { "托管块在第一个表头之前" } else { "托管块排在表头之后 —— 顶层 model_provider 被归给上面那张表，等于没设" },
+    ));
+    checks.push(check(
+        "config_no_duplicate",
+        health.top_level_model_provider <= 1,
+        match health.top_level_model_provider {
+            0 | 1 => "顶层 model_provider 唯一",
+            _ => "顶层 model_provider 重复 —— 整份 config.toml 都解析不了",
+        },
+    ));
+    health.is_healthy()
+}
+
+/// 本地自诊断。返回 `status: ready`，`data.checks` 是逐项结果，
+/// `data.fixable` 表示「重装配置」这一步能不能修好当前问题。
+pub fn recodex_doctor(state: &ReCodexState) -> Value {
+    let mut checks = Vec::new();
+    let config_ok = doctor_config_checks(&mut checks);
+
+    let key = std::env::var(crate::codexcfg::SUB2API_ENV_KEY).unwrap_or_default();
+    let key_ok = !key.trim().is_empty();
+    checks.push(check(
+        "credential",
+        key_ok,
+        if key_ok { "Codex 能读到 ReCodex 凭据" } else { "环境变量里没有 ReCodex 凭据 —— Codex 会被网关拒掉" },
+    ));
+
+    let signed_in = match state.adapter.lock() {
+        Ok(guard) => guard.as_ref().is_some_and(|a| a.is_authenticated()),
+        Err(_) => return error("state_unavailable", "ReCodex state is unavailable"),
+    };
+    checks.push(check(
+        "session",
+        signed_in,
+        if signed_in { "已登录 ReCodex" } else { "未登录 —— 请先登录，自动修复需要它" },
+    ));
+
+    let healthy = config_ok && key_ok;
+    json!({
+        "status": "ready",
+        "data": {
+            "healthy": healthy && signed_in,
+            // 修复靠向服务端重新取配置，所以必须先登录
+            "fixable": !healthy && signed_in,
+            "checks": checks,
+        }
+    })
+}
+
+/// 自动修复：把服务端当前应下发的托管块与凭据重新装回去。
+///
+/// 走的是**登录那一个写入口**（install_login_config），不是另开一条：
+/// 官方模式快照、顶层 model_provider 接管这些策略都写在那里，绕开就会漂移。
+pub fn recodex_doctor_fix(state: &ReCodexState) -> Value {
+    let worker = match state.adapter.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(adapter) if adapter.is_authenticated() => adapter.fork(),
+            Some(_) => return json!({"status":"signed_out"}),
+            None => return error("configuration", "ReCodex is not configured"),
+        },
+        Err(_) => return error("state_unavailable", "ReCodex state is unavailable"),
+    };
+    let managed = match worker.managed_config() {
+        Ok(value) => value,
+        Err(adapter_error) => return adapter_failure("doctor", &adapter_error),
+    };
+    if managed.config.trim().is_empty() {
+        return error("doctor", "服务端没有下发配置，无法重装");
+    }
+    if let Err(io_error) = install_login_config(
+        &managed.config,
+        &managed.auth_json,
+        &managed.env_key,
+        &managed.env_value,
+    ) {
+        return error("doctor", io_error.to_string());
+    }
+    // 重装完立刻复检，让面板显示的是修完之后的真实状态，而不是「已修复」的一句空话。
+    recodex_doctor(state)
+}
+
 /// CDP 桥分发器:把 /recodex/* 路径映射到命令实现。由 launcher 的 RecodexBridge impl 调用(持 ReCodexState)。
 pub fn handle_bridge(state: &ReCodexState, path: &str, payload: &Value) -> Value {
     match path {
@@ -724,6 +845,8 @@ pub fn handle_bridge(state: &ReCodexState, path: &str, payload: &Value) -> Value
         "/recodex/refresh-usage" => recodex_refresh_usage(state),
         "/recodex/refresh-token" => recodex_refresh_token(state),
         "/recodex/check-client" => recodex_check_client(state),
+        "/recodex/doctor" => recodex_doctor(state),
+        "/recodex/doctor/fix" => recodex_doctor_fix(state),
         "/recodex/report-diagnostics" => recodex_report_diagnostics(state),
         "/recodex/login/start" => recodex_login_start(state),
         "/recodex/login/poll" => recodex_login_poll(state),
@@ -801,6 +924,37 @@ pub fn ").unwrap_or(prepare.len())];
         assert!(
             prepare.contains("discard_snapshot()"),
             "卸载准备必须丢弃快照"
+        );
+    }
+
+    /// 401 只能翻成「回登录」,而且这条规则要**留在唯一一处**。
+    ///
+    /// 新加一个带凭据的入口时顺手写 `error(code, adapter_error.to_string())`,
+    /// 设备被撤销后面板就又会停在「重试」上再也走不到登录 —— 1.2.53 原样复发,
+    /// 而且这种回归任何行为测试都照不到(它只在真被撤销时才显形)。
+    #[test]
+    fn unauthorized_always_routes_back_to_login() {
+        use super::{adapter_failure, AdapterError};
+        use serde_json::json;
+
+        assert_eq!(
+            json!({"status":"signed_out","notice":"x"})["status"],
+            adapter_failure("usage", &AdapterError::Unauthorized)["status"],
+            "带凭据的入口遇到 401 必须回 signed_out,面板才会画「登录 ReCodex」"
+        );
+        assert_eq!(
+            adapter_failure("usage", &AdapterError::RateLimited)["status"],
+            "error",
+            "其余错误仍是可重试的普通错误,别一并吞成登出"
+        );
+
+        // 允许出现的三处:`adapter_failure` 自己,以及两个**不带凭据**的登录入口
+        // (login/start、login/poll —— 那里的 401 另有含义,不该把用户登出)。
+        let body = body();
+        let sites = body.matches(", adapter_error.to_string())").count();
+        assert_eq!(
+            sites, 3,
+            "带凭据的入口不得自己拼错误信息,请改用 adapter_failure(code, &err);             当前直接拼装的地方有 {sites} 处(只允许 adapter_failure 自身 + 两个登录入口)"
         );
     }
 

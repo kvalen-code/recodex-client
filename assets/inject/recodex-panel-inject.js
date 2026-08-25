@@ -1393,6 +1393,60 @@
   }
 
   // ── 高级 ───────────────────────────────────────────────────
+    // ── 诊断与修复 ─────────────────────────────────────────────
+  //
+  // 为什么必须放在桌面端里:命令行有 `recodex doctor [--fix]`,而安装包**只装
+  // codex-plus-plus.exe、不带 recodex.exe**,纯桌面端用户根本没有那个命令可跑。
+  // 于是「托管块被清掉 / 凭据被清空」这类故障过去只能来问人。
+  //
+  // 检查全部本地可算(不联网):要诊断的恰恰是「连不上」之前的那一层。
+  async function renderDoctor(box) {
+    if (!box) return;
+    box.innerHTML = `<div class="rcx-muted">${t("加载中…")}</div>`;
+    const res = await bridge("/recodex/doctor", {});
+    if (!res || res.status !== "ready" || !res.data) {
+      box.innerHTML = `<div class="rcx-err">${esc((res && res.error && res.error.message) || t("无法读取状态"))}</div>` +
+        `<button class="rcx-act sec" id="rcx-doc-retry">${t("重试")}</button>`;
+      box.querySelector("#rcx-doc-retry").onclick = () => renderDoctor(box);
+      return;
+    }
+    const d = res.data;
+    const bad = (d.checks || []).filter((c) => c.status !== "ok");
+    if (d.healthy) {
+      box.innerHTML = `<div class="rcx-muted" style="font-size:12px">${t("一切正常。")}</div>` +
+        `<button class="rcx-act sec" id="rcx-doc-recheck">${t("重新检查")}</button>`;
+    } else {
+      // 只列**没通过**的项。全部罗列会把一条真问题淹在一堆绿色里。
+      box.innerHTML = bad.map((c) => `<div class="rcx-err" style="font-size:12px;margin-bottom:4px">${esc(c.detail)}</div>`).join("") +
+        (d.fixable
+          ? `<button class="rcx-act" id="rcx-doc-fix">${t("自动修复")}</button>`
+          : `<div class="rcx-muted" style="font-size:12px">${t("请先登录 ReCodex,再回来修复。")}</div>`) +
+        `<button class="rcx-act sec" id="rcx-doc-recheck">${t("重新检查")}</button>`;
+    }
+    const recheck = box.querySelector("#rcx-doc-recheck");
+    if (recheck) recheck.onclick = () => renderDoctor(box);
+    const fix = box.querySelector("#rcx-doc-fix");
+    if (fix) fix.onclick = async () => {
+      fix.disabled = true;
+      fix.textContent = t("正在修复…");
+      const r = await bridge("/recodex/doctor/fix", {});
+      if (!r || r.status === "error") {
+        box.innerHTML = `<div class="rcx-err" style="font-size:12px">${esc((r && r.error && r.error.message) || t("修复失败"))}</div>` +
+          `<button class="rcx-act sec" id="rcx-doc-retry2">${t("重试")}</button>`;
+        box.querySelector("#rcx-doc-retry2").onclick = () => renderDoctor(box);
+        return;
+      }
+      // 修完重画一次:显示的是修完之后的真实状态,不是「已修复」一句空话。
+      renderDoctor(box);
+      // 环境变量对**已在运行的进程**不生效 —— 不说清楚,用户会以为没修好。
+      const tip = document.createElement("div");
+      tip.className = "rcx-muted";
+      tip.style.cssText = "font-size:12px;margin-top:6px";
+      tip.textContent = t("已重装配置。请完全退出并重开 Codex 让它读到新凭据。");
+      box.appendChild(tip);
+    };
+  }
+
   async function renderAdvanced() {
     const c = panel.querySelector("#recodex-adv");
     if (!c) return;
@@ -1421,6 +1475,9 @@
     html += `<div class="rcx-k" style="margin-bottom:4px">${t("系统集成")}</div>`;
     html += `<div id="rcx-adv-toggles"></div></div>`;
     html += `<div style="margin-top:14px;border-top:1px solid #23272f;padding-top:10px">`;
+    html += `<div class="rcx-k" style="margin-bottom:4px">${t("诊断与修复")}</div>`;
+    html += `<div id="rcx-doctor"><div class="rcx-muted">${t("加载中…")}</div></div></div>`;
+    html += `<div style="margin-top:14px;border-top:1px solid #23272f;padding-top:10px">`;
     html += `<div class="rcx-k" style="margin-bottom:4px">${t("版本与更新")}</div>`;
     html += `<div id="rcx-update"><div class="rcx-muted">${t("加载中…")}</div></div></div>`;
     html += `<div style="margin-top:14px;border-top:1px solid #23272f;padding-top:10px">`;
@@ -1433,6 +1490,7 @@
     html += `<div id="rcx-uninstall"></div></div>`;
     c.innerHTML = html;
 
+    renderDoctor(c.querySelector("#rcx-doctor"));
     renderUpdate(c.querySelector("#rcx-update"));
     renderRunMode(c.querySelector("#rcx-mode"));
     renderUninstall(c.querySelector("#rcx-uninstall"));

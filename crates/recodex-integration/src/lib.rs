@@ -100,6 +100,24 @@ fn read_response_body(response: ureq::Response) -> Result<String, AdapterError> 
         .map_err(|_| AdapterError::InvalidResponse("response body is not UTF-8".into()))
 }
 
+/// 服务端下发的托管配置。桌面端的自诊断靠它把托管块和 RECODEX_KEY 一起重装回去 ——
+/// 这两样被清掉过（登出走 restore_all()，会同时删块并 `setx RECODEX_KEY ""`，
+/// 而它们是命令行与桌面端**共用**的）。命令行早有 `recodex refresh` 能自愈，
+/// 桌面端过去没有对应入口。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ManagedConfig {
+    #[serde(default)]
+    pub gateway_url: String,
+    #[serde(default)]
+    pub config: String,
+    #[serde(default)]
+    pub auth_json: String,
+    #[serde(default)]
+    pub env_key: String,
+    #[serde(default)]
+    pub env_value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Account {
     pub user_id: i64,
@@ -332,6 +350,14 @@ impl<T: Transport> Adapter<T> {
 
     pub fn account(&self) -> Result<Account, AdapterError> {
         self.get("/api/v1/account")
+    }
+
+    /// 取服务端当前应下发的托管配置。
+    ///
+    /// 与命令行的 `/api/cli/auth/config` 是**同一个处理器**（服务端有守卫钉住），
+    /// 所以两个客户端自愈之后落到磁盘上的东西一致。
+    pub fn managed_config(&self) -> Result<ManagedConfig, AdapterError> {
+        self.request("POST", "/api/v1/auth/config", Some("{}"))
     }
 
     pub fn compatibility(&self, version: &str) -> Result<ClientCompatibility, AdapterError> {

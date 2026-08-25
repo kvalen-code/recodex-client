@@ -35,6 +35,9 @@ fn switching_to_official_keeps_provider_definition_for_old_threads() {
         std::env::set_var("HOME", &sandbox);
         std::env::set_var("LOCALAPPDATA", sandbox.join("localappdata"));
         std::env::set_var("APPDATA", sandbox.join("appdata"));
+        // 没有这一句,下面的 apply_login 会用 setx 把**本机真实的** RECODEX_KEY
+        // 永久写成 "sk-recodex" —— USERPROFILE 重定向管不到注册表。
+        std::env::set_var("RECODEX_ENV_SANDBOX", sandbox.join("env"));
     }
 
     let auth_path = codexcfg::auth_path().unwrap();
