@@ -206,12 +206,44 @@ fn try_snapshot_lock(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, Value> {
     }
 }
 
+/// 拿快照锁。锁本身是必要的:snapshot 末尾会 `merge_cache_from`,并发合并会把缓存搅乱。
+///
+/// 但**普通轮询和「点刷新」不该同等对待**:
+/// - 点刷新要打上游,可能几秒;这期间面板每隔几秒的轮询全都撞锁,
+///   于是用户看到一连串「A ReCodex status refresh is already in progress」——
+///   一次无害的重叠被变成了可见故障,而面板上本来就有数据可以继续显示。
+/// - 反过来,用户连点两次刷新,如实告诉他「正在刷新」是对的。
+///
+/// 所以:轮询**等一会儿**(有上限,不会挂死),刷新仍然 try_lock 立即返回。
+fn acquire_snapshot_lock(lock: &Mutex<()>, refresh: bool) -> Result<MutexGuard<'_, ()>, Value> {
+    if refresh {
+        return try_snapshot_lock(lock);
+    }
+    // ponytail: 轮询等最多 2 秒(20 × 100ms)。std 的 Mutex 没有带超时的 lock,
+    // 又不值得为此引入 parking_lot;真需要更精细再说。
+    for _ in 0..SNAPSHOT_LOCK_WAIT_TRIES {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::WouldBlock) => {
+                std::thread::sleep(SNAPSHOT_LOCK_WAIT_STEP);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(error("state_unavailable", "ReCodex state is unavailable"));
+            }
+        }
+    }
+    try_snapshot_lock(lock)
+}
+
+const SNAPSHOT_LOCK_WAIT_TRIES: u32 = 20;
+const SNAPSHOT_LOCK_WAIT_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
 fn snapshot_epoch_is_current(started_epoch: u64, current_epoch: u64) -> bool {
     started_epoch == current_epoch
 }
 
 fn snapshot(state: &ReCodexState, refresh: bool) -> Value {
-    let _snapshot_guard = match try_snapshot_lock(&state.snapshot_lock) {
+    let _snapshot_guard = match acquire_snapshot_lock(&state.snapshot_lock, refresh) {
         Ok(guard) => guard,
         Err(value) => return value,
     };
