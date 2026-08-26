@@ -334,13 +334,13 @@ impl<T: Transport> Adapter<T> {
     }
 
     pub fn refresh_token(&mut self) -> Result<String, AdapterError> {
-        let refreshed: TokenRefresh = self.request("POST", "/api/v1/auth/refresh", Some("{}"))?;
+        let refreshed: TokenRefresh = self.request("POST", "/api/cli/auth/refresh", Some("{}"))?;
         self.set_access_token(refreshed.token.clone())?;
         Ok(refreshed.token)
     }
 
     pub fn revoke_session(&self) -> Result<(), AdapterError> {
-        let _: serde_json::Value = self.request("POST", "/api/v1/auth/logout", Some("{}"))?;
+        let _: serde_json::Value = self.request("POST", "/api/cli/auth/logout", Some("{}"))?;
         Ok(())
     }
 
@@ -357,7 +357,7 @@ impl<T: Transport> Adapter<T> {
     /// 与命令行的 `/api/cli/auth/config` 是**同一个处理器**（服务端有守卫钉住），
     /// 所以两个客户端自愈之后落到磁盘上的东西一致。
     pub fn managed_config(&self) -> Result<ManagedConfig, AdapterError> {
-        self.request("POST", "/api/v1/auth/config", Some("{}"))
+        self.request("POST", "/api/cli/auth/config", Some("{}"))
     }
 
     pub fn compatibility(&self, version: &str) -> Result<ClientCompatibility, AdapterError> {

@@ -393,7 +393,10 @@ fn desktop_logout_revokes_the_server_session() {
     let mut adapter = Adapter::new(transport, "https://api.example").unwrap();
     adapter.set_access_token("rct_logout_token".into()).unwrap();
     adapter.revoke_session().unwrap();
-    assert_eq!(*calls.borrow(), vec!["POST /api/v1/auth/logout"]);
+    // 必须是 /api/cli/auth/：sub2api 自己也有 /api/v1/auth/logout（网页会话），
+    // 反代不把 /api/v1/auth/* 分给 recodex-auth（那会抢掉网页登录），
+    // 走 v1 的话这个请求静默落到 sub2api —— 服务端设备根本没被撤销。
+    assert_eq!(*calls.borrow(), vec!["POST /api/cli/auth/logout"]);
 }
 
 #[test]
@@ -803,7 +806,8 @@ fn refresh_token_rotates_the_adapter_credential_without_serializing_it() {
         .unwrap();
     adapter.refresh_token().unwrap();
     assert!(adapter.is_authenticated());
-    assert_eq!(calls.borrow().as_slice(), ["POST /api/v1/auth/refresh"]);
+    // 同上：走 v1 的话刷新打在 sub2api 的网页会话刷新上，令牌永远不会真的轮换。
+    assert_eq!(calls.borrow().as_slice(), ["POST /api/cli/auth/refresh"]);
 }
 
 #[test]
