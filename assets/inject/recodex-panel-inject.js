@@ -1418,11 +1418,20 @@
     } else {
       // 只列**没通过**的项。全部罗列会把一条真问题淹在一堆绿色里。
       box.innerHTML = bad.map((c) => `<div class="rcx-err" style="font-size:12px;margin-bottom:4px">${esc(c.detail)}</div>`).join("") +
-        (d.fixable
-          ? `<button class="rcx-act" id="rcx-doc-fix">${t("自动修复")}</button>`
-          : `<div class="rcx-muted" style="font-size:12px">${t("请先登录 ReCodex,再回来修复。")}</div>`) +
+        // 凭据缺失和配置损坏要分开说：服务端**只在登录时交付一次** key，
+        // 「重装配置」拿不回被清掉的凭据。混为一谈的话，用户会一直点自动修复
+        // 而问题纹丝不动。
+        (d.needs_relogin
+          ? `<button class="rcx-act" id="rcx-doc-login">${t("重新登录 ReCodex")}</button>` +
+            `<div class="rcx-muted" style="font-size:12px;margin-top:4px">${t("凭据只在登录时下发一次,重装配置取不回来。")}</div>`
+          : d.fixable
+            ? `<button class="rcx-act" id="rcx-doc-fix">${t("自动修复")}</button>`
+            : `<div class="rcx-muted" style="font-size:12px">${t("请先登录 ReCodex,再回来修复。")}</div>`) +
         `<button class="rcx-act sec" id="rcx-doc-recheck">${t("重新检查")}</button>`;
     }
+    const relogin = box.querySelector("#rcx-doc-login");
+    // 登录入口在账号页 —— 切过去再触发，用户能看见二维码/验证码那一套流程
+    if (relogin) relogin.onclick = () => { showTab("account"); doLogin(); };
     const recheck = box.querySelector("#rcx-doc-recheck");
     if (recheck) recheck.onclick = () => renderDoctor(box);
     const fix = box.querySelector("#rcx-doc-fix");

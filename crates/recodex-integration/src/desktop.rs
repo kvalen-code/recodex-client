@@ -794,13 +794,17 @@ pub fn recodex_doctor(state: &ReCodexState) -> Value {
         if signed_in { "已登录 ReCodex" } else { "未登录 —— 请先登录，自动修复需要它" },
     ));
 
-    let healthy = config_ok && key_ok;
     json!({
         "status": "ready",
         "data": {
-            "healthy": healthy && signed_in,
-            // 修复靠向服务端重新取配置，所以必须先登录
-            "fixable": !healthy && signed_in,
+            "healthy": config_ok && key_ok && signed_in,
+            // 「重装配置」能修好的只有托管块那几项，且必须先登录才取得到。
+            "fixable": !config_ok && signed_in,
+            // 凭据是另一回事：服务端**刻意只在登录时交付一次**
+            // （server_authed.go handleConfig 的注释写得很清楚），
+            // 重装配置拿不回被清掉的 key。这时候唯一的出路是重新登录 ——
+            // 不如实说的话，用户会一直点「自动修复」而问题纹丝不动。
+            "needs_relogin": !key_ok,
             "checks": checks,
         }
     })
