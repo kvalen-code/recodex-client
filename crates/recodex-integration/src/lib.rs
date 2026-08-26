@@ -434,7 +434,11 @@ impl<T: Transport> Adapter<T> {
             "device_name": device_name,
             "pubkey": "desktop-managed",
             "client_version": client_version,
-            "os": os
+            "os": os,
+            // 上报自己是哪一端：名额按 device_id 算（与命令行共用一个），
+            // 凭据按 (device_id, client) 分开存 —— 不报的话两端共用一份凭据，
+            // 谁登录谁把对方顶下线。
+            "client": "desktop"
         });
         let login: LoginStart =
             self.public_request("POST", "/api/cli/auth/start", Some(&body.to_string()))?;
