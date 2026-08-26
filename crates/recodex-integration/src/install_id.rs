@@ -17,7 +17,7 @@ const RANDOM_BYTES: usize = 16;
 ///   3. 都没有 —— 新生成，直接落在共用文件里
 pub fn load_or_create_install_id() -> io::Result<String> {
     if let Ok(shared) = shared_identity_path() {
-        if let Some(id) = read_shared_device_id(&shared) {
+        if let Some(id) = read_shared_device_id(&shared)? {
             return Ok(id);
         }
         let legacy_path = install_id_path()?;
@@ -89,14 +89,36 @@ fn shared_identity_path() -> io::Result<PathBuf> {
     Ok(codex_dir()?.join("recodex").join("identity.json"))
 }
 
-fn read_shared_device_id(path: &Path) -> Option<String> {
-    let text = fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let id = value.get("device_id")?.as_str()?.trim();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id.to_string())
+/// 读共用身份里的 device_id。
+///
+/// 三种结果含义完全不同，必须分清：
+///   `Ok(Some(id))` 读到了；`Ok(None)` 文件**不存在**（新机器，可以生成）；
+///   `Err(..)` 文件在、但读不动或没有 device_id。
+///
+/// 最后一种**绝不能当成「没有」**：那样会凭空生成一个新身份，于是这台机器在
+/// 服务端多占一个设备名额，而用户什么都没做、也看不到任何报错 ——
+/// 只是设备列表里莫名多出一台。宁可让登录失败并说清原因。
+fn read_shared_device_id(path: &Path) -> io::Result<Option<String>> {
+    let text = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // Windows 上写文件很容易带 UTF-8 BOM（PowerShell 5.1 的 -Encoding utf8 就写），
+    // serde_json 见到它直接失败。
+    let text = text.trim_start_matches('\u{feff}');
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|error| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("shared identity is unreadable: {error}"),
+        )
+    })?;
+    match value.get("device_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.trim().is_empty() => Ok(Some(id.trim().to_string())),
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "shared identity has no device_id",
+        )),
     }
 }
 
