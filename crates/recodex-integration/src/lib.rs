@@ -178,6 +178,44 @@ pub struct GatewayList {
     pub gateways: Vec<Gateway>,
 }
 
+/// 切换器里的一行。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Organization {
+    pub id: i64,
+    #[serde(default)]
+    pub kind: String,
+    pub name: String,
+    #[serde(default)]
+    pub member_count: i64,
+    /// 为空表示这个组织没有生效订阅 —— 切过去也没有额度。
+    /// 仍然列出来:用户看得到「我在这里但没额度」，比不显示更容易判断该找谁。
+    #[serde(default)]
+    pub plan_name: String,
+    /// **这台设备**当前用的那个。服务端按设备令牌判定,不是按账号 ——
+    /// 同一个人可以在台式机上用团队组织、笔记本上用个人组织。
+    #[serde(default)]
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrganizationList {
+    #[serde(default)]
+    pub organizations: Vec<Organization>,
+}
+
+/// 一次切换的结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrganizationSwitch {
+    pub org_id: i64,
+    pub org_name: String,
+    #[serde(default)]
+    pub plan_name: String,
+    /// 接下来要用的网关凭据。**不要序列化给前端** —— 见 desktop.rs 里的
+    /// recodex_switch_org:明文 Key 只在进程内用于写环境变量,
+    /// 送进 webview 就等于把它暴露给任何能开 devtools 的人。
+    pub gateway_key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoginStart {
     pub device_code: String,
@@ -543,6 +581,36 @@ impl<T: Transport> Adapter<T> {
         )?;
         validate_gateway(&gateway)?;
         Ok(gateway)
+    }
+
+    /// 列出这个用户能切到哪些组织。
+    pub fn organizations(&self) -> Result<Vec<Organization>, AdapterError> {
+        let response: OrganizationList = self.get("/api/v1/org")?;
+        Ok(response.organizations)
+    }
+
+    /// 把这台设备切到目标组织，拿回接下来要用的网关 Key。
+    ///
+    /// 服务端在返回之前已经改了设备归属 —— 调用方**必须**把 Key 落到用户环境,
+    /// 否则就是「服务端认为你在新组织、Codex 还拿着旧组织的 Key」:
+    /// 请求照常成功,只是用量记到旧组织头上,而且没有任何一处会报错。
+    pub fn switch_organization(&self, org_id: i64) -> Result<OrganizationSwitch, AdapterError> {
+        if org_id <= 0 {
+            return Err(AdapterError::InvalidResponse("invalid organization id".into()));
+        }
+        let switched: OrganizationSwitch = self.request(
+            "POST",
+            "/api/v1/org/switch",
+            Some(&serde_json::json!({"org_id": org_id}).to_string()),
+        )?;
+        if switched.gateway_key.trim().is_empty() {
+            // 服务端说成功却没给 Key —— 当失败处理。放行的话会把空串写进环境变量,
+            // 把一个能用的配置改成不能用的。
+            return Err(AdapterError::InvalidResponse(
+                "organization switch returned no gateway key".into(),
+            ));
+        }
+        Ok(switched)
     }
 
     pub fn fastest_gateway<'a>(&self, gateways: &'a [Gateway]) -> Option<&'a Gateway> {

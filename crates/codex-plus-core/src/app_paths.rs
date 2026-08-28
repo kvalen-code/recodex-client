@@ -342,7 +342,7 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    // 拒绝把 Codex++ 管理工具安装目录误当成 Codex 桌面应用
+    // 拒绝把 ReCodex安装目录误当成 Codex 桌面应用
     if is_codex_plus_plus_path(path) {
         return None;
     }

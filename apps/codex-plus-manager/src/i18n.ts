@@ -36,14 +36,18 @@ export function getLanguage(): Language {
 }
 
 /** Translate a plain Chinese literal. Falls back to the source text. */
+// recodex-overlay:brandize -- rebrand upstream product name in all UI copy.
+function brandize(text: string): string {
+  return text.replace(/Codex\+\+/g, "ReCodex").replace(/CodexPlusPlus(?:-Themes|ScriptMarket)?/g, "ReCodex");
+}
 export function t(zh: string): string {
-  if (LANG !== "en") return zh;
+  if (LANG !== "en") return brandize(zh);
   const plain = EN_PLAIN[zh] ?? EN_BACKEND[zh];
-  if (plain) return plain;
+  if (plain) return brandize(plain);
   for (const [re, replacement] of EN_BACKEND_PATTERNS) {
-    if (re.test(zh)) return zh.replace(re, replacement);
+    if (re.test(zh)) return brandize(zh.replace(re, replacement));
   }
-  return zh;
+  return brandize(zh);
 }
 
 /**
@@ -53,7 +57,7 @@ export function t(zh: string): string {
  * looked-up template (also falling back to the key).
  */
 export function tf(key: string, args: Array<string | number>): string {
-  const template = LANG === "en" ? EN_TEMPLATE[key] ?? key : key;
+  const template = brandize(LANG === "en" ? EN_TEMPLATE[key] ?? key : key);
   return template.replace(/\{(\d+)\}/g, (match, index) => {
     const value = args[Number(index)];
     return value === undefined || value === null ? match : String(value);

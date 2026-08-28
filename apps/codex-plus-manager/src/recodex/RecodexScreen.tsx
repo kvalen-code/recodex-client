@@ -5,6 +5,7 @@ import { getLanguage } from "@/i18n";
 import "./RecodexScreen.css";
 
 type Gateway = { id: string; name: string; client_latency_ms?: number; healthy: boolean; enabled?: boolean; maintenance?: boolean; selected: boolean };
+type Organization = { id: number; kind?: string; name: string; member_count?: number; plan_name?: string; is_current?: boolean };
 type UsageWindow = { window: string; limit: number; used: number; remaining: number; reset_at?: string };
 type Usage = { account_type: string; available: number; total: number; used: number; windows?: UsageWindow[]; refreshed_at: string; source: string; stale: boolean; refresh_error?: { code: string; message: string } };
 type Account = { display_name?: string; email?: string; plan?: string; account_type: string };
@@ -12,7 +13,7 @@ type ClientCompatibility = { client_version: string; supported: boolean; minimum
 type UpdateChannel = { channel: string; available: boolean; latest_version?: string; manifest_url?: string; reason?: string };
 type AdapterEnvelope = {
   status: string;
-  data?: { account?: Account; usage?: Usage; gateways?: Gateway[]; selected_gateway?: Gateway; account_error?: string; gateway_error?: string; user_code?: string; verify_url?: string; compatibility?: ClientCompatibility; update_channel?: UpdateChannel; diagnostics?: { status: string } };
+  data?: { account?: Account; usage?: Usage; gateways?: Gateway[]; selected_gateway?: Gateway; account_error?: string; gateway_error?: string; user_code?: string; verify_url?: string; compatibility?: ClientCompatibility; update_channel?: UpdateChannel; diagnostics?: { status: string }; organizations?: Organization[]; org_id?: number; org_name?: string; plan_name?: string };
   error?: { code: string; message: string };
 };
 
@@ -65,6 +66,9 @@ export function RecodexScreen() {
   const [clientInfo, setClientInfo] = useState<AdapterEnvelope | null>(null);
   const [diagnostic, setDiagnostic] = useState<AdapterEnvelope | null>(null);
   const [busy, setBusy] = useState(false);
+  // 组织列表单独放:拉失败不该把整个面板打成错误态 ——
+  // 切换是附加能力,而账号和用量才是这个面板的主功能。
+  const [orgs, setOrgs] = useState<Organization[]>([]);
 
   const setStateIPCError = (error: unknown) => {
     const message = redactError(error);
@@ -164,6 +168,27 @@ export function RecodexScreen() {
     catch (error) { setStateIPCError(error); }
     finally { setBusy(false); }
   };
+  const loadOrgs = async () => {
+    try {
+      const result = await invoke<AdapterEnvelope>("recodex_organizations");
+      setOrgs(result.status === "ready" ? (result.data?.organizations ?? []) : []);
+    } catch {
+      // 静默:服务端版本旧(501)或网络抖动时不显示切换器,而不是弹错。
+      setOrgs([]);
+    }
+  };
+  const switchOrg = async (id: number) => {
+    setBusy(true);
+    try {
+      const result = await invoke<AdapterEnvelope>("recodex_switch_org", { orgId: id });
+      // 切完必须刷新:组织决定用哪个 AI 账号、走哪份额度,
+      // 不刷的话面板上的用量还是上一个组织的 —— 用户会以为切换没生效。
+      if (shouldRefreshAfterAction(result)) await refresh();
+      if (result.status === "ready") await loadOrgs();
+    }
+    catch (error) { setStateIPCError(error); }
+    finally { setBusy(false); }
+  };
   const useFastestGateway = async () => {
     setBusy(true);
     try {
@@ -207,6 +232,7 @@ export function RecodexScreen() {
       case "#recodex-diagnostics": void reportDiagnostics(); break;
       default: void load();
     }
+    void loadOrgs();
   }, []);
 
   const data = state.data;
@@ -242,6 +268,7 @@ export function RecodexScreen() {
       </section>
       {usage ? <section className="recodex-panel recodex-usage" data-testid="recodex-usage"><div className="recodex-panel-title"><h3>{tr("额度", "Quota")}</h3><span className={usage.stale ? "recodex-warning" : "recodex-live"}>{usage.stale ? tr("缓存", "stale") : tr("实时", "live")}</span></div><p className="recodex-quota"><strong>{usage.available}</strong><span>/ {usage.total} {tr("剩余", "remaining")}</span></p><p className="recodex-muted">{tr("已用", "Used")} {usage.used} | {accountTypeLabel(usage.account_type)}</p>{usage.refresh_error ? <p className="recodex-warning" role="alert">{redactError(usage.refresh_error.message)} ({usage.refresh_error.code})</p> : null}<div className="recodex-window-list">{(usage.windows ?? []).map((window) => <div className="recodex-row" key={window.window}><span>{window.window}</span><span>{window.remaining} / {window.limit}{window.reset_at ? <small>{tr("重置", "Resets")} {window.reset_at}</small> : null}</span></div>)}</div><small className="recodex-meta">{tr("更新于", "Updated")} {usage.refreshed_at} | {usage.source}</small></section> : null}
       {data?.account ? <section className="recodex-panel recodex-account" data-testid="recodex-account"><h3>{tr("账户", "Account")}</h3><p className="recodex-account-name">{data.account.display_name || data.account.email || tr("ReCodex 账户", "ReCodex account")}</p><p className="recodex-muted">{data.account.plan || tr("无套餐", "No plan")} | {accountTypeLabel(data.account.account_type)}</p></section> : null}
+      {orgs.length > 1 ? <section className="recodex-panel recodex-orgs" data-testid="recodex-orgs"><div className="recodex-panel-title"><h3>{tr("组织", "Organization")}</h3></div><div className="recodex-gateway-list">{orgs.map((org) => <div className="recodex-row recodex-gateway" key={org.id}><span><span>{org.name}</span></span><span><span className={org.plan_name ? "recodex-live" : "recodex-warning"}>{org.plan_name || tr("无生效订阅", "no subscription")}</span>{org.is_current ? <strong>{tr("使用中", "In use")}</strong> : <button type="button" aria-label={tr("切换到", "Switch to") + ` ${org.name}`} onClick={() => void switchOrg(org.id)} disabled={busy || !org.plan_name}>{tr("切换", "Switch")}</button>}</span></div>)}</div></section> : null}
       {gateways.length > 0 ? <section className="recodex-panel recodex-gateways" data-testid="recodex-gateways"><div className="recodex-panel-title"><h3>{tr("网关", "Gateways")}</h3><button type="button" aria-label={tr("使用最快网关", "Use fastest gateway")} onClick={() => void useFastestGateway()} disabled={busy}><Zap size={16} /> {tr("使用最快", "Use fastest")}</button></div><div className="recodex-gateway-list">{gateways.map((gateway) => <div className="recodex-row recodex-gateway" key={gateway.id}><span><Zap size={14} /> <span>{gateway.name || gateway.id}</span></span><span><span className={gateway.healthy ? "recodex-live" : "recodex-warning"}>{gateway.healthy ? `${gateway.client_latency_ms ?? "-"} ms` : tr("不可用", "unavailable")}</span>{gateway.selected ? <strong>{tr("已选用", "Selected")}</strong> : <button type="button" aria-label={tr("使用网关", "Use gateway") + ` ${gateway.name || gateway.id}`} onClick={() => void selectGateway(gateway.id)} disabled={busy || !gateway.healthy}>{tr("使用", "Use")}</button>}</span></div>)}</div></section> : null}
     </div>
   );

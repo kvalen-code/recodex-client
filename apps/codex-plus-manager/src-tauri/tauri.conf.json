@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex++ Manager",
+  "productName": "ReCodex",
   "version": "1.2.49",
-  "identifier": "com.bigpizzav3.codexplusplus.manager",
+  "identifier": "ai.recodex.desktop.manager",
   "build": {
     "beforeDevCommand": "npm run vite:dev",
     "beforeBuildCommand": "npm run vite:build",
@@ -14,7 +14,7 @@
       {
         "create": false,
         "label": "main",
-        "title": "Codex++ 管理工具",
+        "title": "ReCodex Desktop",
         "width": 1180,
         "height": 820,
         "minWidth": 960,
@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src \u0027self\u0027; script-src \u0027self\u0027; style-src \u0027self\u0027 \u0027unsafe-inline\u0027; img-src \u0027self\u0027 asset: http://asset.localhost data:; font-src \u0027self\u0027 data:; connect-src \u0027self\u0027 https://api.recodex.dev http://127.0.0.1:* http://localhost:*",
       "assetProtocol": {
         "enable": true,
         "scope": [

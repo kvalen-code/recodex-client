@@ -512,6 +512,103 @@ pub fn recodex_use_fastest_gateway(state: &ReCodexState) -> Value {
     }
 }
 
+/// 列出这个用户能切到哪些组织。
+pub fn recodex_organizations(state: &ReCodexState) -> Value {
+    let worker = match state.adapter.lock() {
+        Ok(value) => value,
+        Err(_) => return error("state_unavailable", "ReCodex state is unavailable"),
+    };
+    let Some(adapter) = worker.as_ref() else {
+        return error(
+            "configuration",
+            state
+                .init_error
+                .clone()
+                .unwrap_or_else(|| "ReCodex is not configured".to_owned()),
+        );
+    };
+    if !adapter.is_authenticated() {
+        return json!({"status":"signed_out"});
+    }
+    let adapter = adapter.fork();
+    drop(worker);
+    match adapter.organizations() {
+        Ok(organizations) => json!({"status":"ready", "data":{"organizations":organizations}}),
+        Err(adapter_error) => adapter_failure("org", &adapter_error),
+    }
+}
+
+/// 把这台设备切到目标组织。
+///
+/// **网关 Key 不进 webview。** 它只在进程内用于写用户环境 —— 送给前端就等于
+/// 把一份长期有效的凭据暴露给任何能开 devtools 的人,而前端拿它也没有用途。
+/// 返回体里只有组织名和套餐名。
+///
+/// 顺序:切换 → 写环境变量 → 回报。写失败必须让整个调用失败:
+/// 服务端已经改了设备归属,本地不写就是「服务端认为你在新组织、Codex 还拿着
+/// 旧组织的 Key」—— 请求照常成功,只是用量记到旧组织,没有任何一处报错。
+pub fn recodex_switch_org(state: &ReCodexState, org_id: i64) -> Value {
+    let worker = match state.adapter.lock() {
+        Ok(value) => value,
+        Err(_) => return error("state_unavailable", "ReCodex state is unavailable"),
+    };
+    let Some(adapter) = worker.as_ref() else {
+        return error(
+            "configuration",
+            state
+                .init_error
+                .clone()
+                .unwrap_or_else(|| "ReCodex is not configured".to_owned()),
+        );
+    };
+    if !adapter.is_authenticated() {
+        return json!({"status":"signed_out"});
+    }
+    let adapter = adapter.fork();
+    drop(worker);
+
+    let switched = match adapter.switch_organization(org_id) {
+        Ok(value) => value,
+        Err(adapter_error) => return adapter_failure("org", &adapter_error),
+    };
+
+    if let Err(io_error) = crate::codexcfg::set_user_env(
+        crate::codexcfg::SUB2API_ENV_KEY,
+        switched.gateway_key.trim(),
+    ) {
+        return error(
+            "org_env",
+            format!(
+                "已切到「{}」，但写入 {} 失败：{io_error}。请重新尝试切换。",
+                switched.org_name,
+                crate::codexcfg::SUB2API_ENV_KEY
+            ),
+        );
+    }
+
+    // 让**当前进程**也立刻用上新 Key,而不是等下次启动 —— 桌面端拉起 Codex
+    // 子进程时会继承自己的环境。不同步的话用户切完还得重启客户端,
+    // 而「切了没生效」看起来就是切换坏了。
+    //
+    // Safety: 与 refresh_key_env_from_user_scope 同一个理由 —— 这里是用户
+    // 主动触发的单次调用,不在拉起子进程的过程中。
+    unsafe {
+        std::env::set_var(
+            crate::codexcfg::SUB2API_ENV_KEY,
+            switched.gateway_key.trim(),
+        )
+    };
+
+    json!({
+        "status": "ready",
+        "data": {
+            "org_id": switched.org_id,
+            "org_name": switched.org_name,
+            "plan_name": switched.plan_name,
+        }
+    })
+}
+
 pub fn recodex_login_start(state: &ReCodexState) -> Value {
     let epoch = state.auth_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     let guard = match state.adapter.lock() {

@@ -1,9 +1,10 @@
 pub mod commands;
+mod recodex_overlay;
 pub mod install;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tauri::menu::{Menu, MenuItem};
+// recodex-overlay:tray-menu-owned-by-adapter
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WindowEvent};
 
@@ -41,7 +42,7 @@ pub fn run() {
     }
     let show_update = commands::startup_should_show_update();
     let app_result = tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init()).manage(recodex_overlay::ReCodexState::from_env()) // recodex-overlay:state
         .setup(move |app| {
             let url = if show_update {
                 "/index.html?showUpdate=1"
@@ -50,7 +51,7 @@ pub fn run() {
             };
             let mut main_window_builder =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
-                    .title("Codex++ 管理工具")
+                    .title("ReCodex Desktop") // recodex-overlay:runtime-window-title
                     .inner_size(1180.0, 820.0)
                     .min_inner_size(960.0, 720.0);
             if let Some(icon) = app.default_window_icon().cloned() {
@@ -63,6 +64,18 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            recodex_overlay::recodex_status,
+            recodex_overlay::recodex_refresh_usage,
+            recodex_overlay::recodex_refresh_token,
+            recodex_overlay::recodex_check_client,
+            recodex_overlay::recodex_report_diagnostics,
+            recodex_overlay::recodex_login_start,
+            recodex_overlay::recodex_login_poll,
+            recodex_overlay::recodex_select_gateway,
+            recodex_overlay::recodex_use_fastest_gateway,
+            recodex_overlay::recodex_organizations,
+            recodex_overlay::recodex_switch_org,
+            recodex_overlay::recodex_logout,
             commands::backend_version,
             commands::startup_options,
             commands::load_overview,
@@ -165,12 +178,12 @@ pub fn run() {
         ])
         .build(tauri::generate_context!());
     match app_result {
-        Ok(app) => app.run(|app_handle, event| {
+        Ok(app) => app.run(|_app_handle, _event| { // recodex-overlay:windows-run-args
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Opened { urls } = event {
+            if let tauri::RunEvent::Opened { urls } = _event { // recodex-overlay:windows-run-event
                 for url in urls {
                     if handle_dream_skin_url(url.as_str()) {
-                        show_main_window(app_handle);
+                        show_main_window(_app_handle); // recodex-overlay:windows-run-app-handle
                     }
                 }
             }
@@ -209,17 +222,17 @@ pub fn handle_dream_skin_url(url: &str) -> bool {
 }
 
 fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW, "显示主窗口", true, None::<&str>)?;
-    let apply_skin_item = MenuItem::with_id(
+    let tray_menu = recodex_overlay::build_tray_menu(
         app,
-        TRAY_MENU_DREAM_SKIN_APPLY,
-        "应用 Dream Skin",
-        true,
-        None::<&str>,
-    )?;
-    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT, "退出程序", true, None::<&str>)?;
-    let tray_menu = Menu::with_items(app, &[&show_item, &apply_skin_item, &quit_item])?;
-
+        "Show main window",
+        "Apply Dream Skin",
+        "ReCodex sign in",
+        "Refresh ReCodex quota",
+        "Use fastest ReCodex gateway",
+        "Check ReCodex updates",
+        "Send ReCodex diagnostics",
+        "Exit",
+    )?; // recodex-overlay:native-tray-menu
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&tray_menu)
         .show_menu_on_left_click(false)
@@ -236,7 +249,11 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
                 APP_EXITING.store(true, Ordering::SeqCst);
                 app.exit(0);
             }
-            _ => {}
+            id => {
+                if let Some(action) = recodex_overlay::tray_action(id) {
+                    recodex_overlay::open_recodex_action(app, action);
+                }
+            } // recodex-overlay:native-tray-handler
         })
         .on_tray_icon_event(|tray, event| match event {
             TrayIconEvent::Click {
@@ -314,29 +331,29 @@ fn update_tray_labels<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     show_label: String,
     apply_skin_label: String,
+    recodex_login_label: String,
+    recodex_refresh_label: String,
+    recodex_fastest_label: String,
+    recodex_update_label: String,
+    recodex_diagnostics_label: String,
     quit_label: String,
-    window_title: String,
 ) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let show_item = MenuItem::with_id(&app, TRAY_MENU_SHOW, &show_label, true, None::<&str>);
-        let apply_skin_item = MenuItem::with_id(
+        if let Ok(menu) = recodex_overlay::build_tray_menu(
             &app,
-            TRAY_MENU_DREAM_SKIN_APPLY,
+            &show_label,
             &apply_skin_label,
-            true,
-            None::<&str>,
-        );
-        let quit_item = MenuItem::with_id(&app, TRAY_MENU_QUIT, &quit_label, true, None::<&str>);
-        if let (Ok(show), Ok(apply_skin), Ok(quit)) = (show_item, apply_skin_item, quit_item) {
-            if let Ok(menu) = Menu::with_items(&app, &[&show, &apply_skin, &quit]) {
-                let _ = tray.set_menu(Some(menu));
-            }
+            &recodex_login_label,
+            &recodex_refresh_label,
+            &recodex_fastest_label,
+            &recodex_update_label,
+            &recodex_diagnostics_label,
+            &quit_label,
+        ) {
+            let _ = tray.set_menu(Some(menu));
         }
     }
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.set_title(&window_title);
-    }
-}
+} // recodex-overlay:localized-tray-labels
 
 async fn apply_dream_skin_from_tray() -> anyhow::Result<()> {
     let store = codex_plus_core::settings::SettingsStore::default();

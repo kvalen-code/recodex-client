@@ -520,6 +520,23 @@ pub fn recodex_report_diagnostics(state: tauri::State<'_, ReCodexState>) -> Valu
 }
 
 #[tauri::command]
+pub fn recodex_organizations(state: tauri::State<'_, ReCodexState>) -> Value {
+    recodex_integration::desktop::recodex_organizations(&state)
+}
+
+/// 把这台设备切到目标组织。
+///
+/// 逻辑全在 recodex_integration::desktop 里 —— 这里只做 Tauri 包装。
+/// 那边有测试覆盖(tests/org_switch.rs)，把逻辑抄一份到这里就等于抄一份
+/// **没人测的**代码:两边迟早分叉，而分叉的症状是「CLI 能切、桌面端不能」。
+///
+/// 网关 Key 不会出现在返回值里 —— 它只在进程内用于写用户环境。
+#[tauri::command]
+pub fn recodex_switch_org(state: tauri::State<'_, ReCodexState>, org_id: i64) -> Value {
+    recodex_integration::desktop::recodex_switch_org(&state, org_id)
+}
+
+#[tauri::command]
 pub fn recodex_select_gateway(state: tauri::State<'_, ReCodexState>, id: String) -> Value {
     let worker = match state.adapter.lock() {
         Ok(value) => value,
