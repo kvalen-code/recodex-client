@@ -128,6 +128,33 @@ pub struct Account {
     #[serde(default)]
     pub plan: String,
     pub account_type: String,
+    /// 面板那个重置按钮要的全部信息。服务端算好,客户端只画。
+    #[serde(default)]
+    pub reset_credits: ResetCredits,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResetCredits {
+    #[serde(default)]
+    pub available: i64,
+    #[serde(default)]
+    pub next_expires_at: String,
+    /// 由服务端判定 —— 要用到「账号是不是独享」「这人是不是组织所有者」,
+    /// 两个事实客户端都不知道。在这边猜一遍迟早会与服务端分叉。
+    #[serde(default)]
+    pub allowed: bool,
+    #[serde(default)]
+    pub denied_reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuotaReset {
+    #[serde(default)]
+    pub account_id: i64,
+    #[serde(default)]
+    pub remaining: i64,
+    #[serde(default)]
+    pub state_recovered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,6 +222,16 @@ pub struct Organization {
     /// 同一个人可以在台式机上用团队组织、笔记本上用个人组织。
     #[serde(default)]
     pub is_current: bool,
+    /// 这个组织当前的用量(0~100)。-1 表示还没有观测数据。
+    ///
+    /// 自动切换靠它挑落点,所以 -1 与 0 必须分开:0 是「确实没用」,
+    /// -1 是「不知道」—— 当成 0 会切到一个可能已经满了的组织。
+    #[serde(default = "unknown_used_percent")]
+    pub used_percent: i64,
+}
+
+fn unknown_used_percent() -> i64 {
+    -1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -611,6 +648,14 @@ impl<T: Transport> Adapter<T> {
             ));
         }
         Ok(switched)
+    }
+
+    /// 消耗一次官方重置额度。
+    ///
+    /// 不传账号 id —— 服务端按 (用户, 这台设备的组织) 自己解析。
+    /// 允许客户端指定就等于把「重置任意账号」开放出去。
+    pub fn reset_quota(&self) -> Result<QuotaReset, AdapterError> {
+        self.request("POST", "/api/v1/quota/reset", Some("{}"))
     }
 
     pub fn fastest_gateway<'a>(&self, gateways: &'a [Gateway]) -> Option<&'a Gateway> {

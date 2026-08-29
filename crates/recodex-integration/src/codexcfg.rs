@@ -31,7 +31,22 @@ const AUTH_MANAGED_SUFFIX: &str = ".recodex-managed";
 
 // The sub2api managed block (recodex.md v2). Plain `env_key` auth — no
 // `requires_openai_auth` — matching the CLI's Sub2APIConfigTemplate.
-const SUB2API_TEMPLATE: &str = "model_provider = \"recodex\"\n\n[model_providers.recodex]\nname = \"ReCodex\"\nbase_url = \"{{BASE_URL}}\"\nwire_api = \"responses\"\nenv_key = \"{{ENV_KEY}}\"";
+// requires_openai_auth / http_headers 这两行是**生图能不能显示**的开关。
+//
+// Codex 有两条生图路径:
+//   - hosted image_generation:上游生成,回 image_generation_call —— 客户端存得下,
+//     但 Codex 界面没有对应的渲染分支,用户看到「模型说生成好了、界面什么都没有」;
+//   - 本地 image_gen.imagegen:客户端自己的执行器,打 /v1/images/generations,
+//     结果由它自己渲染 —— 这条才看得见。
+//
+// 本地执行器默认不注册,要靠这两行授权(上游把它叫 API Key Mode)。少了它们,
+// 客户端连工具都不声明,模型只能反过来劝用户「去设置 OPENAI_API_KEY」。
+//
+// 密钥仍走 env_key,不用 experimental_bearer_token —— 后者要把明文密钥写进
+// config.toml,而这个文件用户会截图、会贴进工单。
+//
+// 改完必须**完全退出 Codex 并新建 task**:工具注册表是启动时建的,热重载看不到。
+const SUB2API_TEMPLATE: &str = "model_provider = \"recodex\"\n\n[model_providers.recodex]\nname = \"ReCodex\"\nbase_url = \"{{BASE_URL}}\"\nwire_api = \"responses\"\nenv_key = \"{{ENV_KEY}}\"\nhttp_headers = { \"x-openai-actor-authorization\" = \"recodex\" }";
 
 fn home_dir() -> io::Result<PathBuf> {
     std::env::var_os("USERPROFILE")

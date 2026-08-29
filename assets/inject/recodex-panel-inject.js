@@ -86,6 +86,11 @@
       "增强功能": "增強功能", "微信连接": "微信連接", "加载中…": "載入中…",
       "邮箱": "郵箱", "套餐": "套餐", "网关": "網關", "未选": "未選",
       "用最快网关": "用最快網關", "刷新额度": "重新整理額度", "登出": "登出",
+      "组织": "組織", "无生效订阅": "無生效訂閱", "切换组织失败": "切換組織失敗", "未选": "未選",
+      "重置额度": "重設額度", "剩 %n 次": "剩 %n 次", "重置中…": "重設中…",
+      "无重置次数": "無重設次數", "仅组织所有者可重置": "僅組織所有者可重設",
+      "重置失败": "重設失敗", "额度用完自动切换组织": "額度用完自動切換組織",
+      "若当前组织还没分配到 AI 账号，可以先切到别的组织。": "若目前組織還沒分配到 AI 帳號，可以先切到別的組織。",
       "使用情况": "使用情況", "邀请好友": "邀請好友", "退出登录": "退出登入",
       "设备数已达上限,请先撤销一台再继续。": "裝置數已達上限,請先撤銷一台再繼續。",
       "打开设备管理": "開啟裝置管理",
@@ -279,6 +284,12 @@
     #recodex-panel button.rcx-act.sec{background:#2c313a;color:#e6e9ef}
     #recodex-panel .rcx-muted{color:#7c8598;font-size:12px}
     #recodex-panel .rcx-err{color:#ff6b5e}
+    #recodex-panel .rcx-pick{cursor:pointer;user-select:none}
+    #recodex-panel .rcx-opt{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-radius:6px;font-size:13px;cursor:pointer}
+    #recodex-panel .rcx-opt:hover{background:#2c313a}
+    #recodex-panel .rcx-opt.on{background:#2c313a;color:#10a37f}
+    #recodex-panel .rcx-opt.off{color:#7c8598;cursor:default}
+    #recodex-panel .rcx-opt.off:hover{background:transparent}
     #recodex-panel .rcx-toggle{display:flex;justify-content:space-between;align-items:center;padding:5px 0}
     #recodex-panel .rcx-toggle input{width:34px;height:18px;cursor:pointer}
     #recodex-panel .rcx-qr{background:#fff;border-radius:8px;padding:8px;margin-top:8px}
@@ -365,6 +376,48 @@
   }
 
   // ── 渲染 ───────────────────────────────────────────────────
+  // 状态读不出来时的逃生入口:只画组织切换。
+  //
+  // 与正常渲染那份分开写而不是复用:那份依赖 status 带回来的组织列表和
+  // 当前额度,这里两样都没有。硬凑到一起会让正常路径为了照顾错误路径
+  // 到处判空,而错误路径本来只需要「列出来、能点」。
+  async function renderOrgEscapeHatch() {
+    const res = await bridge("/recodex/org/list", {});
+    if (!res || res.status !== "ready" || !res.data) return;
+    const orgs = res.data.organizations || [];
+    if (orgs.length < 2) return;
+    const box = document.createElement("div");
+    box.style.cssText = "margin-top:12px;border-top:1px solid #23272f;padding-top:10px";
+    // 给一句最可能的原因,但不把话说死 —— 读不出状态也可能是网络问题。
+    box.innerHTML = `<div class="rcx-k" style="margin-bottom:4px">${t("组织")}</div>` +
+      `<div class="rcx-muted" style="font-size:12px;margin-bottom:6px">${
+        t("若当前组织还没分配到 AI 账号，可以先切到别的组织。")}</div>` +
+      orgs.map((o) => {
+        const usable = !!o.plan_name && !o.is_current;
+        const cls = o.is_current ? "rcx-opt on" : (o.plan_name ? "rcx-opt" : "rcx-opt off");
+        return `<div class="${cls}"${usable ? ` data-org="${o.id}"` : ""}>` +
+          `<span>${esc(o.name)}</span>` +
+          `<span class="rcx-k">${o.plan_name ? esc(o.plan_name) : t("无生效订阅")}</span></div>`;
+      }).join("");
+    body().appendChild(box);
+    box.querySelectorAll("[data-org]").forEach((item) => {
+      item.onclick = async () => {
+        const id = Number(item.getAttribute("data-org"));
+        if (!id) return;
+        const r = await bridge("/recodex/org/switch", { org_id: id });
+        if (!r || r.status !== "ready") {
+          const line = document.createElement("div");
+          line.className = "rcx-err";
+          line.style.cssText = "font-size:12px;margin-top:6px";
+          line.textContent = (r && r.error && r.error.message) || t("切换组织失败");
+          box.appendChild(line);
+          return;
+        }
+        await render();
+      };
+    });
+  }
+
   async function render() {
     body().innerHTML = `<div class="rcx-muted">${t("加载中…")}</div>`;
     const res = await bridge("/recodex/status", {});
@@ -387,6 +440,14 @@
       body().innerHTML = `<div class="rcx-err">${esc(msg)}</div>
         <button class="rcx-act sec" id="rcx-retry">${t("重试")}</button>`;
       body().querySelector("#rcx-retry").onclick = render;
+      // 读不出状态时**也要**把组织切换器画出来。
+      //
+      // 最常见的一种失败恰恰是「这台设备所在的组织还没给你分配账号」——
+      // 而唯一的出路就是切到另一个组织,那个切换器却在这块渲染不出来的区域里。
+      // 少了这一段,用户只能对着「重试」按到底,而重试永远不会成功。
+      //
+      // 单独再拉一次 org/list:状态那条路已经失败了,拿不到它带的组织列表。
+      await renderOrgEscapeHatch();
       return;
     }
     const d = res.data;
@@ -427,13 +488,115 @@
     // 5h 窗口只在有实际用量时显示;无用量则只显示 7 天(对齐 mdash「隐藏空 5h」)
     if (w5 && w5.used > 0) html += `<div style="padding:6px 0"><div class="rcx-row" style="border:0"><span class="rcx-k">${t("5 小时")}</span><span>${pct(w5)}%</span></div><div class="rcx-bar"><i style="width:${pct(w5)}%"></i></div></div>`;
     if (w7) html += `<div style="padding:6px 0"><div class="rcx-row" style="border:0"><span class="rcx-k">${t("7 天")}</span><span>${pct(w7)}%</span></div><div class="rcx-bar"><i style="width:${pct(w7)}%"></i></div></div>`;
+    // 重置按钮。共享账号上不出现 —— 按一次会把同号其他人的额度一起重置,
+    // 而他们根本不知道发生了什么;这种情况服务端回 denied_reason=shared_account。
+    //
+    // 能不能按完全由服务端判定(要用到「是不是独享」「是不是组织所有者」两个事实),
+    // 这里只把结论画出来。自己再判一遍迟早会与服务端分叉 —— 那意味着界面允许、
+    // 服务端拒绝,或者更糟,反过来。
+    const rc = acc.reset_credits || {};
+    if (rc.denied_reason !== "shared_account") {
+      const label = `${t("重置额度")} · ${t("剩 %n 次").replace("%n", rc.available || 0)}`;
+      const why = rc.denied_reason === "not_org_owner" ? t("仅组织所有者可重置")
+        : rc.denied_reason === "no_credits" ? t("无重置次数") : "";
+      html += `<button class="rcx-act sec" id="rcx-reset"${rc.allowed ? "" : " disabled"}>${
+        esc(label)}</button>`;
+      // 按不了要说清为什么,而不是给一个死灰的按钮让用户猜。
+      if (why) html += `<div class="rcx-muted" style="font-size:12px;margin-top:4px">${esc(why)}</div>`;
+    }
     html += `<div class="rcx-row"><span class="rcx-k">${t("网关")}</span><span>${esc(sel ? sel.name : t("未选"))}</span></div>`;
+    // 组织切换。只在属于 2 个以上组织时出现 —— 没得切的时候多一行只是噪音。
+    //
+    // 自己画下拉而不是用 <select>:原生下拉的选项列表由操作系统渲染,
+    // 深色面板里会弹出一块白底蓝选中的方块,而且面板的 CSS 是按 button.rcx-act
+    // 写的,<select> 一条样式都吃不到。
+    //
+    // 与网关那行并列而不是单开一页:两者是同一类东西(「这台设备现在走哪条路」)。
+    const orgs = Array.isArray(d.organizations) ? d.organizations : [];
+    if (orgs.length > 1) {
+      const cur = orgs.find((o) => o.is_current);
+      html += `<div class="rcx-row rcx-pick" id="rcx-org-toggle"><span class="rcx-k">${t("组织")}</span>` +
+        `<span>${esc(cur ? cur.name : t("未选"))} <span class="rcx-k">▾</span></span></div>`;
+      html += `<div id="rcx-org-list" style="display:none;padding:4px 0">${
+        orgs.map((o) => {
+          // 没有生效订阅的组织切过去也没额度(服务端会回 409),置灰而不是隐藏 ——
+          // 用户看得到「我在这个组织但没额度」,比它凭空消失更容易判断该找谁。
+          const usable = !!o.plan_name && !o.is_current;
+          const cls = o.is_current ? "rcx-opt on" : (o.plan_name ? "rcx-opt" : "rcx-opt off");
+          return `<div class="${cls}"${usable ? ` data-org="${o.id}"` : ""}>` +
+            `<span>${esc(o.name)}</span>` +
+            `<span class="rcx-k">${o.plan_name ? esc(o.plan_name) : t("无生效订阅")}</span></div>`;
+        }).join("")
+      }</div>`;
+      // 自动切换开关。跟组织下拉放在一起 —— 它只在有得切的时候才有意义。
+      html += `<label class="rcx-toggle"><span>${t("额度用完自动切换组织")}</span>`
+        + `<input type="checkbox" data-k="recodexAutoSwitchOrg"></label>`;
+    }
     html += `<button class="rcx-act" id="rcx-fastest">${t("用最快网关")}</button>`;
     html += `<button class="rcx-act sec" id="rcx-refresh">${t("刷新额度")}</button>`;
     html += `<button class="rcx-act sec" id="rcx-logout">${t("退出登录")}</button>`;
     body().innerHTML = html;
     // 桥可能带回 warning(例如官方模式下网关只记进快照、切回后才生效)。
     // 原先直接丢掉,用户点完只看到界面刷新一下,不知道到底生没生效。
+    // 开关的初值要从设置里读回来,不能靠 HTML 里写死 —— 否则每次重画都会
+    // 显示成关闭,用户以为自己没打开,再点一次反而关掉了。
+    const autoBox = body().querySelector('input[data-k="recodexAutoSwitchOrg"]');
+    if (autoBox) {
+      const settings = await readSettings();
+      autoBox.checked = !!settings.recodexAutoSwitchOrg;
+      bindToggles(body());
+    }
+    const resetBtn = body().querySelector("#rcx-reset");
+    if (resetBtn && !resetBtn.disabled) {
+      resetBtn.onclick = async () => {
+        // 先禁用再发请求:这个按钮花的是真金白银(一次上游重置额度),连点两下
+        // 就是烧掉两次,而次数按周发放、烧掉不可逆。
+        resetBtn.disabled = true;
+        resetBtn.textContent = t("重置中…");
+        const r = await bridge("/recodex/quota/reset", {});
+        if (!r || r.status !== "ready") {
+          await render();
+          const line = document.createElement("div");
+          line.className = "rcx-err";
+          line.style.cssText = "font-size:12px;margin-top:6px";
+          line.textContent = (r && r.error && r.error.message) || t("重置失败");
+          body().appendChild(line);
+          return;
+        }
+        // 重置完额度归零、次数减一,两个数都得重拉 —— 不刷的话用户看到的还是
+        // 满格进度条,会以为没生效然后再按一次。
+        await refreshAccountCache();
+        await render();
+      };
+    }
+    const orgToggle = body().querySelector("#rcx-org-toggle");
+    const orgList = body().querySelector("#rcx-org-list");
+    if (orgToggle && orgList) {
+      orgToggle.onclick = () => {
+        orgList.style.display = orgList.style.display === "none" ? "block" : "none";
+      };
+      orgList.querySelectorAll("[data-org]").forEach((item) => {
+        item.onclick = async () => {
+          const id = Number(item.getAttribute("data-org"));
+          if (!id) return;
+          const r = await bridge("/recodex/org/switch", { org_id: id });
+          // 失败要说出来。静默的话用户只看到列表收起来,会以为是自己点歪了 ——
+          // 而真实原因(没订阅/不是成员/写环境变量失败)一条都看不到。
+          if (!r || r.status !== "ready") {
+            await render();
+            const line = document.createElement("div");
+            line.className = "rcx-err";
+            line.style.cssText = "font-size:12px;margin-top:6px";
+            line.textContent = (r && r.error && r.error.message) || t("切换组织失败");
+            body().appendChild(line);
+            return;
+          }
+          // 切完必须重拉:组织决定用哪个 AI 账号、走哪份额度,
+          // 不刷的话面板上的用量还是上一个组织的,用户会以为切换没生效。
+          await render();
+        };
+      });
+    }
     body().querySelector("#rcx-fastest").onclick = async () => {
       const r = await bridge("/recodex/gateway/fastest", {});
       await render();
@@ -1220,6 +1383,47 @@
       subtree: true,
     });
   }
+  // ── 额度用完自动切换组织 ───────────────────────────────────
+  //
+  // 跑在保底轮询里而不是面板打开时:用户绝大多数时间不看面板,而额度恰恰
+  // 是在他埋头干活时用完的。面板关着也要能切。
+  //
+  // 只在**用满 100%** 时动手。提前切会让每个组织都剩一点用不完;
+  // 而切换本身有代价(换网关 Key、用量记到另一个组织头上),不该轻易触发。
+  let autoSwitching = false;
+  async function autoSwitchOrgIfExhausted() {
+    // 重入保护:一次切换要打两三个来回,期间轮询可能又到点了。
+    // 不挡的话会连着切两次,第二次把刚切过去的组织又换掉。
+    if (autoSwitching || !rcxAccount) return;
+    const used = Math.max(pct(rcxAccount.w5) || 0, pct(rcxAccount.w7) || 0);
+    if (used < 100) return;
+
+    let settings;
+    try { settings = await readSettings(); } catch (e) { return; }
+    if (!settings.recodexAutoSwitchOrg) return;
+
+    const res = await bridge("/recodex/org/list", {});
+    if (!res || res.status !== "ready" || !res.data) return;
+    const orgs = res.data.organizations || [];
+    // 落点要求:有生效订阅、不是当前这个、且**确实还有额度**。
+    // used_percent 为 -1 表示还没有观测数据 —— 当作有额度(一个从没跑过的
+    // 组织多半是没用过的),但排在有实测数据的后面,宁可先切确定能用的。
+    const usable = orgs.filter((o) => o.plan_name && !o.is_current && (o.used_percent < 0 || o.used_percent < 100));
+    if (usable.length === 0) return;
+    usable.sort((a, b) => (a.used_percent < 0 ? 101 : a.used_percent) - (b.used_percent < 0 ? 101 : b.used_percent));
+
+    autoSwitching = true;
+    try {
+      const r = await bridge("/recodex/org/switch", { org_id: usable[0].id });
+      if (!r || r.status !== "ready") return;
+      // 切完立刻重拉:面板(如果开着)上的账号、套餐、额度全都变了。
+      await refreshAccountCache();
+      if (panel.classList.contains("open")) await render();
+    } finally {
+      autoSwitching = false;
+    }
+  }
+
   // 保底轮询。原先是 setInterval 60 秒**无条件**打一次,而每次 /recodex/status
   // 在服务端要拉账号+额度+网关三份数据 —— 一台机器开一天就是 1440 轮。
   // 未登录、或者桥/服务端不通时,这些数据不会自己变好,继续每分钟敲没有意义,
@@ -1229,6 +1433,7 @@
   let pollDelay = POLL_BASE_MS;
   async function pollTick() {
     await refreshAccountCache();
+    await autoSwitchOrgIfExhausted();
     scanOfficialAccountUi();
     const idle = !rcxAccount || rcxStatus.cls === "anon" || rcxStatus.cls === "off";
     pollDelay = idle ? Math.min(pollDelay * 2, POLL_MAX_MS) : POLL_BASE_MS;

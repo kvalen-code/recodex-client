@@ -8810,7 +8810,7 @@
         if (group) delete group.dataset.codexActionLayoutStable;
       });
       syncActionGroupsLayout();
-      updateFloatingCodexPlusMenuPosition(document.getElementById(codexPlusMenuId));
+      // recodex-overlay:drop-floating-menu-call
       runScanStep(refreshConversationView);
     });
   };

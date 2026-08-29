@@ -287,6 +287,7 @@ fn snapshot(state: &ReCodexState, refresh: bool) -> Value {
     // commands can acquire the real state mutex while upstream requests wait.
     let account_worker = worker.fork();
     let gateway_worker = worker.fork();
+    let org_worker = worker.fork();
     let ((usage, usage_worker), account, gateways) = parallel_snapshot_requests(
         move || worker.usage_in_fork(refresh),
         move || account_worker.account(),
@@ -303,6 +304,15 @@ fn snapshot(state: &ReCodexState, refresh: bool) -> Value {
     let gateway_error = gateways.as_ref().err().map(ToString::to_string);
     let gateways = gateways.unwrap_or_default();
     let selected = gateways.iter().find(|gateway| gateway.selected).cloned();
+    // 组织列表随快照一起带回,面板才画得出切换器。
+    //
+    // 取失败只当「没有组织可切」,不参与 stale 判定 —— 切换是附加能力,
+    // 而账号和用量才是这个面板的主功能。让它把整块打成 stale 的话,
+    // 一个可选能力的故障会显示成「你的额度数据不可信」。
+    // 串行取而不是塞进 parallel_snapshot_requests:那个辅助函数只收三路,
+    // 为一个可选能力改它的签名会波及所有调用点。组织列表是一次带索引的
+    // 小查询,多这一跳不值得动公共代码。
+    let organizations = org_worker.organizations().unwrap_or_default();
     let mut guard = match state.adapter.lock() {
         Ok(value) => value,
         Err(_) => return error("state_unavailable", "ReCodex state is unavailable"),
@@ -315,7 +325,7 @@ fn snapshot(state: &ReCodexState, refresh: bool) -> Value {
     }
     drop(guard);
     let stale = usage.stale || account_error.is_some() || gateway_error.is_some();
-    json!({"status": if stale { "stale" } else { "ready" }, "data":{"account":account.ok(),"usage":usage,"gateways":gateways,"selected_gateway":selected,"account_error":account_error,"gateway_error":gateway_error,"web_url":state.web_url}})
+    json!({"status": if stale { "stale" } else { "ready" }, "data":{"account":account.ok(),"usage":usage,"gateways":gateways,"selected_gateway":selected,"account_error":account_error,"gateway_error":gateway_error,"organizations":organizations,"web_url":state.web_url}})
 }
 
 pub fn recodex_status(state: &ReCodexState) -> Value {
@@ -547,6 +557,40 @@ pub fn recodex_organizations(state: &ReCodexState) -> Value {
 /// 顺序:切换 → 写环境变量 → 回报。写失败必须让整个调用失败:
 /// 服务端已经改了设备归属,本地不写就是「服务端认为你在新组织、Codex 还拿着
 /// 旧组织的 Key」—— 请求照常成功,只是用量记到旧组织,没有任何一处报错。
+/// 消耗一次官方重置额度。
+///
+/// 不收任何参数:账号由服务端按 (用户, 这台设备的组织) 解析 —— 让客户端指定
+/// 就等于把「重置任意账号」开放出去。能不能按也由服务端判定,面板只是照着画。
+pub fn recodex_reset_quota(state: &ReCodexState) -> Value {
+    let worker = match state.adapter.lock() {
+        Ok(value) => value,
+        Err(_) => return error("state_unavailable", "ReCodex state is unavailable"),
+    };
+    let Some(adapter) = worker.as_ref() else {
+        return error(
+            "configuration",
+            state
+                .init_error
+                .clone()
+                .unwrap_or_else(|| "ReCodex is not configured".to_owned()),
+        );
+    };
+    if !adapter.is_authenticated() {
+        return json!({"status":"signed_out"});
+    }
+    let adapter = adapter.fork();
+    drop(worker);
+
+    match adapter.reset_quota() {
+        Ok(result) => json!({"status":"ready","data":{
+            "account_id": result.account_id,
+            "remaining": result.remaining,
+            "state_recovered": result.state_recovered,
+        }}),
+        Err(adapter_error) => adapter_failure("reset", &adapter_error),
+    }
+}
+
 pub fn recodex_switch_org(state: &ReCodexState, org_id: i64) -> Value {
     let worker = match state.adapter.lock() {
         Ok(value) => value,
@@ -956,6 +1000,12 @@ pub fn handle_bridge(state: &ReCodexState, path: &str, payload: &Value) -> Value
             None => error("invalid", "gateway id is required"),
         },
         "/recodex/gateway/fastest" => recodex_use_fastest_gateway(state),
+        "/recodex/org/list" => recodex_organizations(state),
+        "/recodex/org/switch" => match payload.get("org_id").and_then(Value::as_i64) {
+            Some(id) => recodex_switch_org(state, id),
+            None => error("invalid", "organization id is required"),
+        },
+        "/recodex/quota/reset" => recodex_reset_quota(state),
         "/recodex/logout" => recodex_logout(state),
         "/recodex/official-mode" => recodex_official_mode_status(),
         "/recodex/official-mode/enable" => recodex_official_mode_enable(),

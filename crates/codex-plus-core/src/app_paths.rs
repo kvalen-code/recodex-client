@@ -690,7 +690,46 @@ fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'
 /// 结果就是微信一发消息就报「无法启动 Codex app-server」。
 ///
 /// 我们本来就知道 Codex 客户端装在哪 —— 直接去它旁边取,取不到再回落 PATH。
+/// Windows 上 Codex 自己解出来的那份**可执行**的 CLI。
+///
+/// 商店(MSIX)装的 codex.exe 在 `C:\Program Files\WindowsApps\...` 下:
+/// 文件确实在,`is_file()` 为真 —— 但那个目录的 ACL 不允许普通进程执行它,
+/// CreateProcess 直接 Access is denied。于是「找到了」和「能跑」是两回事,
+/// 微信一发消息就报「无法启动 Codex app-server」,而报错里印的路径明明存在,
+/// 让人以为是路径配错了。
+///
+/// 应用启动时会把一份可执行的 CLI 解到 LOCALAPPDATA,优先用它。
+#[cfg(windows)]
+fn windows_unpacked_codex_cli() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let bin = Path::new(&base).join("OpenAI").join("Codex").join("bin");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&bin).ok()?.flatten() {
+        let candidate = entry.path().join("codex.exe");
+        if !candidate.is_file() {
+            continue;
+        }
+        // 目录名是版本哈希,字典序认不出新旧 —— 按修改时间取最新的那份。
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(seen, _)| modified > *seen) {
+            newest = Some((modified, candidate));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+#[cfg(not(windows))]
+fn windows_unpacked_codex_cli() -> Option<PathBuf> {
+    None
+}
+
 pub fn find_codex_cli(app_dir: Option<&Path>) -> Option<PathBuf> {
+    // 调用方点名了目录 = 「就在这里面找」,找不到就是找不到 —— 不能替他
+    // 换一个别处的二进制,那会让「我指定了路径」这件事失去意义。
+    // 解包副本的回落只用于自动发现(app_dir 为 None)。
+    let autodiscover = app_dir.is_none();
     let app_dir = resolve_codex_app_dir_with_saved(app_dir, None)?;
     let exe_name = if cfg!(windows) { "codex.exe" } else { "codex" };
     // 两种布局:macOS 的 .app 包,和 Windows 的 app 目录
@@ -700,7 +739,35 @@ pub fn find_codex_cli(app_dir: Option<&Path>) -> Option<PathBuf> {
         app_dir.join("resources").join(exe_name),
         app_dir.join(exe_name),
     ];
-    candidates.into_iter().find(|path| path.is_file())
+    let found: Vec<PathBuf> = candidates.into_iter().filter(|path| path.is_file()).collect();
+    // 先要一个**能执行**的。WindowsApps 下那份文件在、却跑不了,
+    // 直接返回它等于把「找到了」当成「能用」—— 用户看到的报错里印着一个
+    // 确实存在的路径,只会去查路径配错没有。
+    if let Some(path) = found.iter().find(|path| !is_msix_restricted(path)) {
+        return Some(path.clone());
+    }
+    // 应用目录里只有那份跑不了的 —— 用 Codex 自己解包出来的。
+    if autodiscover {
+        if let Some(path) = windows_unpacked_codex_cli() {
+            return Some(path);
+        }
+    }
+    // 两条都没有就把它交出去:让上层报「启动失败」,好过报「根本没找到」。
+    found.into_iter().next()
+}
+
+/// 这个路径是不是在 MSIX 的受限目录下。
+///
+/// 只认目录,不做真正的执行权限探测:那要么起一个进程(有副作用),要么读 ACL
+/// (Windows 专有、一堆边界)。而线上唯一踩到的就是这一个目录,收窄到它
+/// 既准确又不会误伤别的安装方式。
+fn is_msix_restricted(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("WindowsApps"))
+    })
 }
 
 /// 微信连接要用的 codex 命令:用户显式配了就用他的,否则去 Codex 客户端旁边找,

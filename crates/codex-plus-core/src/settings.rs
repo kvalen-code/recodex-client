@@ -235,6 +235,8 @@ pub enum RelayMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackendSettings {
+    #[serde(rename = "recodexAutoSwitchOrg", default)] // recodex-overlay:auto-switch-field
+    pub recodex_auto_switch_org: bool,
     #[serde(rename = "codexAppPath", default)]
     pub codex_app_path: String,
     #[serde(rename = "codexExtraArgs", default)]
@@ -359,6 +361,7 @@ pub struct BackendSettings {
 impl Default for BackendSettings {
     fn default() -> Self {
         Self {
+            recodex_auto_switch_org: false, // recodex-overlay:auto-switch-default
             codex_app_path: String::new(),
             codex_extra_args: Vec::new(),
             provider_sync_enabled: false,
@@ -751,6 +754,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppPasteFix");
     merge_bool_setting(target, source, "codexAppForceChineseLocale");
+    merge_bool_setting(target, source, "recodexAutoSwitchOrg"); // recodex-overlay:auto-switch-merge
     merge_bool_setting(target, source, "codexAppFastStartup");
     merge_bool_setting(target, source, "codexAppThreadIdBadge");
     merge_bool_setting(target, source, "codexAppConversationView");

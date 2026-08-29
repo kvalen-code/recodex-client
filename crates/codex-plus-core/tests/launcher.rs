@@ -1918,6 +1918,27 @@ impl LaunchHooks for FakeHooks {
 /// 微信连接跑的是 `codex app-server`。原先没配路径时直接用 PATH 上的 "codex",
 /// 而 macOS 的 .app 和 Windows 的 MSIX 都不会把它放进 PATH —— 一发消息就报
 /// 「无法启动 Codex app-server」。用户显式配了路径的话必须原样用他的。
+/// Windows: 商店(MSIX)装的 codex.exe 文件确实存在,但 WindowsApps 的 ACL 不允许
+/// 普通进程执行它 —— is_file() 为真、CreateProcess 却 Access is denied。
+/// 所以解析必须优先取 LOCALAPPDATA 下那份解包出来的、真的能跑的 CLI。
+///
+/// 这条测试只在**装了 Codex 的 Windows 机器**上有意义,其余环境自动跳过 ——
+/// 它守的是「存在 != 能执行」这个区别,而不是某台机器的具体路径。
+#[test]
+#[cfg(windows)]
+fn wechat_prefers_the_runnable_cli_over_the_msix_copy() {
+    use codex_plus_core::app_paths::codex_cli_command;
+
+    let resolved = codex_cli_command("");
+    if resolved == "codex" {
+        return; // 这台机器没装 Codex,没什么可断言的
+    }
+    assert!(
+        !resolved.contains("WindowsApps"),
+        "解析到了 WindowsApps 下的副本,那份执行会被 ACL 拒绝: {resolved}"
+    );
+}
+
 #[test]
 fn wechat_uses_the_configured_codex_path_verbatim() {
     use codex_plus_core::app_paths::codex_cli_command;
