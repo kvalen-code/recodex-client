@@ -43,6 +43,8 @@ pub struct FlushOutcome {
     pub uploaded: usize,
     /// 不是报错、或本地校验不过、或服务端 4xx 拒收 —— 都跳过并推进水位,别卡住后面的。
     pub skipped: usize,
+    /// 本轮内被折叠掉的同类重复条数(重试风暴)。
+    pub suppressed: usize,
     /// 提前停下的原因:`rate_limited` / `unavailable`。None = 处理到了文件末尾。
     pub stopped: Option<&'static str>,
 }
@@ -79,6 +81,13 @@ impl<T: Transport> Adapter<T> {
         let os = std::env::consts::OS;
         let mut consumed = watermark;
         let mut cursor = watermark;
+        // 本轮内按 (event, error_code) 折叠:一次启动的重试风暴会刷出几十条同样的记录
+        // (实测一次启动 20 条里,9 条是同一个菜单汉化重试、6 条是同一个 dispatcher 补丁),
+        // 全传既吵又白烧匿名口的限流额度,真故障反而挤不进来。只传每种的第一条,
+        // 后续同类只计数不发,量降一个数量级。折叠掉的条数记在 FlushOutcome.suppressed 里
+        // (单遍流式扫描,发第一条时还不知道后面有几条,所以不往 message 里塞次数 ——
+        // 服务端本来就按事件聚合,少的是「这一轮重复了几次」这个次要信息)。
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         while cursor < bytes.len() {
             // 只处理完整行;末尾半行是别的进程正在写,下次再说。
             let Some(nl) = bytes[cursor..].iter().position(|b| *b == b'\n') else {
@@ -95,6 +104,15 @@ impl<T: Transport> Adapter<T> {
                 consumed = line_end;
                 continue;
             };
+            let dedup_key = format!("{}|{}", report.event, report.error_code.as_deref().unwrap_or(""));
+            let repeats = seen.entry(dedup_key).or_insert(0);
+            *repeats += 1;
+            if *repeats > 1 {
+                // 同类已经传过了,这条只累加不发。水位照常推进,否则下轮会重来一遍。
+                out.suppressed += 1;
+                consumed = line_end;
+                continue;
+            }
             match self.send(&report) {
                 SendResult::Uploaded => {
                     out.uploaded += 1;
@@ -350,7 +368,7 @@ mod tests {
         let log = temp_log(&[OK_LINE, FAIL_LINE, OK_LINE, ERRKEY_LINE]);
         let t = FakeTransport::returning(&[202]);
         let out = adapter(t.clone(), Some("rct_abcdefgh")).flush_diagnostic_log(&log, "desktop-x", "1.0.0", 20);
-        assert_eq!(out, FlushOutcome { uploaded: 2, skipped: 2, stopped: None });
+        assert_eq!(out, FlushOutcome { uploaded: 2, skipped: 2, ..Default::default() });
         let calls = t.calls.borrow();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "rct_abcdefgh", "有 token 走已认证");
@@ -419,12 +437,52 @@ mod tests {
 
     #[test]
     fn max_per_flush_caps_and_leaves_rest_for_next_round() {
-        let log = temp_log(&[FAIL_LINE, FAIL_LINE, FAIL_LINE]);
+        // 三条**不同**事件:同一事件会被本轮折叠(见 collapses_retry_storm_within_one_flush),
+        // 那样就验不到每轮条数上限了。
+        let mk = |ev: &str| format!(
+            r#"{{"timestamp_ms":1756944000000,"pid":1,"event":"{ev}","detail":{{"error":"x"}}}}"#
+        );
+        let (a, b, c) = (mk("a.failed"), mk("b.failed"), mk("c.failed"));
+        let log = temp_log(&[&a, &b, &c]);
         let t = FakeTransport::returning(&[202]);
         let out = adapter(t.clone(), None).flush_diagnostic_log(&log, "d", "1.0.0", 2);
         assert_eq!(out.uploaded, 2);
         let out2 = adapter(t, None).flush_diagnostic_log(&log, "d", "1.0.0", 2);
         assert_eq!(out2.uploaded, 1, "剩下那条下一轮补上");
+    }
+
+    #[test]
+    fn collapses_retry_storm_within_one_flush() {
+        // 线上实测形状:一次启动 20 条里,9 条是同一个菜单汉化重试。
+        // 全传会白烧匿名口的限流额度,真故障反而挤不进来。
+        let retry = r#"{"timestamp_ms":1756944000000,"pid":1,"event":"native_menu.localization_retry_failed","detail":{"attempt":1,"message":"failed to evaluate"}}"#;
+        let other = r#"{"timestamp_ms":1756944000000,"pid":1,"event":"bridge.health_check_failed","detail":{"message":"timed out"}}"#;
+        let mut lines: Vec<&str> = vec![retry; 9];
+        lines.push(other);
+        let log = temp_log(&lines);
+        let t = FakeTransport::returning(&[202]);
+        let out = adapter(t.clone(), None).flush_diagnostic_log(&log, "d", "1.0.0", 20);
+
+        assert_eq!(out.uploaded, 2, "两种事件各传一条");
+        assert_eq!(out.suppressed, 8, "同类的另外 8 条折叠掉");
+        assert_eq!(t.calls.borrow().len(), 2);
+        // 水位推到末尾:折叠掉的也算处理过,否则下一轮会重来一遍。
+        assert_eq!(
+            read_watermark(&watermark_path(&log)),
+            std::fs::metadata(&log).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn same_event_different_error_code_not_collapsed() {
+        // 事件名相同但错误码不同 = 不同的故障,不能折叠掉。
+        let a = r#"{"timestamp_ms":0,"pid":1,"event":"gateway.connect_failed","detail":{"code":"timeout"}}"#;
+        let b = r#"{"timestamp_ms":0,"pid":1,"event":"gateway.connect_failed","detail":{"code":"refused"}}"#;
+        let log = temp_log(&[a, b]);
+        let t = FakeTransport::returning(&[202]);
+        let out = adapter(t, None).flush_diagnostic_log(&log, "d", "1.0.0", 20);
+        assert_eq!(out.uploaded, 2, "错误码不同要分别上报");
+        assert_eq!(out.suppressed, 0);
     }
 
     #[test]

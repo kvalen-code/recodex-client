@@ -629,6 +629,12 @@ fn models_endpoint(base_url: &str) -> String {
     if crate::protocol_proxy::has_version_suffix(&cleaned) {
         return format!("{cleaned}/models");
     }
+    // ReCodex 的 base 是 `.../backend-api/codex` —— codex 不是版本段,上面那条判定
+    // 不成立,于是拼出 `/backend-api/codex/v1/models` 打了 404(线上一天 88 次)。
+    // 网关服务的是 `{base}/models`(见 sub2api handler/gateway_models_test.go)。
+    if cleaned.ends_with("/backend-api/codex") {
+        return format!("{cleaned}/models");
+    }
     format!("{cleaned}/v1/models")
 }
 
@@ -839,4 +845,58 @@ fn unquote_toml_string(value: &str) -> String {
         })
         .unwrap_or(value)
         .to_string()
+}
+
+#[cfg(test)]
+mod models_endpoint_tests {
+    use super::models_endpoint;
+
+    // 这个函数踩过两次拼接错:先是 ARK 的版本化 base 拼出 `/v3/v1/models`,
+    // 后是 ReCodex 的 `/backend-api/codex` 拼出 `/codex/v1/models`(线上一天 404 了 88 次)。
+    // 每种 base 形状钉一条,别再靠人肉推断。
+    #[test]
+    fn recodex_native_base_appends_models_directly() {
+        assert_eq!(
+            models_endpoint("https://api.recodex.dev/backend-api/codex"),
+            "https://api.recodex.dev/backend-api/codex/models"
+        );
+        // 末尾多个斜杠是同一件事
+        assert_eq!(
+            models_endpoint("https://api.recodex.dev/backend-api/codex/"),
+            "https://api.recodex.dev/backend-api/codex/models"
+        );
+    }
+
+    #[test]
+    fn versioned_base_appends_models_without_v1() {
+        assert_eq!(
+            models_endpoint("https://ark.example.com/api/coding/v3"),
+            "https://ark.example.com/api/coding/v3/models"
+        );
+        assert_eq!(
+            models_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn plain_base_still_gets_v1_prefix() {
+        assert_eq!(
+            models_endpoint("https://api.example.com"),
+            "https://api.example.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn already_models_is_left_alone() {
+        assert_eq!(
+            models_endpoint("https://api.example.com/v1/models"),
+            "https://api.example.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn empty_base_yields_empty() {
+        assert_eq!(models_endpoint(""), "");
+    }
 }
