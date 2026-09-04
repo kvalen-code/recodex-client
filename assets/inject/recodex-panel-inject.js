@@ -11,7 +11,8 @@
   // 桥调用超时。没有它的时候,原生侧一旦不应答(launcher 卡住 / binding 只装了一半),
   // Promise 就永远不落地,页签停在「加载中」——没有报错、没有重试,用户只能重启。
   // 这个症状真的发生过,根因单独修了;但面板自己也该有防线。
-  const BRIDGE_TIMEOUT_MS = 20000;
+  // 测试夹具可以把它调短 —— 真等 20 秒的回归没人会跑。
+  const BRIDGE_TIMEOUT_MS = Number(window.__recodexBridgeTimeoutMs) || 20000;
 
   // 这些是**本来就慢**的命令,不能按 20 秒判死:
   // 自更新要下十几 MB;微信启停内部自带轮询;探测最快网关要逐个测速;
@@ -34,10 +35,16 @@
     if (BRIDGE_NO_TIMEOUT.indexOf(path) >= 0) return call;
     let timer = null;
     const guard = new Promise((resolve) => {
-      timer = setTimeout(
-        () => resolve({ status: "error", error: { code: "bridge_timeout", message: t("ReCodex 桥未响应") } }),
-        BRIDGE_TIMEOUT_MS,
-      );
+      timer = setTimeout(async () => {
+        // 超时之后再探一下桥本身:「桥断了」和「这一条命令慢」的处理办法完全不同
+        // (前者只能重启客户端,后者等一等就好)。以前两种都叫「桥未响应」,
+        // 用户拿着这四个字来问,我们也答不上来是哪种。
+        const alive = await bridgeAlive(fn);
+        const where = " (" + path + " " + Math.round(BRIDGE_TIMEOUT_MS / 1000) + "s)";
+        resolve(alive
+          ? { status: "error", error: { code: "bridge_timeout", message: t("桥正常,但这条命令超时了,请稍后重试") + where } }
+          : { status: "error", error: { code: "bridge_down", message: t("ReCodex 桥未响应,请重启 ReCodex 客户端") + where } });
+      }, BRIDGE_TIMEOUT_MS);
     });
     return Promise.race([call, guard]).then((result) => {
       if (timer !== null) clearTimeout(timer);
@@ -45,11 +52,32 @@
     });
   }
 
+  // 桥还活着吗:/backend/status 是后端最便宜的应答,2 秒内没回就当断了。
+  function bridgeAlive(fn) {
+    const probeMs = Math.min(2000, BRIDGE_TIMEOUT_MS);
+    return Promise.race([
+      Promise.resolve().then(() => fn("/backend/status", {})).then((r) => !!r && r.status === "ok").catch(() => false),
+      new Promise((resolve) => setTimeout(() => resolve(false), probeMs)),
+    ]);
+  }
+
   // ── 多语言 ─────────────────────────────────────────────────
   // 以简体原文作为 key:未翻译的条目自动回落简体,不会漏成空白或 key 名。
   // 覆盖面板全部文案 + 我们注入到官方 UI 上的文字(如「7 天用量」)。
   const I18N = {
     tw: {
+      "桥正常,但这条命令超时了,请稍后重试": "橋正常,但這條命令逾時了,請稍後再試",
+      "ReCodex 桥未响应,请重启 ReCodex 客户端": "ReCodex 橋未回應,請重新啟動 ReCodex 用戶端",
+      "请登录你购买服务的网站,在「设备」页点「输入验证码授权设备」,输入验证码:": "請登入你購買服務的網站,在「裝置」頁點「輸入驗證碼授權裝置」,輸入驗證碼:",
+      "登录已生成新凭据,旧凭据同时作废 —— 正在运行的 Codex 必须重启后才能继续使用。": "登入已產生新憑證,舊憑證同時作廢 —— 正在執行的 Codex 必須重新啟動後才能繼續使用。",
+      "秒后自动重启": "秒後自動重新啟動",
+      "立即重启客户端": "立即重新啟動用戶端",
+      "凭据已更新,重启后生效。": "憑證已更新,重新啟動後生效。",
+      "诊断与修复": "診斷與修復", "一切正常。": "一切正常。", "自动修复": "自動修復",
+      "正在修复…": "正在修復…", "修复失败": "修復失敗", "重新登录 ReCodex": "重新登入 ReCodex",
+      "凭据只在登录时下发一次,重装配置取不回来。": "憑證只在登入時下發一次,重裝設定取不回來。",
+      "请先登录 ReCodex,再回来修复。": "請先登入 ReCodex,再回來修復。",
+      "已重装配置。请完全退出并重开 Codex 让它读到新凭据。": "已重裝設定。請完全退出並重開 Codex 讓它讀到新憑證。",
       "版本与更新": "版本與更新", "当前版本": "目前版本", "最新版本": "最新版本",
       "已是最新版本": "已是最新版本", "重新检查": "重新檢查", "检查中…": "檢查中…",
       "更新到最新版": "更新到最新版", "立即更新(必需)": "立即更新(必要)",
@@ -137,6 +165,24 @@
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ 白名單為 *:任何人給該微信號發訊息都能在本機執行 Codex。",
     },
     ru: {
+      "桥正常,但这条命令超时了,请稍后重试": "Мост работает, но эта команда не ответила вовремя, попробуйте позже",
+      "ReCodex 桥未响应,请重启 ReCodex 客户端": "Мост ReCodex не отвечает, перезапустите клиент ReCodex",
+      "请登录你购买服务的网站,在「设备」页点「输入验证码授权设备」,输入验证码:": "Войдите на сайт, где вы купили услугу, откройте «Устройства», нажмите «Авторизовать устройство по коду» и введите код:",
+      "登录已生成新凭据,旧凭据同时作废 —— 正在运行的 Codex 必须重启后才能继续使用。": "Вход создал новые учётные данные, старые отозваны — запущенный Codex нужно перезапустить, чтобы продолжить.",
+      "秒后自动重启": "с. до автоматического перезапуска",
+      "立即重启客户端": "Перезапустить клиент",
+      "凭据已更新,重启后生效。": "Учётные данные обновлены, вступят в силу после перезапуска.",
+      "诊断与修复": "Диагностика и исправление", "一切正常。": "Всё в порядке.",
+      "自动修复": "Исправить автоматически", "正在修复…": "Исправление…", "修复失败": "Исправить не удалось",
+      "重新登录 ReCodex": "Войти в ReCodex заново",
+      "凭据只在登录时下发一次,重装配置取不回来。": "Учётные данные выдаются только при входе; переустановка конфигурации их не вернёт.",
+      "请先登录 ReCodex,再回来修复。": "Сначала войдите в ReCodex, затем вернитесь к исправлению.",
+      "已重装配置。请完全退出并重开 Codex 让它读到新凭据。": "Конфигурация переустановлена. Полностью закройте и снова откройте Codex, чтобы он прочитал новые учётные данные.",
+      "组织": "Организация", "无生效订阅": "Нет активной подписки", "切换组织失败": "Не удалось переключить организацию",
+      "若当前组织还没分配到 AI 账号，可以先切到别的组织。": "Если текущей организации ещё не выделен AI-аккаунт, переключитесь на другую.",
+      "重置额度": "Сбросить квоту", "剩 %n 次": "Осталось %n", "仅组织所有者可重置": "Сбросить может только владелец организации",
+      "无重置次数": "Сбросов не осталось", "额度用完自动切换组织": "Автопереключение организации при исчерпании квоты",
+      "重置中…": "Сброс…", "重置失败": "Сброс не удался",
       "版本与更新": "Версия и обновление", "当前版本": "Текущая версия", "最新版本": "Последняя версия",
       "已是最新版本": "Установлена последняя версия", "重新检查": "Проверить снова", "检查中…": "Проверка…",
       "更新到最新版": "Обновить", "立即更新(必需)": "Обновить (обязательно)",
@@ -645,7 +691,19 @@
       body().innerHTML = `<div class="rcx-err">${esc(start.error ? start.error.message : t("登录发起失败"))}</div>`;
       return;
     }
-    const { user_code, verify_url } = start.data;
+    const { user_code, verify_url, portal_known } = start.data;
+    // 不知道这台机器归哪个站点(独立下载的安装包、没跑过安装脚本):不能把用户
+    // 引到平台主站的授权页 —— 那正是贴牌漏出的地方。只显示验证码,让用户去
+    // 自己购买服务的网站输码;授权时服务端把站点随凭据回写,下次登录就自动打开正确的页。
+    if (portal_known === false) {
+      body().innerHTML = `<div>${t("请登录你购买服务的网站,在「设备」页点「输入验证码授权设备」,输入验证码:")}</div>
+        <div class="rcx-row"><span class="rcx-k">${t("授权码")}</span><b style="font-size:16px;letter-spacing:1px">${esc(user_code)}</b></div>
+        <button class="rcx-act sec" id="rcx-login-cancel">${t("取消")}</button>
+        <div class="rcx-muted" id="rcx-poll" style="margin-top:8px">${t("等待确认…")}</div>`;
+      body().querySelector("#rcx-login-cancel").onclick = () => render();
+      await pollLogin();
+      return;
+    }
     body().innerHTML = `<div>${t("在浏览器打开并输入授权码:")}</div>
       <div class="rcx-row"><span class="rcx-k">${t("授权码")}</span><b>${esc(user_code)}</b></div>
       <div class="rcx-muted" style="word-break:break-all">${esc(verify_url)}</div>
@@ -676,7 +734,12 @@
     // 节点检查自然停止。曾经另设过一个取消标志,破坏验证时发现删掉它测试照样绿
     // —— 没有可观察效果,去掉。
     body().querySelector("#rcx-login-cancel").onclick = () => render();
-    // 轮询
+    await pollLogin();
+  }
+
+  // 轮询:「知道归属」与「不知道归属」两种登录页共用同一个循环,
+  // 靠 #rcx-poll 节点存在与否自然停止(见下)。
+  async function pollLogin() {
     const deadline = Date.now() + 10 * 60 * 1000;
     const tick = async () => {
       // 面板重绘或切走之后这个节点就没了 —— 循环必须跟着停。
@@ -742,30 +805,43 @@
   async function showLoginDone() {
     body().innerHTML =
       `<div style="color:#3ee98a;font-weight:600;font-size:14px">${t("✅ 登录成功")}</div>` +
-      // 句中有 <b> 标记,拆成三段分别翻译,避免把 HTML 塞进词条
-      `<div class="rcx-muted" style="margin-top:8px">${t("侧边栏已切换到你的账号。要让官方 Codex 也用上,需要")}<b style="color:#e6e9ef">${t("重启一次")}</b>${t("(无需再登 ChatGPT)。")}</div>` +
+      // 不是「重启后更好」,是「不重启就用不了」:登录会换发凭据,旧的当场作废,
+      // 而正在跑的 Codex 只在启动时读一次 —— 它手里那把已经是死 key。
+      // (2026-09-04 用户实测:登录后 ChatGPT 里立刻 invalid api key,重启即好。)
+      `<div class="rcx-muted" style="margin-top:8px">${t("登录已生成新凭据,旧凭据同时作废 —— 正在运行的 Codex 必须重启后才能继续使用。")}</div>` +
       `<button class="rcx-act" id="rcx-restart" style="margin-top:12px">${t("立即重启生效")}</button>` +
-      `<button class="rcx-act sec" id="rcx-recheck">${t("稍后手动重启")}</button>`;
+      `<button class="rcx-act sec" id="rcx-recheck">${t("稍后手动重启")}</button>` +
+      `<div class="rcx-muted" id="rcx-restart-count" style="font-size:12px;margin-top:6px"></div>`;
     const restart = body().querySelector("#rcx-restart");
-    if (restart) {
-      restart.onclick = async () => {
-        restart.disabled = true;
-        restart.textContent = t("正在重启…");
-        const r = await bridge("/restart-codex", {});
-        // 重启成功的话这个进程就没了,下面这段只有失败时才会跑到
-        if (r && r.status === "error") {
-          restart.disabled = false;
-          restart.textContent = t("立即重启生效");
-          const line = document.createElement("div");
-          line.className = "rcx-err";
-          line.style.cssText = "font-size:12px;margin-top:6px";
-          line.textContent = (r.error && r.error.message) || t("重启失败,请手动退出后重新打开");
-          body().appendChild(line);
-        }
-      };
-    }
+    const doRestart = async () => {
+      if (!restart) return;
+      restart.disabled = true;
+      restart.textContent = t("正在重启…");
+      const r = await bridge("/restart-codex", {});
+      // 重启成功的话这个进程就没了,下面这段只有失败时才会跑到
+      if (r && r.status === "error") {
+        restart.disabled = false;
+        restart.textContent = t("立即重启生效");
+        const line = document.createElement("div");
+        line.className = "rcx-err";
+        line.style.cssText = "font-size:12px;margin-top:6px";
+        line.textContent = (r.error && r.error.message) || t("重启失败,请手动退出后重新打开");
+        body().appendChild(line);
+      }
+    };
+    if (restart) restart.onclick = doRestart;
+    // 默认倒数自动重启:多数人不会读完提示就去用了,而在这里「稍后」等于「继续报错」。
+    const count = body().querySelector("#rcx-restart-count");
+    let left = 8;
+    if (count) count.textContent = left + " " + t("秒后自动重启");
+    const tick = setInterval(() => {
+      left -= 1;
+      if (!count || !body().contains(count)) { clearInterval(tick); return; }
+      if (left <= 0) { clearInterval(tick); doRestart(); return; }
+      count.textContent = left + " " + t("秒后自动重启");
+    }, 1000);
     const btn = body().querySelector("#rcx-recheck");
-    if (btn) btn.onclick = render;
+    if (btn) btn.onclick = () => { clearInterval(tick); render(); };
     // 侧边栏能立刻变的部分,立刻变 —— 并把退避了的轮询拉回正常节奏
     pollDelay = POLL_BASE_MS;
     await refreshAccountCache();
@@ -849,12 +925,15 @@
     if (!res) return true;
     const code = res.error && res.error.code;
     return res.status === "error" &&
-      (code === "no_bridge" || code === "bridge_error" || code === "bridge_timeout");
+      (code === "no_bridge" || code === "bridge_error" || code === "bridge_timeout" || code === "bridge_down");
   }
 
-  function renderBridgeDown(box, retry) {
+  // res 可选:带上的话把桥给的原因(哪条命令、超时还是断了、要不要重启)也画出来。
+  function renderBridgeDown(box, retry, res) {
     if (!box) return;
+    const why = res && res.error && res.error.message;
     box.innerHTML = `<div class="rcx-err">${t("ReCodex 桥未就绪")}</div>` +
+      (why ? `<div class="rcx-muted" style="font-size:12px;margin:4px 0">${esc(why)}</div>` : "") +
       `<button class="rcx-act sec" id="rcx-bridge-retry">${t("重试")}</button>`;
     box.querySelector("#rcx-bridge-retry").onclick = retry;
   }
@@ -863,7 +942,7 @@
     const c = panel.querySelector("#recodex-enh");
     if (!c) return;
     const probe = await bridge("/backend/settings", {});
-    if (bridgeUnavailable(probe)) { renderBridgeDown(c, renderEnhancements); return; }
+    if (bridgeUnavailable(probe)) { renderBridgeDown(c, renderEnhancements, probe); return; }
     const settings = await readSettings();
     c.innerHTML = `<div id="rcx-enh-toggles"></div>` +
       `<div id="rcx-enh-width" style="margin-top:10px"></div>` +
@@ -1008,7 +1087,7 @@
     if (!c) return;
     wxStopPolling();
     const res = await bridge("/weixin/status", {});
-    if (bridgeUnavailable(res)) { renderBridgeDown(c, renderWeixin); return; }
+    if (bridgeUnavailable(res)) { renderBridgeDown(c, renderWeixin, res); return; }
     const cfg = (res && res.config) || {};
     const conn = (res && res.connect) || {};
     const [stateKey, stateCls] = WX_STATE_TEXT[conn.state] || WX_STATE_TEXT.idle;
@@ -1604,7 +1683,7 @@
   // codex-plus-plus.exe、不带 recodex.exe**,纯桌面端用户根本没有那个命令可跑。
   // 于是「托管块被清掉 / 凭据被清空」这类故障过去只能来问人。
   //
-  // 检查全部本地可算(不联网):要诊断的恰恰是「连不上」之前的那一层。
+  // 除「网关认不认这把凭据」一项要联网,其余本地可算:要诊断的恰恰是「连不上」之前的那一层。
   async function renderDoctor(box) {
     if (!box) return;
     box.innerHTML = `<div class="rcx-muted">${t("加载中…")}</div>`;
@@ -1626,7 +1705,11 @@
         // 凭据缺失和配置损坏要分开说：服务端**只在登录时交付一次** key，
         // 「重装配置」拿不回被清掉的凭据。混为一谈的话，用户会一直点自动修复
         // 而问题纹丝不动。
-        (d.needs_relogin
+        // 「只差重启」排最前:凭据是好的,重新登录只会再换一把 key、再欠一次重启。
+        (d.needs_restart
+          ? `<button class="rcx-act" id="rcx-doc-restart">${t("立即重启客户端")}</button>` +
+            `<div class="rcx-muted" style="font-size:12px;margin-top:4px">${t("凭据已更新,重启后生效。")}</div>`
+          : d.needs_relogin
           ? `<button class="rcx-act" id="rcx-doc-login">${t("重新登录 ReCodex")}</button>` +
             `<div class="rcx-muted" style="font-size:12px;margin-top:4px">${t("凭据只在登录时下发一次,重装配置取不回来。")}</div>`
           : d.fixable
@@ -1634,6 +1717,8 @@
             : `<div class="rcx-muted" style="font-size:12px">${t("请先登录 ReCodex,再回来修复。")}</div>`) +
         `<button class="rcx-act sec" id="rcx-doc-recheck">${t("重新检查")}</button>`;
     }
+    const restartBtn = box.querySelector("#rcx-doc-restart");
+    if (restartBtn) restartBtn.onclick = () => { restartBtn.disabled = true; bridge("/restart-codex", {}); };
     const relogin = box.querySelector("#rcx-doc-login");
     // 登录入口在账号页 —— 切过去再触发，用户能看见二维码/验证码那一套流程
     if (relogin) relogin.onclick = () => { showTab("account"); doLogin(); };

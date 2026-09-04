@@ -16,6 +16,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Managed-block markers. These are byte-identical to the CLI's so a config
 /// written by either client is recognised and cleanly removed by the other.
@@ -25,6 +26,25 @@ pub const END_MARKER: &str = "# <<< recodex managed block <<<";
 /// The environment variable Codex reads the API key from in `env_key` mode. Must
 /// match the `env_key` rendered into the managed block.
 pub const SUB2API_ENV_KEY: &str = "RECODEX_KEY";
+
+/// 本进程启动之后 `RECODEX_KEY` 有没有被改过(登录 / 换组织 / 登出)。
+///
+/// Codex 只在**启动时**读一次这个变量:改了之后本进程的副本是新的,
+/// 已经在跑的 Codex 攥着的还是旧值 —— 而旧 key 在服务端已经作废
+/// (重新登录会换发)。自诊断靠这个标志把「凭据没问题、只是没重启」
+/// 和「凭据坏了」分开,否则两者在用户眼里都是网关 401。
+static KEY_CHANGED_SINCE_START: AtomicBool = AtomicBool::new(false);
+
+pub fn key_changed_since_start() -> bool {
+    KEY_CHANGED_SINCE_START.load(Ordering::SeqCst)
+}
+
+/// 记录一次对 `RECODEX_KEY` 的改动。值没变(重复登录同一把 key)不算。
+fn note_key_change(name: &str, current: Option<&str>, next: Option<&str>) {
+    if name == SUB2API_ENV_KEY && current != next {
+        KEY_CHANGED_SINCE_START.store(true, Ordering::SeqCst);
+    }
+}
 
 const AUTH_BACKUP_SUFFIX: &str = ".recodex-bak";
 const AUTH_MANAGED_SUFFIX: &str = ".recodex-managed";
@@ -193,6 +213,22 @@ fn marked_block_span(content: &str) -> Option<(usize, usize)> {
         None => content.len(),
     };
     Some((start, end))
+}
+
+/// 托管块里写的 `base_url`(网关的 `/backend-api/codex` 根)。没有托管块时为 None。
+///
+/// 自诊断要拿它去问网关「这把 key 还认不认」—— 用户看到的 401 只有网关说得清。
+pub fn managed_base_url(content: &str) -> Option<String> {
+    let (start, end) = marked_block_span(content)?;
+    content[start..end].lines().find_map(|line| {
+        let value = line
+            .trim_start()
+            .strip_prefix("base_url")?
+            .trim_start()
+            .strip_prefix('=')?;
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 /// 块体自己定义的顶层键。托管块的内容是**可变的**(服务端可以下发别的模板),
@@ -772,6 +808,7 @@ mod mac_env {
 /// spawns as a child inherits the key immediately — no app restart needed after
 /// the first sign-in. `setx` (Windows only) carries it across restarts.
 pub fn set_user_env(name: &str, value: &str) -> io::Result<()> {
+    note_key_change(name, std::env::var(name).ok().as_deref(), Some(value));
     // Safe on edition 2021; this is the login-time write, not a hot path.
     std::env::set_var(name, value);
     #[cfg(windows)]
@@ -794,6 +831,7 @@ pub fn set_user_env(name: &str, value: &str) -> io::Result<()> {
 /// ""` cannot delete the entry but empties it, which Codex treats as unset —
 /// matching the CLI.
 pub fn unset_user_env(name: &str) -> io::Result<()> {
+    note_key_change(name, std::env::var(name).ok().as_deref(), None);
     std::env::remove_var(name);
     #[cfg(windows)]
     {
@@ -849,6 +887,38 @@ pub fn restore_all() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 自诊断拿托管块里的 base_url 去问网关 —— 读错了就会去探错地方,
+    /// 把「网关连不上」报成「凭据失效」。用户自己的 base_url 不能被读成我们的。
+    #[test]
+    fn managed_base_url_reads_the_block_and_only_the_block() {
+        let block = render_sub2api_block("https://sg.gw.recodex.dev/backend-api/codex");
+        let content = install_block(
+            "base_url = \"https://user.example/v1\"\n[other]\nbase_url = \"https://other.example\"\n",
+            &block,
+        );
+        assert_eq!(
+            managed_base_url(&content).as_deref(),
+            Some("https://sg.gw.recodex.dev/backend-api/codex")
+        );
+        assert_eq!(managed_base_url("base_url = \"https://user.example/v1\"\n"), None);
+    }
+
+    /// 只有 RECODEX_KEY 真的变了才算「需要重启」:重复登录同一把 key、
+    /// 或者改的是别的变量,都不该让自诊断喊重启。
+    #[test]
+    fn key_change_flag_only_trips_on_a_real_change() {
+        KEY_CHANGED_SINCE_START.store(false, Ordering::SeqCst);
+        note_key_change("OTHER_VAR", None, Some("x"));
+        note_key_change(SUB2API_ENV_KEY, Some("same"), Some("same"));
+        assert!(!key_changed_since_start(), "没变的不该置位");
+        note_key_change(SUB2API_ENV_KEY, Some("old"), Some("new"));
+        assert!(key_changed_since_start());
+        KEY_CHANGED_SINCE_START.store(false, Ordering::SeqCst);
+        note_key_change(SUB2API_ENV_KEY, Some("old"), None);
+        assert!(key_changed_since_start(), "登出清掉也算变了");
+        KEY_CHANGED_SINCE_START.store(false, Ordering::SeqCst);
+    }
 
     #[test]
     fn render_fills_base_url_and_env_key() {

@@ -19,7 +19,24 @@ struct LauncherRecodexBridge {
 
 impl codex_plus_core::routes::RecodexBridge for LauncherRecodexBridge {
     fn handle(&self, path: &str, payload: &Value) -> Value {
-        recodex_integration::desktop::handle_bridge(&self.state, path, payload)
+        let result = recodex_integration::desktop::handle_bridge(&self.state, path, payload);
+        // recodex-overlay:diag-flush — 任何 ReCodex 操作失败(登录/选网关/刷新额度…)都留一条
+        // 诊断,后台 flush 会传回服务器。事件名带上操作(select-gateway/login-start…)方便聚合,
+        // detail 里带 path、错误码和网关 id —— 连接类故障才分得清是哪条线。
+        if result.get("status").and_then(Value::as_str) == Some("error") {
+            let op = path.rsplit('/').next().unwrap_or("unknown");
+            let error = result.get("error").cloned().unwrap_or(Value::Null);
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                &format!("recodex.bridge_error.{op}"),
+                serde_json::json!({
+                    "path": path,
+                    "code": error.get("code").cloned().unwrap_or(Value::Null),
+                    "message": error.get("message").cloned().unwrap_or(Value::Null),
+                    "gateway": payload.get("id").or(payload.get("gateway")).or(payload.get("gateway_id")).cloned().unwrap_or(Value::Null),
+                }),
+            );
+        }
+        result
     }
 }
 
@@ -44,7 +61,16 @@ impl Default for LauncherHooks {
             bridge_context: Arc::new(Mutex::new(None)),
             // recodex-overlay: ReCodexState 只建一次(load 保存的凭据),跨重注入共享,不丢登录态。
             recodex: Arc::new(LauncherRecodexBridge {
-                state: recodex_integration::desktop::ReCodexState::from_env(),
+                state: {
+                    let state = recodex_integration::desktop::ReCodexState::from_env();
+                    // recodex-overlay:diag-flush — 后台把本地诊断日志里的报错(启动失败/连不上/
+                    // 任何 fail|error|panic)传回服务器;登录前也传(匿名口)。日志路径只有这层拿得到。
+                    state.spawn_diagnostics_flush(
+                        codex_plus_core::diagnostic_log::diagnostic_log_path(),
+                        env!("CARGO_PKG_VERSION"),
+                    );
+                    state
+                },
             }),
         }
     }
@@ -63,6 +89,24 @@ impl LauncherHooks {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    // 安装器收尾时调用:`--import-installer-tag <安装包路径>`。安装包在下发时被打上
+    // 「来自哪个站点」的标签(签名后追加,见 recodex_integration::installer_tag),
+    // 这里读出来写进 api-base,这台机器从此知道自己归哪个代理站,登录直接打开
+    // 对应站点的授权页。读不到标签(主站直下、老安装包)什么都不做,静默退出。
+    if let Some(pos) = args.iter().position(|arg| arg == "--import-installer-tag") {
+        if let Some(path) = args.get(pos + 1) {
+            // 线索是客户端侧读到的,持久化前由平台确认域名(persist_api_base_if_trusted)。
+            let imported = recodex_integration::installer_tag::read_portal(std::path::Path::new(path))
+                .filter(|_| !recodex_integration::desktop::portal_known())
+                .map(|origin| recodex_integration::desktop::persist_api_base_if_trusted(&origin))
+                .unwrap_or(false);
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.installer_tag_import",
+                json!({ "imported": imported }),
+            );
+        }
+        return Ok(());
+    }
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
     let options = parse_launch_options(args.iter());
     if let Err(error) = launcher_main(args, helper_only, options.clone()).await {
@@ -535,6 +579,16 @@ impl LaunchHooks for LauncherHooks {
         settings: &codex_plus_core::settings::BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<codex_plus_core::launcher::CodexLaunch> {
+        // Codex 子进程继承的是**本进程**的环境。启动器活着期间用户可能登录/换组织,
+        // RECODEX_KEY 在用户级环境里已经换了,而本进程环境还是启动时那份 ——
+        // 这时拉起的 Codex 拿到的是旧 Key 甚至没有 Key(线上 api_key_required 每 2 分钟一次)。
+        // 每次拉起前从用户级环境刷一遍,子进程才拿到当前有效的那把。
+        if recodex_integration::codexcfg::refresh_key_env_from_user_scope() {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.recodex_key_refreshed_before_launch",
+                json!({}),
+            );
+        }
         self.core
             .launch_codex(app_dir, debug_port, settings, extra_args)
             .await

@@ -59,6 +59,11 @@ Section "Install"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ReCodex" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ReCodex" "NoRepair" 1
 
+  ; 归属导入:安装包在下发时带着「来自哪个站点」的线索(文件名 @域名、浏览器写的
+  ; 下载来源、签名后追加的标签)。把安装包自己的路径交给启动器读一次,写进
+  ; %USERPROFILE%\.codex\recodex\api-base —— 代理站用户装完登录就直接打开自己站点的
+  ; 授权页,不会看到平台主站。主站直下的包没有线索,这一步静默无事。
+  nsExec::ExecToLog '"$INSTDIR\codex-plus-plus.exe" --import-installer-tag "$EXEPATH"'
   WriteUninstaller "$INSTDIR\uninstall.exe"
 SectionEnd
 

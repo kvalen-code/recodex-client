@@ -727,6 +727,10 @@ fn compatibility_update_and_diagnostics_use_the_v1_client_contract() {
             os: "windows".into(),
             event: "manual_report".into(),
             error_code: None,
+            device_id: None,
+            category: None,
+            gateway: None,
+            message: None,
             occurred_at: None,
         })
         .unwrap();
@@ -775,6 +779,10 @@ fn diagnostics_reject_secrets_before_transport() {
             os: "windows".into(),
             event: "Bearer rct_secret".into(),
             error_code: None,
+            device_id: None,
+            category: None,
+            gateway: None,
+            message: None,
             occurred_at: None,
         })
         .unwrap_err();

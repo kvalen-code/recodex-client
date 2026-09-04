@@ -54,13 +54,143 @@ where
     })
 }
 
+// saved_api_base 读 ~/.codex/recodex/api-base（CLI 安装脚本与 login 写入的
+// 来源站点）。桌面端与命令行同机共用一个 device_id，也共用这份来源：
+// 代理站装过 CLI 的机器，桌面端自动跟随代理域名，不再露出平台主站。
+// 文件缺失或不是 http(s) URL 一律当没有，行为与从前一致。
+fn saved_api_base() -> Option<String> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let path = std::path::Path::new(&home)
+        .join(".codex")
+        .join("recodex")
+        .join("api-base");
+    let value = std::fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    if value.starts_with("https://") || value.starts_with("http://") {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn api_base_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(
+        std::path::Path::new(&home)
+            .join(".codex")
+            .join("recodex")
+            .join("api-base"),
+    )
+}
+
+/// persist_api_base 把来源站点写进 api-base(与 CLI 共用同一个文件)。
+/// 只接受 http(s) origin;写入的是服务端校验过的值,这里不再做域名判断。
+pub fn persist_api_base(origin: &str) -> std::io::Result<()> {
+    let origin = origin.trim();
+    if !origin.starts_with("https://") && !origin.starts_with("http://") {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "api base must be http(s)"));
+    }
+    let Some(path) = api_base_path() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"));
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, format!("{origin}\n"))
+}
+
+/// macOS 的下载来源线索:Finder 给下载的文件写 `kMDItemWhereFroms`(下载地址列表),
+/// 从 dmg 拖进「应用程序」时会带到 app 上。`mdls -raw` 直接打印那个数组;
+/// 取第一个 http(s) 地址的 origin。没有(非浏览器下载、被清过)就 None。
+#[cfg(target_os = "macos")]
+fn portal_from_where_froms() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    // 属性挂在 .app 包上,不在里面的可执行文件上
+    let bundle = exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app"))?;
+    let out = std::process::Command::new("mdls")
+        .args(["-raw", "-name", "kMDItemWhereFroms"])
+        .arg(bundle)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let url = text
+        .split('"')
+        .find(|s| s.starts_with("https://") || s.starts_with("http://"))?;
+    let rest = url.split("://").nth(1)?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    if host.is_empty() {
+        return None;
+    }
+    let scheme = if url.starts_with("https://") { "https" } else { "http" };
+    Some(format!("{scheme}://{host}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn portal_from_where_froms() -> Option<String> {
+    None
+}
+
+/// 平台主 API:只用来做一件事 —— 问「这个域名是不是已验证的代理站」。
+/// 它不出现在任何界面上,归属定下来之后客户端也不再打它。
+const PLATFORM_API: &str = "https://api.recodex.dev";
+
+/// 线索来自客户端侧(文件名、下载来源、WhereFroms),持久化前必须让平台确认那是
+/// 已验证的代理域名 —— 否则把安装包放到任意域名下,就能让这台机器把登录流量指过去。
+/// 平台联系不上时不写(返回 false),交给登录时的最后防线;宁可多输一次码。
+pub fn portal_trusted(origin: &str) -> bool {
+    let Some(rest) = origin.split("://").nth(1) else { return false };
+    let Some(host) = rest.split(['/', '?', '#']).next() else { return false };
+    if host.is_empty() {
+        return false;
+    }
+    let url = format!("{PLATFORM_API}/api/cli/auth/portal-check?host={host}");
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .get(&url)
+        .call()
+        .map(|resp| resp.status() == 204)
+        .unwrap_or(false)
+}
+
+/// 经平台确认后再持久化。安装器收尾(--import-installer-tag)与 mac 首启共用。
+pub fn persist_api_base_if_trusted(origin: &str) -> bool {
+    if !portal_trusted(origin) {
+        return false;
+    }
+    persist_api_base(origin).is_ok()
+}
+
+/// 首次启动的归属发现:api-base 还没有时,用安装包留下的线索补上一次。
+/// Windows 的线索在安装器收尾时已由 --import-installer-tag 写入;这里兜 macOS。
+pub fn discover_portal_once() {
+    if portal_known() {
+        return;
+    }
+    if let Some(origin) = portal_from_where_froms() {
+        persist_api_base_if_trusted(&origin);
+    }
+}
+
+/// portal_known 报告这台机器有没有归属(显式环境变量或 api-base 文件)。
+/// 没有归属的客户端不该自动弹平台主站的授权页 —— 那正是贴牌漏出的地方;
+/// 面板改为显示验证码,让用户去自己购买服务的网站输码,授权时归属随凭据回写。
+pub fn portal_known() -> bool {
+    std::env::var("RECODEX_API_URL").is_ok() || saved_api_base().is_some()
+}
+
 impl ReCodexState {
     pub fn from_env() -> Self {
+        discover_portal_once();
         let api_url = std::env::var("RECODEX_API_URL")
-            .unwrap_or_else(|_| "https://api.recodex.dev".to_owned());
+            .ok()
+            .or_else(saved_api_base)
+            .unwrap_or_else(|| "https://api.recodex.dev".to_owned());
         let web_url = std::env::var("RECODEX_WEB_URL")
             .map(|value| value.trim_end_matches('/').to_owned())
-            .unwrap_or_else(|_| "https://recodex.dev".to_owned());
+            .ok()
+            .or_else(|| saved_api_base().map(|v| v.trim_end_matches('/').to_owned()))
+            .unwrap_or_else(|| "https://recodex.dev".to_owned());
         let result = HttpTransport::new(&api_url, std::time::Duration::from_secs(10))
             .and_then(|transport| Adapter::new(transport, &api_url))
             .and_then(|adapter| {
@@ -111,6 +241,41 @@ impl ReCodexState {
                 web_url,
             },
         }
+    }
+
+    /// 后台把本地诊断日志里的报错传回服务器(逻辑在 crate::diagnostics_flush)。
+    ///
+    /// launcher 建好 state 后调一次。这个 crate 拿不到 codex-plus-core 的日志路径,由调用方
+    /// 传进来。启动先等 20s 让主流程起来、别抢 I/O;之后每 10 分钟一轮,每轮最多 20 条 ——
+    /// 匿名口按 IP 限流 0.2/s,这个节奏扛得住。
+    ///
+    /// 持有的是启动时的 adapter fork:中途重新登录不会同步过来,那些报错会按匿名带 device_id
+    /// 上去(device_id 就是登录注册的设备号,服务端能 join 回用户),重启后回到已认证。
+    /// adapter 没建起来(init_error)就什么都不做 —— 诊断上报绝不能反过来影响启动。
+    /// ponytail: 先这样;真要实时跟身份,每轮从 self.adapter 重新 fork 即可。
+    pub fn spawn_diagnostics_flush(&self, log_path: std::path::PathBuf, client_version: &'static str) {
+        // 幂等:state 若被建了不止一次,也只起一个线程 —— 两个线程抢同一个水位会重复上传。
+        static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let adapter = match self.adapter.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(adapter) => adapter.fork(),
+                None => return,
+            },
+            Err(_) => return,
+        };
+        let _ = std::thread::Builder::new()
+            .name("recodex-diag-flush".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                let device_id = crate::load_or_create_install_id().unwrap_or_default();
+                loop {
+                    let _ = adapter.flush_diagnostic_log(&log_path, &device_id, client_version, 20);
+                    std::thread::sleep(std::time::Duration::from_secs(600));
+                }
+            });
     }
 }
 
@@ -458,6 +623,10 @@ pub fn recodex_report_diagnostics(state: &ReCodexState) -> Value {
         os: std::env::consts::OS.to_owned(),
         event: "manual_report".to_owned(),
         error_code: None,
+        device_id: None,
+        category: None,
+        gateway: None,
+        message: None,
         occurred_at: None,
     };
     match adapter.report_diagnostic(&report) {
@@ -689,7 +858,13 @@ pub fn recodex_login_start(state: &ReCodexState) -> Value {
                 return error("login_cancelled", "ReCodex login was cancelled");
             }
             *pending = Some(login.device_code.clone());
-            json!({"status":"pending", "data":PublicLoginStart::from(&login)})
+            let mut data = serde_json::to_value(PublicLoginStart::from(&login)).unwrap_or_default();
+            if let Some(map) = data.as_object_mut() {
+                // 面板据此决定:知道归属 → 照常自动打开授权页;
+                // 不知道 → 只显示验证码,提示去自己购买服务的网站输码。
+                map.insert("portal_known".into(), json!(portal_known()));
+            }
+            json!({"status":"pending", "data":data})
         }
         Err(adapter_error) => error("login", adapter_error.to_string()),
     }
@@ -772,6 +947,11 @@ pub fn recodex_login_poll(state: &ReCodexState) -> Value {
                 &result.env_value,
             ) {
                 return json!({"status":"approved", "warning":{"code":"codex_config","message":config_error.to_string()}});
+            }
+            // 归属回写:服务端说授权是在哪个站点完成的,这台机器从此就归那个站点
+            // (贴牌的最后防线)。写失败只影响下次启动的默认值,不算登录失败。
+            if !result.portal.is_empty() {
+                let _ = persist_api_base(&result.portal);
             }
             json!({"status":"approved"})
         }
@@ -925,6 +1105,40 @@ pub fn recodex_doctor(state: &ReCodexState) -> Value {
         if key_ok { "Codex 能读到 ReCodex 凭据" } else { "环境变量里没有 ReCodex 凭据 —— Codex 会被网关拒掉" },
     ));
 
+    // 有凭据不等于凭据能用。被后台停用、或重新登录时被服务端换掉的 key,
+    // 本地看起来一模一样 —— 只有网关说了算。这是全部检查里唯一一项联网的:
+    // 它诊断的正是「本地全绿、网关却一直 401」(2026-09-04 两个用户同一天撞上)。
+    let mut key_rejected = false;
+    let mut gateway_ok = true;
+    if key_ok {
+        if let Some(root) = gateway_root_from_managed_config() {
+            match probe_gateway_key(&root, key.trim()) {
+                KeyProbe::Accepted => {
+                    checks.push(check("credential_accepted", true, "网关确认凭据有效"));
+                }
+                KeyProbe::Rejected(detail) => {
+                    key_rejected = true;
+                    checks.push(check("credential_accepted", false, &detail));
+                }
+                KeyProbe::Unreachable(detail) => {
+                    gateway_ok = false;
+                    checks.push(check("gateway_reachable", false, &detail));
+                }
+            }
+        }
+    }
+
+    // Codex 只在启动时读一次 RECODEX_KEY。登录 / 换组织之后新 key 只到了本进程,
+    // 正在跑的 Codex 攥着的还是旧值 —— 而旧 key 在服务端已经作废。
+    // 这种情况什么都不用修,只需要重启;不单列出来的话,它和「凭据坏了」
+    // 在用户眼里是同一个 401,于是反复重新登录、反复换 key、反复失败。
+    let restart_pending = crate::codexcfg::key_changed_since_start();
+    checks.push(check(
+        "codex_restarted",
+        !restart_pending,
+        if restart_pending { "凭据已更新,但正在运行的 Codex 仍拿着旧凭据 —— 请重启客户端" } else { "Codex 使用的是当前凭据" },
+    ));
+
     let signed_in = match state.adapter.lock() {
         Ok(guard) => guard.as_ref().is_some_and(|a| a.is_authenticated()),
         Err(_) => return error("state_unavailable", "ReCodex state is unavailable"),
@@ -938,17 +1152,88 @@ pub fn recodex_doctor(state: &ReCodexState) -> Value {
     json!({
         "status": "ready",
         "data": {
-            "healthy": config_ok && key_ok && signed_in,
+            "healthy": config_ok && key_ok && !key_rejected && gateway_ok && !restart_pending && signed_in,
             // 「重装配置」能修好的只有托管块那几项，且必须先登录才取得到。
             "fixable": !config_ok && signed_in,
             // 凭据是另一回事：服务端**刻意只在登录时交付一次**
             // （server_authed.go handleConfig 的注释写得很清楚），
             // 重装配置拿不回被清掉的 key。这时候唯一的出路是重新登录 ——
             // 不如实说的话，用户会一直点「自动修复」而问题纹丝不动。
-            "needs_relogin": !key_ok,
+            // 网关明确拒掉的 key 同理：停用 / 换发过的 key 重装也回不来。
+            "needs_relogin": !key_ok || key_rejected,
+            // 只差一次重启：面板据此给「立即重启」而不是「重新登录」。
+            "needs_restart": restart_pending,
             "checks": checks,
         }
     })
+}
+
+/// 网关对这把 key 的态度。
+enum KeyProbe {
+    Accepted,
+    /// 网关明确拒绝,附用户可读的原因。
+    Rejected(String),
+    /// 没问到网关(网络 / 5xx),不能据此说凭据坏了。
+    Unreachable(String),
+}
+
+/// 托管块里的 base_url 去掉 `/backend-api/codex` 就是网关根。
+fn gateway_root(base_url: &str) -> String {
+    base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/backend-api/codex")
+        .to_string()
+}
+
+fn gateway_root_from_managed_config() -> Option<String> {
+    let content = crate::codexcfg::config_path()
+        .and_then(std::fs::read_to_string)
+        .ok()?;
+    crate::codexcfg::managed_base_url(&content).map(|base| gateway_root(&base))
+}
+
+/// 拿这把 key 打一次网关上最便宜的鉴权接口。只问「认不认」,不拉模型、不碰上游。
+fn probe_gateway_key(root: &str, key: &str) -> KeyProbe {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    match agent
+        .get(&format!("{root}/v1/key/billing"))
+        .set("Authorization", &format!("Bearer {key}"))
+        .call()
+    {
+        Ok(response) => classify_key_probe(response.status(), ""),
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            classify_key_probe(status, &body)
+        }
+        Err(ureq::Error::Transport(transport)) => {
+            KeyProbe::Unreachable(format!("连不上网关,无法确认凭据:{transport}"))
+        }
+    }
+}
+
+/// 把网关的应答翻成诊断结论。401 的 `code` 是 sub2api 鉴权中间件定死的那几个值。
+fn classify_key_probe(status: u16, body: &str) -> KeyProbe {
+    let code = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("code").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+    match (status, code.as_str()) {
+        (200..=299, _) => KeyProbe::Accepted,
+        (401, "API_KEY_DISABLED") => {
+            KeyProbe::Rejected("这把凭据已被停用 —— 请重新登录获取新凭据".to_string())
+        }
+        (401, "INVALID_API_KEY") => KeyProbe::Rejected(
+            "这把凭据已失效(不存在或已被更换)—— 请重新登录获取新凭据".to_string(),
+        ),
+        (401, _) | (403, _) => KeyProbe::Rejected(format!(
+            "网关不接受这把凭据({status} {code})—— 请重新登录;仍失败请联系客服"
+        )),
+        // simple 模式没有计费接口,但能走到 handler 就说明鉴权已经过了
+        (404, _) => KeyProbe::Accepted,
+        _ => KeyProbe::Unreachable(format!("网关返回 {status},暂时无法确认凭据")),
+    }
 }
 
 /// 自动修复：把服务端当前应下发的托管块与凭据重新装回去。
@@ -1017,6 +1302,8 @@ pub fn handle_bridge(state: &ReCodexState, path: &str, payload: &Value) -> Value
 
 #[cfg(test)]
 mod config_writer_tests {
+    use super::{classify_key_probe, gateway_root, KeyProbe};
+
     /// 写 `~/.codex` 的入口必须只有两个,而且各自带着官方模式的策略。
     ///
     /// 这条约束靠人记是记不住的 —— 已经因此踩过四次(快照漏 auth.json /
@@ -1037,6 +1324,54 @@ mod config_writer_tests {
             .collect::<Vec<_>>()
             .join("
 ")
+    }
+
+    /// 网关 401 的几种 code 要翻成不同的话,而且都得是「回登录」;
+    /// 网络问题不能被说成凭据坏了 —— 否则用户会对着好好的凭据反复重登。
+    #[test]
+    fn key_probe_classifies_gateway_answers() {
+        assert!(matches!(classify_key_probe(200, ""), KeyProbe::Accepted));
+        assert!(matches!(classify_key_probe(404, ""), KeyProbe::Accepted));
+        match classify_key_probe(401, r#"{"code":"API_KEY_DISABLED","message":"x"}"#) {
+            KeyProbe::Rejected(detail) => assert!(detail.contains("停用"), "{detail}"),
+            _ => panic!("停用的 key 必须判为拒绝"),
+        }
+        match classify_key_probe(401, r#"{"code":"INVALID_API_KEY","message":"x"}"#) {
+            KeyProbe::Rejected(detail) => assert!(detail.contains("失效"), "{detail}"),
+            _ => panic!("不存在的 key 必须判为拒绝"),
+        }
+        assert!(matches!(classify_key_probe(401, "not json"), KeyProbe::Rejected(_)));
+        assert!(matches!(classify_key_probe(502, ""), KeyProbe::Unreachable(_)));
+    }
+
+    #[test]
+    fn gateway_root_strips_codex_suffix() {
+        assert_eq!(
+            gateway_root("https://sg.gw.recodex.dev/backend-api/codex/"),
+            "https://sg.gw.recodex.dev"
+        );
+    }
+
+    /// 自诊断必须真的问网关、真的看重启标志 —— 这两项是 2026-09-04 两个用户
+    /// 「本地全绿、网关一直 401」的根因,拿掉任何一个,上面的单元测试照样绿。
+    #[test]
+    fn doctor_consults_gateway_and_restart_flag() {
+        let doctor = body()
+            .split("pub fn recodex_doctor(")
+            .nth(1)
+            .expect("recodex_doctor 应存在")
+            .to_string();
+        let doctor = &doctor[..doctor.find("\npub fn ").unwrap_or(doctor.len())];
+        assert!(doctor.contains("probe_gateway_key("), "自诊断必须拿 key 问网关");
+        assert!(doctor.contains("key_changed_since_start()"), "自诊断必须区分「只差重启」");
+        assert!(
+            doctor.contains("\"needs_restart\": restart_pending"),
+            "面板靠 needs_restart 给「立即重启」"
+        );
+        assert!(
+            doctor.contains("\"needs_relogin\": !key_ok || key_rejected"),
+            "网关拒掉的 key 必须走「重新登录」—— 重装配置拿不回被停用 / 换发过的 key"
+        );
     }
 
     /// 官方模式下换网关只能改快照。把这个判断拿掉,官方模式会被悄悄破坏 ——

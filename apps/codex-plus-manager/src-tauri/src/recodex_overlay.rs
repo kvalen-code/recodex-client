@@ -511,6 +511,10 @@ pub fn recodex_report_diagnostics(state: tauri::State<'_, ReCodexState>) -> Valu
         os: std::env::consts::OS.to_owned(),
         event: "manual_report".to_owned(),
         error_code: None,
+        device_id: None,
+        category: None,
+        gateway: None,
+        message: None,
         occurred_at: None,
     };
     match adapter.report_diagnostic(&report) {

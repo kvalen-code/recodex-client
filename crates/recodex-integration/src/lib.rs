@@ -1,8 +1,10 @@
 mod compatibility;
 pub mod codexcfg;
 pub mod desktop;
+pub mod installer_tag; // recodex-overlay: 读安装包上的代理站点标签
 pub mod officialmode; // recodex-overlay: 官方模式切换(可逆)
 pub mod credential;
+pub mod diagnostics_flush; // recodex-overlay: 本地诊断日志自动上报(启动失败/连不上也能看到)
 mod error;
 mod install_id;
 mod ui;
@@ -316,6 +318,10 @@ pub struct LoginPoll {
     pub env_key: String,
     #[serde(default, skip_serializing)]
     pub env_value: String,
+    /// 完成授权的站点 origin(贴牌归属的最后防线,见 authflow.PollResponse.Portal)。
+    /// 非空就持久化为 api-base,下次启动起全部走这个域名。
+    #[serde(default)]
+    pub portal: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -345,6 +351,19 @@ pub struct DiagnosticReport {
     pub event: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// 匿名上报(登录前/连不上,没 token)时带上,服务端按它归到设备;已认证路径服务端
+    /// 会无视它、以 token 的设备为准。值用 install_id —— 和登录注册的设备号是同一个。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// startup / connect / auth / crash / runtime,给服务端聚合用。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// 出错时在用的网关面(jp/sg/jpcf/sgcf),连接类故障靠它定位是哪条线。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// 人读的错误详情,≤2KB,发送前已 redact 掉 rct_/sk-/Bearer/token=。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occurred_at: Option<String>,
 }
@@ -513,7 +532,10 @@ impl<T: Transport> Adapter<T> {
             // 上报自己是哪一端：名额按 device_id 算（与命令行共用一个），
             // 凭据按 (device_id, client) 分开存 —— 不报的话两端共用一份凭据，
             // 谁登录谁把对方顶下线。
-            "client": "desktop"
+            "client": "desktop",
+            // 自报来源站点：服务端只认已验证的代理域名，据此把 verify_url
+            // 指到代理域（贴牌闭环的登录一环）；主站安装报主站，无副作用。
+            "portal": self.base_url.as_str()
         });
         let login: LoginStart =
             self.public_request("POST", "/api/cli/auth/start", Some(&body.to_string()))?;
@@ -713,6 +735,9 @@ impl<T: Transport> Adapter<T> {
             200..=299 => serde_json::from_str(&payload)
                 .map_err(|e| AdapterError::InvalidResponse(e.to_string())),
             401 => Err(AdapterError::Unauthorized),
+            403 if error_code(&payload) == "allocation_pending" => {
+                Err(AdapterError::AllocationPending)
+            }
             403 => Err(AdapterError::Forbidden),
             409 => Err(AdapterError::Conflict(
                 "request conflicts with current ReCodex state".into(),
@@ -721,6 +746,21 @@ impl<T: Transport> Adapter<T> {
             _ => Err(AdapterError::Unavailable),
         }
     }
+}
+
+/// 认证服务的错误体形如 `{"error":{"code":"...","message":"..."}}`。
+/// 只取 code:同一个状态码下不同 code 的含义可能截然相反(403 的 allocation_pending)。
+fn error_code(payload: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(|code| code.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 fn validate_base_url(url: &Url) -> Result<(), AdapterError> {
@@ -894,32 +934,53 @@ fn validate_channel(value: &str) -> Result<(), AdapterError> {
     Ok(())
 }
 
-fn validate_diagnostic_report(report: &DiagnosticReport) -> Result<(), AdapterError> {
+/// 粗筛像不像夹带了凭据。和服务端 containsSecretMarker 同一套词——两边一致才不会
+/// 出现「本地放行、服务端 400」把整条诊断丢掉的情况。
+pub(crate) fn contains_secret_marker(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("bearer ")
+        || lower.contains("rct_")
+        || lower.contains("sk-")
+        || lower.contains("token=")
+}
+
+pub(crate) fn validate_diagnostic_report(report: &DiagnosticReport) -> Result<(), AdapterError> {
+    // 短结构化字段:定长、单行、无密钥。与服务端 validateDiagnosticReport 逐条对齐。
     for (name, value) in [
         ("client_version", report.client_version.as_str()),
         ("os", report.os.as_str()),
         ("event", report.event.as_str()),
         ("error_code", report.error_code.as_deref().unwrap_or("")),
+        ("device_id", report.device_id.as_deref().unwrap_or("")),
+        ("category", report.category.as_deref().unwrap_or("")),
+        ("gateway", report.gateway.as_deref().unwrap_or("")),
     ] {
         if value.len() > 128 || value.chars().any(|c| matches!(c, '\r' | '\n' | '\t')) {
             return Err(AdapterError::InvalidConfiguration(format!(
                 "diagnostic {name} is invalid"
             )));
         }
-        let lower = value.to_ascii_lowercase();
-        if lower.contains("bearer ")
-            || lower.contains("rct_")
-            || lower.contains("sk-")
-            || lower.contains("token=")
-        {
+        if contains_secret_marker(value) {
             return Err(AdapterError::InvalidConfiguration(
                 "diagnostic payload contains a secret".into(),
             ));
         }
     }
-    if report.event.is_empty() {
+    if report.event.is_empty() || report.event.len() > 64 {
         return Err(AdapterError::InvalidConfiguration(
             "diagnostic event is required".into(),
+        ));
+    }
+    // message 是自由文本(错误串/短栈):允许换行,但上限更严 + 同样不许带密钥。
+    let message = report.message.as_deref().unwrap_or("");
+    if message.len() > 2048 {
+        return Err(AdapterError::InvalidConfiguration(
+            "diagnostic message is too long".into(),
+        ));
+    }
+    if contains_secret_marker(message) {
+        return Err(AdapterError::InvalidConfiguration(
+            "diagnostic payload contains a secret".into(),
         ));
     }
     Ok(())
