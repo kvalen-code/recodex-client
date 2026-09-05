@@ -3585,16 +3585,6 @@
     }
   }
 
-  function isCodexPlusAdExpired(ad) {
-    if (!ad.expires_at) return false;
-    const expiresAt = Date.parse(ad.expires_at);
-    return Number.isFinite(expiresAt) && expiresAt < Date.now();
-  }
-
-  function cacheBustCodexPlusAdUrl(url, version) {
-    return `${url}${url.includes("?") ? "&" : "?"}v=${version}`;
-  }
-
   function selectCodexPlusTab(tab) {
     document.querySelectorAll(".codex-plus-modal-content").forEach((modal) => {
       modal.dataset.codexPlusActiveTab = tab;
@@ -4600,6 +4590,18 @@
     };
   }
 
+  // 把一次后端调用的结果压成一个能上报的短词。
+  //
+  // 只取形状，不带响应体：响应里可能有会话内容，而定位需要的只是
+  // 「回了 undefined / 超时 / 某个非 ok 的 status」这个区分。
+  function describeBackendOutcome(outcome) {
+    if (outcome === undefined) return "undefined";
+    if (outcome === null) return "null";
+    if (outcome.timeout) return "timeout";
+    if (typeof outcome.status === "string" && outcome.status) return outcome.status;
+    return typeof outcome;
+  }
+
   function sendCodexPlusDiagnostic(event, detail) {
     const payload = codexPlusDiagnosticPayload(event, detail);
     if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
@@ -5298,10 +5300,18 @@
           });
           return fallback;
         }
+        // 这条路是「两边都返回了，但都不是 ok」——没有异常对象可报。
+        // 原来硬写两个空串，上报回来就是 errorName:"" errorMessage:""，
+        // 拿到也查不出任何东西（线上 3 台设备报的全是这个）。
+        // 桥和 HTTP 各自到底回了什么，才是能定位的：桥超时、桥回了非 ok、
+        // 还是 HTTP 那边压根没响应，三种情况修法完全不同。
         sendCodexPlusDiagnostic("backend_status_bridge_and_http_failed", {
           path,
-          errorName: "",
-          errorMessage: "",
+          errorName: "no_exception",
+          errorMessage: "bridge and http fallback both returned non-ok",
+          bridgeStatus: describeBackendOutcome(result),
+          bridgeTimeout: Boolean(result?.timeout),
+          httpStatus: describeBackendOutcome(fallback),
         });
         return fallback;
       }
@@ -5322,10 +5332,13 @@
           });
           return fallback;
         }
+        // 这条路有真实的异常对象，但 HTTP 兜底那边回了什么同样要说 ——
+        // 「桥抛了异常」和「桥抛了异常且 HTTP 也没响应」是两种故障。
         sendCodexPlusDiagnostic("backend_status_bridge_and_http_failed", {
           path,
           errorName: error?.name || "",
           errorMessage: error?.message || String(error),
+          httpStatus: describeBackendOutcome(fallback),
         });
         return fallback;
       }
