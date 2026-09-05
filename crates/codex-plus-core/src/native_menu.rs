@@ -3,34 +3,30 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use serde_json::json;
 
-// ⚠️ 未证实的怀疑:这个功能可能**根本跑不通**,而不只是慢。
+// Fuse 猜想已坐实(2026-09-05,本机二进制实证):**Codex 152 起这条路永远不通**。
 //
-// `--inspect` 走的是 Electron 的 **Node** inspector,和 `--remote-debugging-port`
-// (Chromium DevTools)是两套东西。两个参数在 `build_codex_arguments_with_native_menu_inspector`
-// 里是**同一批**传给 Codex 的 —— 现场 CDP 通、inspector 不通,说明参数到达了,
-// 是 Electron 自己没开。最可能是打包时烧了 Fuse `EnableNodeCliInspectArguments=false`
-// (处理用户凭据的应用这么做很合理),那样等多久都没用。
+// `--inspect` 走的是 Electron 的 **Node** inspector(端口 = CDP 端口 + 100),
+// 和 `--remote-debugging-port`(Chromium DevTools)是两套东西。Electron 打包时
+// 可以烧 fuse 把 `--inspect` 整个禁掉,烧过之后参数被静默忽略,端口永不监听。
 //
-// 吻合的旁证:6 台上报设备**全部**失败、终态清一色 `failed to query CDP targets`
-// (连不上,不是执行失败)、Windows 和 macOS 都有 —— fuse 是打包烧录的,跨平台一致。
+// 实测:本机 Codex 26.901.5003.0 的 fuse wire 在 `app\chrome.dll` 里(**不在主 exe**,
+// 它是 OpenAI 定制构建,Electron 编进了 chrome.dll),sentinel 后 wire = `010011001`,
+// 第 4 位 `EnableNodeCliInspectArguments = 0` = 禁用。对照组 Xmind 读出官方默认
+// `10110001`,证明偏移没读错。
 //
-// 没有直接证据(本机没装 Codex,查不了它二进制里的 fuse wire),所以先不下线功能。
-// **发版后看 `native_menu.localization_failed` 里新加的 `inspector_port_free`**:
-// 端口空着=没人监听=坐实 fuse;端口被占=另一回事。坐实了就该把这个功能摘掉,
-// 而不是继续每次启动空转两分钟。
+// 本机日志 58 次启动的分界线干净得吓人:Chrome/151 世代 52 次里成功 45 次;
+// Chrome/152 世代 6 次**全败**,清一色 connrefused。同一次启动里 CDP 9229 完全正常,
+// 只有 inspector 9329 连不上 —— 参数到了,Electron 自己没开。
 //
-// 等的和 `ensure_injection` 是**同一个 Codex 进程**开出来的两个端口
-// (CDP 9229 / 菜单 inspector 9329),没道理一个等 120 秒、一个只等 10 秒。
+// 所以「慢机器上 inspector 就绪得比 10 秒晚」这个旧判断是错的:151 上确实有启动
+// 竞态(attempt 1/2/3 就成),152 上则是永不监听,等多久都一样。把窗口从 10 秒
+// 拉到 120 秒对后者毫无用处,只是每次启动多空转 110 秒。**保持 10 秒**:够覆盖
+// 151 的竞态,又不会在 152 上白等。
 //
-// 线上实测(2026-09-05):20×500ms=10 秒的老配置下,6 台设备报重试失败、3 台跑到
-// 终态彻底失败,其中 desktop-61ac49b6… 这台**桥完全正常、只有菜单汉化挂了** ——
-// 说明不是 Codex 没起来,是慢机器上 inspector 就绪得比 10 秒晚。attempt 分布
-// (1/2/3/5/18 都有)也印证:多数机器重试几次就成,少数跑满。
-//
-// 拉长不花钱:这条路跑在 `tokio::spawn` 的后台任务里,不挡启动;失败日志已经按
-// 2 的幂次采样(120 次最多留 7 条)。
-const MENU_LOCALIZATION_RETRIES: usize = 120;
-const MENU_LOCALIZATION_RETRY_DELAY: Duration = Duration::from_secs(1);
+// 不下线功能:151 世代用户还能用,而这条路跑在 `tokio::spawn` 里不挡启动。
+// 等 151 彻底没人用了再摘。
+const MENU_LOCALIZATION_RETRIES: usize = 20;
+const MENU_LOCALIZATION_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 const MENU_LABEL_TRANSLATIONS: &[(&str, &str)] = &[
     ("File", "文件"),

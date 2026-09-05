@@ -524,9 +524,13 @@ fn start_native_menu_localizer(inspector_port: u16) {
                 serde_json::json!({
                     "inspector_port": inspector_port,
                     // 和 ensure_injection_exhausted / bridge.gave_up 一致:三条等 CDP
-                    // 的路都在终态留下端口证据,不然又要靠猜。这里尤其能证伪端口猜想 ——
-                    // inspector 端口(debug_port+100)通常在动态端口范围**之外**,
-                    // 真被占的概率很低,超时才是主因(所以这一版把 10 秒提到 120 秒)。
+                    // 的路都在终态留下端口证据,不然又要靠猜。
+                    //
+                    // 注意它**单独看不能定性**:端口空着同时匹配三种情况 ——
+                    // fuse 禁用了 `--inspect`(Codex 152+,见 native_menu.rs 开头)、
+                    // Codex 压根没起来、已有实例在跑(`launcher.already_running`,
+                    // 新参数根本没送进去)。要分清得配合同次启动的 `ensure_injection`
+                    // 是否成功一起看:CDP 通而 inspector 不通,才是 fuse 那种。
                     "inspector_port_free": crate::ports::can_bind_loopback_port(inspector_port),
                     "error": error.to_string()
                 }),
