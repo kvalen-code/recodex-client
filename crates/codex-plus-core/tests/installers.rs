@@ -115,37 +115,59 @@ fn macos_dmg_includes_applications_shortcut_for_drag_install() {
 
 #[test]
 fn companion_binary_path_resolves_macos_silent_app_next_to_manager_app() {
-    let manager_exe = std::path::Path::new(
-        "/Applications/ReCodex.app/Contents/MacOS/CodexPlusPlusManager",
-    );
+    // 原来直接写死 /Applications/…,而实现是靠 `.exists()` 挑文件的 —— 于是只有
+    // 「真装了 ReCodex 的 mac」才跑得过,别的机器一律红,等于常年没有这条守卫。
+    // 自己把 bundle 造出来,任何平台都能真正验到这段路径解析。
+    let macos_dir = macos_bundle_fixture(&["CodexPlusPlus", "CodexPlusPlusManager"]);
+    let manager_exe = macos_dir.path().join("CodexPlusPlusManager");
 
-    let companion = companion_binary_path_from_exe(manager_exe, SILENT_BINARY);
+    let companion = companion_binary_path_from_exe(&manager_exe, SILENT_BINARY);
 
-    assert_eq!(
-        companion,
-        std::path::PathBuf::from("/Applications/ReCodex.app/Contents/MacOS/CodexPlusPlus")
-    );
-    assert_ne!(
-        companion,
-        std::path::PathBuf::from(
-            "/Applications/ReCodex.app/Contents/MacOS/codex-plus-plus"
-        )
-    );
+    assert_eq!(companion, macos_dir.path().join("CodexPlusPlus"));
+    // sidecar 名(codex-plus-plus)不存在时不能拿它顶包:bundle 里真正能跑的是
+    // CodexPlusPlus,挑错了就是启动一个不存在的二进制。
+    assert_ne!(companion, macos_dir.path().join("codex-plus-plus"));
+}
+
+/// 造一个 `<tmp>/ReCodex.app/Contents/MacOS/` 并放进指定的可执行文件,
+/// 返回那个 MacOS 目录(持有 TempDir,出作用域才删)。
+fn macos_bundle_fixture(binaries: &[&str]) -> MacosBundleFixture {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let macos_dir = temp
+        .path()
+        .join("ReCodex.app")
+        .join("Contents")
+        .join("MacOS");
+    std::fs::create_dir_all(&macos_dir).expect("bundle dirs should be created");
+    for binary in binaries {
+        std::fs::write(macos_dir.join(binary), "").expect("bundle binary should be written");
+    }
+    MacosBundleFixture {
+        _temp: temp,
+        macos_dir,
+    }
+}
+
+struct MacosBundleFixture {
+    _temp: tempfile::TempDir,
+    macos_dir: std::path::PathBuf,
+}
+
+impl MacosBundleFixture {
+    fn path(&self) -> &std::path::Path {
+        &self.macos_dir
+    }
 }
 
 #[test]
 fn companion_binary_path_resolves_macos_manager_app_next_to_silent_app() {
-    let silent_exe = std::path::Path::new("/Applications/ReCodex.app/Contents/MacOS/CodexPlusPlus");
+    let macos_dir = macos_bundle_fixture(&["CodexPlusPlus", "CodexPlusPlusManager"]);
+    let silent_exe = macos_dir.path().join("CodexPlusPlus");
 
     let companion =
-        companion_binary_path_from_exe(silent_exe, codex_plus_core::install::MANAGER_BINARY);
+        companion_binary_path_from_exe(&silent_exe, codex_plus_core::install::MANAGER_BINARY);
 
-    assert_eq!(
-        companion,
-        std::path::PathBuf::from(
-            "/Applications/ReCodex.app/Contents/MacOS/CodexPlusPlusManager"
-        )
-    );
+    assert_eq!(companion, macos_dir.path().join("CodexPlusPlusManager"));
 }
 
 #[test]
