@@ -2241,34 +2241,38 @@ fn user_alert_is_off_unless_the_launcher_turns_it_on() {
     );
 }
 
-/// 菜单汉化和注入等的是**同一个 Codex 进程**开出来的两个端口,超时必须同量级。
+/// 菜单汉化的等待窗口**不该**跟注入看齐。
 ///
-/// 老配置是 20×500ms=10 秒,而注入等 120 秒 —— 12 倍差距。线上后果:6 台设备报
-/// 菜单重试失败、3 台彻底失败,其中一台**桥完全正常只有菜单挂了**,证明不是
-/// Codex 没起来,是慢机器上 inspector 就绪得比 10 秒晚。
+/// 这条原来断言的是「和 ensure_injection 同量级(≥60 秒)」,依据是「慢机器上
+/// inspector 就绪得比 10 秒晚」。那个判断已被证伪:菜单等的是 Electron 的
+/// **Node inspector**,而 Codex 152 起烧了 fuse `EnableNodeCliInspectArguments=0`,
+/// 那个端口**永远不会监听**,等多久都一样(实证见 native_menu.rs 开头)。
+/// 注入等的 CDP 端口则是真会起来的,两者没有可比性。
+///
+/// 现在守的是另一个不变量:窗口要够覆盖 151 世代的启动竞态(实测 attempt 1/2/3
+/// 就成),又不能在 152 上每次启动空转成分钟级。
 #[test]
-fn menu_localization_waits_as_long_as_injection_does() {
+fn menu_localization_gives_up_before_wasting_minutes() {
     let source = include_str!("../src/native_menu.rs");
-    let retries: usize = source
+    let retries: u64 = source
         .split_once("const MENU_LOCALIZATION_RETRIES: usize = ")
         .and_then(|(_, rest)| rest.split_once(';'))
         .and_then(|(value, _)| value.trim().parse().ok())
         .expect("读不到 MENU_LOCALIZATION_RETRIES");
-    let delay_secs: u64 = source
-        .split_once("const MENU_LOCALIZATION_RETRY_DELAY: Duration = Duration::from_secs(")
+    let delay_ms: u64 = source
+        .split_once("const MENU_LOCALIZATION_RETRY_DELAY: Duration = Duration::from_millis(")
         .and_then(|(_, rest)| rest.split_once(')'))
         .and_then(|(value, _)| value.trim().parse().ok())
-        .expect("读不到 MENU_LOCALIZATION_RETRY_DELAY(改成非整秒了?)");
+        .expect("读不到 MENU_LOCALIZATION_RETRY_DELAY(改成非毫秒了?)");
 
-    let budget = retries as u64 * delay_secs;
-    // ensure_injection 是 120 次 × 1 秒。菜单这边不必分毫不差,但不能再差一个量级。
+    let budget_ms = retries * delay_ms;
     assert!(
-        budget >= 60,
-        "菜单汉化只等 {budget} 秒,慢机器上 inspector 还没就绪就放弃了"
+        budget_ms >= 5_000,
+        "菜单汉化只等 {budget_ms}ms,盖不住 151 世代的启动竞态"
     );
     assert!(
-        budget <= 180,
-        "等 {budget} 秒太久:Codex 真不支持 inspector 时会空转这么长"
+        budget_ms <= 30_000,
+        "等 {budget_ms}ms 太久:152 上那个端口永远不会监听,这是纯空转"
     );
 }
 
