@@ -787,10 +787,12 @@ pub fn restore_auth() -> io::Result<()> {
 ///
 /// 光让测试改传空 env_key 修不掉:`officialmode` 还会自己调 `set_user_env`。
 /// 所以挡在**唯一那两个碰注册表的函数**里 —— 谁调都逃不掉。
-#[cfg(windows)]
+// 不加 cfg(windows):macOS 的 register_launchd / unregister_launchd 也要用它。
+// launchctl 写的是进程外的登录会话状态，和 Windows 的 setx 同属「HOME 重定向
+// 关不住」那一类，共用同一个沙箱开关才拦得住测试污染开发机。
+// 标成 windows-only 会让 macOS 构建直接编译不过（发布通道因此堵过一次）。
 const ENV_SANDBOX: &str = "RECODEX_ENV_SANDBOX";
 
-#[cfg(windows)]
 fn env_sandbox_path(name: &str) -> Option<PathBuf> {
     let dir = std::env::var_os(ENV_SANDBOX)?;
     Some(PathBuf::from(dir).join(format!("{name}.env")))
