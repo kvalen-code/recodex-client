@@ -360,6 +360,27 @@ pub fn activate_process_window(process_id: u32) -> bool {
     }
 }
 
+/// 图标一直贴不上时,把「卡在哪一步」说清楚。
+///
+/// 线上 3/6 台设备报 `launcher.window_icon.apply_failed`,而那条日志只有 pid 和
+/// 图标路径 —— 三台的安装路径各不相同,于是既排除不了路径,也说不出是窗口没出来
+/// 还是 pid 就不对。这三种情况的修法完全不一样:
+///   - 有窗口但一直不可见 → 是时序,该等更久;
+///   - 进程在、名下没有任何窗口 → pid 指的不是开窗口的那个进程
+///     (MSIX 打包应用的窗口常常挂在 ApplicationFrameHost 名下,这是最可疑的一条);
+///   - 进程都打不开 → pid 已经失效,和 `packaged_process_wait_failed_nonfatal`
+///     是同一个根因(线上确实是同一个 pid 同时报了这两条)。
+#[cfg(windows)]
+pub fn describe_window_lookup_failure(process_id: u32) -> &'static str {
+    if process_window(process_id, false).is_some() {
+        "window exists but never became visible"
+    } else if query_process_image_path(process_id).is_some() {
+        "process is alive but owns no window"
+    } else {
+        "process handle could not be opened (pid stale or access denied)"
+    }
+}
+
 #[cfg(windows)]
 pub fn apply_codexplusplus_icon_to_process_window(
     process_id: u32,
@@ -666,6 +687,26 @@ impl Drop for RegistryKeyGuard {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    /// 图标贴不上时那句诊断必须真的能分辨情况，否则和原来只报 pid 一样没用。
+    ///
+    /// 两种能在测试里造出来的极端各测一次：一个不可能存在的 pid，
+    /// 和当前这个活着但没有窗口的测试进程 —— 后者正是线上最可疑的那一类
+    /// (「进程在、名下没有窗口」指向窗口挂在别的进程名下)。
+    #[test]
+    fn window_lookup_failure_tells_a_dead_pid_from_a_windowless_one() {
+        // pid 0 是系统空闲进程，OpenProcess 一定失败 —— 代表「句柄打不开」那一类。
+        assert_eq!(
+            describe_window_lookup_failure(0),
+            "process handle could not be opened (pid stale or access denied)",
+        );
+
+        // 测试进程自己：活着，但没有任何窗口。
+        assert_eq!(
+            describe_window_lookup_failure(std::process::id()),
+            "process is alive but owns no window",
+        );
+    }
 
     #[test]
     fn application_window_outranks_titled_ime_and_tool_windows() {
