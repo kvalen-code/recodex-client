@@ -507,6 +507,21 @@ pub fn is_audio_transcriptions_proxy_path(path: &str) -> bool {
     )
 }
 
+/// 这条路径会不会带着用户的凭据打到上游、花掉用户的额度。
+///
+/// 单独聚合出来是给 helper 的跨源校验用的:这几条和 `/backend/status`、
+/// `/overlay/image` 那种只读本地状态的路径不是一个量级 —— 前者被外部网页调到
+/// 就是**直接烧钱**,后者最多泄漏一点本地信息。
+///
+/// 新增代理路径时必须同步加进来:漏一条,那条就是没有校验的后门。
+pub fn path_spends_upstream_credits(path: &str) -> bool {
+    is_responses_proxy_path(path)
+        || is_responses_compact_proxy_path(path)
+        || is_chat_completions_proxy_path(path)
+        || is_models_proxy_path(path)
+        || is_audio_transcriptions_proxy_path(path)
+}
+
 pub async fn open_responses_proxy_request(
     body: &str,
     original_user_agent: Option<&str>,
