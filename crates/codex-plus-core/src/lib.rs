@@ -31,6 +31,7 @@ pub mod status;
 pub mod uninstall; // recodex-overlay: 卸载流程
 pub mod update;
 pub mod upstream_worktree;
+pub mod user_alert; // recodex-overlay: 降级对用户可见
 pub mod user_scripts;
 pub mod version;
 pub mod vision;
@@ -60,6 +61,11 @@ pub fn windows_apply_codexplusplus_icon_to_process_window(
     icon_resource_path: std::path::PathBuf,
 ) -> bool {
     windows_integration::apply_codexplusplus_icon_to_process_window(process_id, icon_resource_path)
+}
+
+#[cfg(windows)]
+pub fn windows_describe_window_lookup_failure(process_id: u32) -> &'static str {
+    windows_integration::describe_window_lookup_failure(process_id)
 }
 
 #[cfg(windows)]
