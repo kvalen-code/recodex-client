@@ -4,6 +4,7 @@ pub mod desktop;
 pub mod installer_tag; // recodex-overlay: 读安装包上的代理站点标签
 pub mod officialmode; // recodex-overlay: 官方模式切换(可逆)
 pub mod credential;
+pub mod gateway_probe; // recodex-overlay: 在本机测网关延迟(服务端那份与用户无关)
 pub mod diagnostics_flush; // recodex-overlay: 本地诊断日志自动上报(启动失败/连不上也能看到)
 mod error;
 mod install_id;
@@ -623,12 +624,38 @@ impl<T: Transport> Adapter<T> {
 
     /// Tests server-authorized gateways immediately before selection. Stale
     /// latency values returned by the list endpoint are never used here.
+    /// 选最快的网关：服务端定**哪些可用**，本机定**哪个最快**。
+    ///
+    /// 以前整个流程都用服务端返回的 client_latency_ms，而那是 recodex-auth
+    /// (在香港)到网关的往返，与用户所在网络毫无关系 —— 线上后台显示新加坡
+    /// 30ms「最快」，国内实测却是 230ms、40% 丢包，日本只要 75ms。
+    /// 于是「用最快网关」把用户分到了对他最差的那条线上。
     pub fn use_fastest_gateway(&self) -> Result<Gateway, AdapterError> {
         let tested = self.test_gateways(&[])?;
-        let fastest = self
-            .fastest_gateway(&tested)
-            .ok_or_else(|| AdapterError::InvalidResponse("no healthy enabled gateway".into()))?;
-        self.select_gateway(&fastest.id)
+        let candidates: Vec<Gateway> = tested
+            .iter()
+            .filter(|g| g.enabled && !g.maintenance && g.healthy && !g.endpoint.trim().is_empty())
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return Err(AdapterError::InvalidResponse(
+                "no healthy enabled gateway".into(),
+            ));
+        }
+
+        let probes = gateway_probe::probe_gateways(&candidates);
+        let chosen = match gateway_probe::fastest_reachable(&probes) {
+            Some(probe) => probe.gateway.clone(),
+            // 本机一个都探不通(整体断网、或全被本地策略拦了)：退回服务端排序，
+            // 至少还能选出一个来，而不是直接报错让用户没得选。
+            None => self
+                .fastest_gateway(&candidates)
+                .ok_or_else(|| {
+                    AdapterError::InvalidResponse("no healthy enabled gateway".into())
+                })?
+                .clone(),
+        };
+        self.select_gateway(&chosen.id)
     }
 
     pub fn select_gateway(&self, id: &str) -> Result<Gateway, AdapterError> {
