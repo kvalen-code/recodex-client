@@ -1303,8 +1303,8 @@ impl LaunchHooks for ContextHooks {
         Ok(())
     }
 
-    async fn start_helper(&self, _helper_port: u16) -> anyhow::Result<()> {
-        Ok(())
+    async fn start_helper(&self, _helper_port: u16) -> anyhow::Result<u16> {
+        Ok(_helper_port)
     }
 
     async fn launch_codex(

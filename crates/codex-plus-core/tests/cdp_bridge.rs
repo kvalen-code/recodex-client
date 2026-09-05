@@ -65,8 +65,10 @@ fn injection_script_prefixes_helper_url_and_metadata() {
     assert!(!script.contains("window.__CODEX_PLUS_SPONSOR_IMAGES__"));
     assert!(script.contains("window.__CODEX_PLUS_VERSION__"));
     assert!(script.contains(codex_plus_core::version::VERSION));
-    assert!(script.contains("https://discord.gg/y96kX7A76v"));
-    assert!(script.contains("data-codex-plus-discord"));
+    // 去品牌是硬要求:上游的 Discord 入口不能出现在我们发出去的包里。
+    // 断言从「它在」翻成「它不在」—— 以后合上游把它带回来,这里当场报警。
+    assert!(!script.contains("discord.gg"));
+    assert!(!script.contains("data-codex-plus-discord"));
 }
 
 #[test]
@@ -75,7 +77,9 @@ fn pet_real_mouse_settings_are_gated_to_windows_in_injected_ui() {
 
     assert!(script.contains("codexPlusIsWindowsPlatform"));
     assert!(script.contains(r#"/\bWindows\b/i.test(navigator.userAgent || "")"#));
-    assert!(script.contains("codexPlusIsWindowsPlatform ? `<div"));
+    // 顶栏菜单整套已被 recodex-slim 下线,`codexPlusIsWindowsPlatform ? ` 那段
+    // 三元渲染随之消失 —— 开关搬到了悬浮面板。守面板侧的入口,别再守死掉的菜单。
+    assert!(script.contains("桌宠跟随真实鼠标"));
 }
 
 #[test]
@@ -541,20 +545,25 @@ fn injection_script_marks_diagnostic_build_and_reports_script_loaded() {
     assert!(script.contains("window.__CODEX_PLUS_BUILD__"));
     assert!(script.contains(codex_plus_core::assets::DIAGNOSTIC_BUILD_ID));
     assert!(script.contains("script_loaded"));
-    assert!(script.contains("data-codex-plus-build"));
+    // `data-codex-plus-build` 是挂在顶栏菜单上的 DOM 标记,菜单下线后它也没了。
+    // 遥测认的是 `window.__CODEX_PLUS_BUILD__`(上面两条已经守住),不受影响。
 }
 
 #[test]
-fn injection_script_fetches_ads_without_bridge() {
+/// 上游的广告位在 recodex-slim 里整套下线了。这条断言因此**整个翻过来**:
+/// 守的不再是「广告能拉到」,而是「广告一行都不许回来」—— 合上游时它是唯一
+/// 会当场拦住的东西。
+fn injection_script_ships_without_upstream_ads() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("directFetchCodexPlusAds"));
-    assert!(script.contains("cacheBustCodexPlusAdUrl"));
-    assert!(script.contains("Date.now()"));
-    assert!(script.contains("BigPizzaV3/Ad-List"));
-    assert!(
-        !script.contains("codexPlusAds = normalizeCodexPlusAds(await postJson(\"/ads\", {}));")
-    );
+    assert!(!script.contains("directFetchCodexPlusAds"));
+    assert!(!script.contains("cacheBustCodexPlusAdUrl"));
+    assert!(!script.contains("BigPizzaV3/Ad-List"));
+    assert!(!script.contains("normalizeCodexPlusAds"));
+    assert!(!script.contains("codexPlusAds"));
+    // recodex-slim 删广告时把这两个函数漏在了原地,零调用的死代码。
+    assert!(!script.contains("isCodexPlusAdExpired"));
+    assert!(!script.contains("CodexPlusAd"));
 }
 
 #[test]
@@ -572,15 +581,23 @@ fn injection_script_times_out_backend_bridge_calls_and_falls_back_to_helper() {
 fn injection_script_explains_plugin_patch_is_unneeded_in_relay_mode() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("兼容增强模式下无需开启"));
+    // 菜单下线后这句提示从菜单文案变成了开关上的 CSS ::after,文字也短了。
+    // 要守的是「relay 模式下用户看得到『不用开』」这件事,不是那串旧文案。
+    assert!(script.contains(r#"[data-relay-unneeded="true"]"#));
+    assert!(script.contains(r#"content: "无需开启""#));
+    // 判定本身:后端设置没到位、或 launchMode 是 relay,就算「无需开启」。
+    assert!(script.contains(r#"codexPlusBackendSettings.launchMode === "relay""#));
 }
 
 #[test]
 fn injection_script_menu_exposes_marketplace_plugin_switch_only() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("插件市场解锁"));
-    assert!(script.contains("data-codex-plus-setting=\"pluginMarketplaceUnlock\""));
+    // 开关搬到了悬浮面板,那里用 (后端键, 中文标签) 的元组声明,不再是
+    // `data-codex-plus-setting` 属性。守新写法,否定断言原样保留 —— 那几个
+    // 已经砍掉的入口,任何一个回来都要当场拦住。
+    assert!(script.contains(r#"["codexAppPluginMarketplaceUnlock", "插件市场解锁"]"#));
+    assert!(script.contains("pluginMarketplaceUnlock: \"codexAppPluginMarketplaceUnlock\""));
     assert!(!script.contains("特殊插件强制安装"));
     assert!(!script.contains("data-codex-plus-setting=\"forcePluginInstall\""));
     assert!(!script.contains("forcePluginInstall"));
@@ -592,16 +609,14 @@ fn injection_script_menu_exposes_marketplace_plugin_switch_only() {
 fn injection_script_defers_backend_mapped_toggles_until_settings_load() {
     let script = assets::injection_script(57321);
 
+    // 这批断言原来守的是**顶栏菜单**怎么把开关置灰,菜单整套已被 recodex-slim
+    // 下线,那几行渲染代码随之消失。剩下能守、也真正要守的是那份「哪些开关的
+    // 真值在后端」的映射本身 —— 少一项就会出现「本地显示开着、后端其实没开」。
     assert!(script.contains("const codexPlusBackendMappedSettings = new Set"));
-    assert!(
-        script
-            .contains("codexPlusBackendMappedSettings.has(key) && !codexPlusBackendSettingsLoaded")
-    );
-    assert!(script.contains("button.dataset.pending = String(waitsForBackend)"));
-    assert!(script.contains(
-        "button.disabled = waitsForBackend || button.dataset.relayUnneeded === \"true\""
-    ));
-    assert!(script.contains("toggle.disabled || toggle.dataset.pending === \"true\""));
+    assert!(script.contains("const codexPlusBackendSettingMap = {"));
+    assert!(script.contains("let codexPlusBackendSettingsLoaded = false"));
+    // 后端设置没回来之前不能把它当已加载 —— 否则会拿默认值去覆盖用户的真实开关。
+    assert!(script.contains("!codexPlusBackendSettingsLoaded"));
 }
 
 #[test]
@@ -976,7 +991,12 @@ const cases = {{
   chatGptKinds: chatGpt.marketplaceKinds,
   unrelatedErrorMatched: api.remoteAuthError({{ message: "network unavailable" }}),
 }};
-process.stdout.write(JSON.stringify(cases));
+// 必须显式退出:这个 harness `require` 的是**完整**注入脚本,它会注册
+// setInterval 之类的常驻定时器,node 的 event loop 因此永远不空 —— 不退的话
+// 子进程一直挂着,Command::output() 跟着无限等待,整个 cdp_bridge 目标就卡死在
+// 这一个用例上,它后面的测试一个都跑不到(表现是「跑全量测试十几分钟不出结果」)。
+// 用 write 的回调而不是裸 exit:stdout 是管道时是异步写,直接退会丢结果。
+process.stdout.write(JSON.stringify(cases), () => process.exit(0));
 "#,
         script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
             .expect("script path should serialize")
@@ -1043,8 +1063,9 @@ fn injection_script_exposes_sidebar_thread_id_badge_control() {
 
     assert!(script.contains("threadIdBadge: false"));
     assert!(script.contains("threadIdBadge: \"codexAppThreadIdBadge\""));
-    assert!(script.contains("会话 ID 标识"));
-    assert!(script.contains("data-codex-plus-setting=\"threadIdBadge\""));
+    // 开关本身搬到了悬浮面板(元组声明),菜单里的 data-codex-plus-setting 属性
+    // 已随菜单下线。功能实现仍在 renderer 侧,下面几条继续守着。
+    assert!(script.contains(r#"["codexAppThreadIdBadge", "会话 ID 标识"]"#));
     assert!(script.contains("codex-thread-id-badge"));
     assert!(script.contains("data-codex-thread-id-badge-wrap=\"true\""));
     assert!(script.contains("let threadIdBadgeActive = false"));

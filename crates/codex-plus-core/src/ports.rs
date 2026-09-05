@@ -96,6 +96,16 @@ pub fn select_packaged_codex_debug_port_with(
     }
 }
 
+/// 注意**非 Windows 上这里什么都不做** —— 直接把请求的端口原样返回。
+///
+/// 也就是说 mac 上 helper 端口永远是那个默认值,被占了这里也不会换。老代码在
+/// `start_helper` 里绑不上就 `?` 返回 Err,于是 mac 用户遇到端口冲突时增强功能
+/// 直接全挂、而且没有任何补救路径(Windows 至少还有下面这个探测,尽管它本身是
+/// TOCTOU 的)。
+///
+/// 现在 `start_helper` 改成「直接 bind、失败就退到 port 0」,两个平台都兜住了,
+/// 所以这里保持原样是安全的 —— 它至多让 Windows 少走一次 fallback。
+/// 真要动这个函数,先确认 `start_helper` 那层的兜底还在。
 pub fn select_platform_loopback_port_with(
     requested: u16,
     is_windows: bool,
