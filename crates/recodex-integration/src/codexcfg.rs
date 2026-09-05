@@ -10,6 +10,23 @@
 //!     rewrite: the user's other tables survive byte-for-byte);
 //!   - `~/.codex/auth.json` (backed up once so the original can be restored);
 //!   - the `RECODEX_KEY` user environment variable Codex reads the key from.
+//!
+//! ## 写进配置的东西按来源分三档信任(2026-09-05 排查后固化)
+//!
+//! 这个模块几乎全是**字符串拼接**写 TOML,没有序列化器兜底 —— 所以「这个值从哪
+//! 来」直接决定要不要校验:
+//!
+//!   1. **登录服务器下发的整块 config** —— 完全信任。服务端本来就控制客户端配置,
+//!      再校验也没意义(它想改什么都能改)。API base 那侧由
+//!      `persist_api_base_if_trusted` 把关。
+//!   2. **网关列表里的 endpoint** —— 半信任。同样出自 API base,但会被拼成
+//!      `base_url` 塞进托管块,所以过 `base_url_is_safe`。
+//!   3. **models manifest 里的 slug** —— **不信任**。manifest 是向**用户自选的网关**
+//!      要的,那一端不归我们管;而 slug 会被直接写成 `model = "..."`。
+//!      必须过 `model_name_is_safe`,否则一个带引号和换行的值就能再开一张
+//!      `[model_providers.*]` 表,把用户的对话全导走。
+//!
+//! 往这里加新的「写配置」路径时,先问清楚值是哪一档。
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -87,6 +104,29 @@ pub fn config_path() -> io::Result<PathBuf> {
 /// Path to `~/.codex/auth.json`.
 pub fn auth_path() -> io::Result<PathBuf> {
     Ok(codex_dir()?.join("auth.json"))
+}
+
+/// base_url 能不能安全地拼进托管块。
+///
+/// 和 `model_name_is_safe` 同一个道理:下面是纯字符串 `.replace()`,零转义。
+/// 一个含双引号或换行的 endpoint 就能在托管块里再开一张表,把 provider 改掉。
+/// endpoint 来自服务端下发的网关列表(API base 那侧有 persist_api_base_if_trusted
+/// 把关),风险低于 manifest 里的 slug —— 但这是同一类洞,一起堵。
+///
+/// 只认 http/https 且不含引号、换行、`#`、`?`:真实网关地址本来就长这样。
+///
+/// `?` 挡的不是注入,是**静默失效**:网关地址一路都在被拼接
+/// (`<endpoint>/backend-api/codex` 写进 config.toml、
+/// `<base>/api/cli/auth/portal-check?host=` 用于控制面探活)。
+/// endpoint 里带一个 `?`,后面拼的路径就全被吃进查询串 —— Codex 打向网关根路径、
+/// 探活永远失败,而两者都**不报错**,只是不工作。
+pub fn base_url_is_safe(base_url: &str) -> bool {
+    let base_url = base_url.trim();
+    (base_url.starts_with("https://") || base_url.starts_with("http://"))
+        && base_url.len() <= 512
+        && !base_url
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '"' | '\'' | '#' | '\\' | '?'))
 }
 
 /// Renders the sub2api managed block. `base_url` is the gateway root Codex talks
@@ -437,6 +477,139 @@ pub fn remove_block(content: &str) -> String {
     restored.trim_end_matches('\n').to_string() + if restored.ends_with('\n') { "\n" } else { "" }
 }
 
+/// 顶层 `model` 的托管标记。带这个标记的行是我们写的,可以更新;不带的是用户
+/// 自己选的,一个字不碰。
+const MANAGED_MODEL_MARK: &str = "# recodex-managed-model";
+
+/// 把顶层 `model` 设成 `model`,**仅当**这一行由我们托管、或者本来就没有这个键。
+///
+/// 为什么用行内注释做标记,而不是另开状态文件、也不塞进托管块:
+///   - 状态文件 = 同一份状态两个主人,理由同 `SAVED_PROVIDER_PREFIX`;
+///   - 塞进托管块会改变块体,而块体是 Go 与 Rust 两个写入方**逐字节比对**的共享语料
+///     (见 docs/recodex-client.md「两侧行为对照语料」)。为一个默认值去动那份契约
+///     不划算 —— 那块出过「顶层重复键导致整份 config.toml 解析失败」的事故。
+///
+/// 只在**第一个表头之前**查找与写入:`[profiles.work]` 里的 `model` 属于那张表,
+/// 分毫不能碰。理由与 `top_level_len` 上那段注释一致。
+///
+/// Codex++ 会重新序列化整份 config.toml 并丢掉注释。标记没了之后我们就再也不动
+/// 这一行,用户停在当时的模型上 —— 降级成「不再自动跟进」,而不是覆盖用户的选择。
+/// ponytail: 真要跨重新序列化保住托管关系,再上状态文件。
+pub fn set_managed_model(content: &str, model: &str) -> String {
+    let model = model.trim();
+    if !model_name_is_safe(model) {
+        return content.to_string();
+    }
+    let head_len = top_level_len(content);
+    let (head, tail) = content.split_at(head_len);
+
+    let mut out = String::with_capacity(content.len() + model.len() + 48);
+    let mut replaced = false;
+    let mut found_unmanaged = false;
+    for line in head.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if !replaced && !trimmed.starts_with('#') && model_value(trimmed).is_some() {
+            if line.contains(MANAGED_MODEL_MARK) {
+                out.push_str(&format!("model = \"{model}\" {MANAGED_MODEL_MARK}\n"));
+                replaced = true;
+                continue;
+            }
+            // 用户自己写的 model:原样保留,并且整份内容不做任何改动。
+            found_unmanaged = true;
+        }
+        out.push_str(line);
+    }
+    if found_unmanaged {
+        return content.to_string();
+    }
+    if !replaced {
+        // 没有这个键 —— 插在顶层区最前面。绝不追加到 EOF:顶层键落在最后一张表
+        // 之后,按 TOML 规则就属于那张表,等于没设置(与托管块同一个坑)。
+        out = format!("model = \"{model}\" {MANAGED_MODEL_MARK}\n{out}");
+    }
+    out.push_str(tail);
+    out
+}
+
+/// 模型名是否安全到可以直接拼进 `config.toml`。
+///
+/// **这个值来自网络** —— 上游 models manifest 里的 `slug`,而下面是
+/// `format!("model = ...")` 直接拼字符串,没有任何转义。一个含双引号和换行的
+/// slug 就能注入任意 TOML:让它以 `gpt-5` 加一个双引号结尾、后面接换行和一段
+/// `[model_providers.<名字>]` 表,写进去就等于给用户凭空加了一个 provider,
+/// 之后所有对话都发去攻击者那边。manifest 走 HTTPS,但**网关是用户可配的** ——
+/// 不能假设那一端可信。
+///
+/// (写这段注释时用多行代码块演示过那个 payload,结果它把 doc comment 撑破、
+///  真的变成了源码里的 TOML —— 这个漏洞的杀伤力不用再论证了。)
+///
+/// 放在这里而不是 `recommended_model`:这是所有写入的必经之路,守住这一处
+/// 就守住了全部调用方。真实模型名(gpt-5.6-sol / gpt-6-astra)本来就只用
+/// 字母数字和 `-` `.` `_`,这条限制不会误伤。
+fn model_name_is_safe(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 128
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+}
+
+/// 顶层 `model` 是否由我们托管 —— 带标记,或者压根还没有这个键。
+///
+/// 给调用方做**便宜的前置判断**用:用户自己写过 model 的机器,直接跳过,
+/// 连拉 manifest 的网络请求都不发。
+pub fn model_is_managed(content: &str) -> bool {
+    let head = &content[..top_level_len(content)];
+    match head
+        .split_inclusive('\n')
+        .find(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#') && model_value(trimmed).is_some()
+        }) {
+        Some(line) => line.contains(MANAGED_MODEL_MARK),
+        None => true,
+    }
+}
+
+/// 把顶层 `model` 更新成 `model` 并落盘。返回是否真的写了。
+///
+/// 内容没变就不写 —— 每次启动都重写一遍 config.toml 会无谓地动用户文件的 mtime,
+/// 也给「谁改了我的配置」这类排查添噪音。
+pub fn apply_managed_model(model: &str) -> io::Result<bool> {
+    let path = config_path()?;
+    let current = read_or_empty(&path)?;
+    let next = set_managed_model(&current, model);
+    if next == current {
+        return Ok(false);
+    }
+    write_atomic(&path, next.as_bytes())?;
+    Ok(true)
+}
+
+/// 顶层 `model` 这一行当前的值(不含引号);没有该键时返回 None。
+pub fn managed_model(content: &str) -> Option<String> {
+    content[..top_level_len(content)]
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| !line.starts_with('#'))
+        .find_map(model_value)
+        .map(str::to_string)
+}
+
+/// 解析一行顶层 `model = "x"`,返回去引号的值。
+/// 只认这个精确的键:`model_provider`、`model_providers`、`model_reasoning_effort`
+/// 都不匹配 —— 它们在 "model" 之后跟的是 `_`,不是 `=`。
+fn model_value(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("model")?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim();
+    // 去掉行尾注释再剥引号,否则 `"x" # mark` 会被当成值的一部分。
+    let rest = match rest.strip_prefix('"') {
+        Some(after) => &after[..after.find('"')?],
+        None => rest.split('#').next()?.trim(),
+    };
+    Some(rest)
+}
+
 fn read_or_empty(path: &Path) -> io::Result<String> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(text),
@@ -740,6 +913,15 @@ pub fn refresh_key_env_from_user_scope() -> bool {
         let Some(stored) = mac_env::load(SUB2API_ENV_KEY) else {
             return false;
         };
+        // 存量用户补丁,必须在下面那个早退**之前**。
+        //
+        // launchd 那条路是这一版才加的:在此之前登录过的 mac,0600 文件里有 key,
+        // 但 `~/Library/LaunchAgents` 下什么都没有 —— 他们从 Dock / 访达点开
+        // Codex.app 照样 401(线上 24h 内 5005 次)。光升级客户端救不了他们,
+        // 得等他们自己想到「重新登录一次」才会补上,而没人会想到。
+        //
+        // 所以这里发现缺 LaunchAgent 就当场补一次,让**升级本身**把人救回来。
+        mac_env::ensure_launchd_registered(SUB2API_ENV_KEY, &stored);
         if std::env::var(SUB2API_ENV_KEY).ok().as_deref() == Some(stored.as_str()) {
             return false;
         }
@@ -751,6 +933,88 @@ pub fn refresh_key_env_from_user_scope() -> bool {
     {
         false
     }
+}
+
+/// macOS LaunchAgent 的文件名/Label。一个变量一个 agent。
+///
+/// `name` 只会是 `RECODEX_KEY` 这种合法环境变量名(字母数字下划线),
+/// 拼进文件名安全。
+pub(crate) fn macos_launch_agent_label(name: &str) -> String {
+    format!("ai.recodex.env.{name}")
+}
+
+/// 登录时重新 `launchctl setenv` 的 LaunchAgent。
+///
+/// **为什么必须有它**:mac 上 0600 文件里的 key 只有走 ReCodex 启动器才会被
+/// `refresh_key_env_from_user_scope` 读回进程环境。用户从 Dock / 访达 / 聚焦
+/// 直接点开 Codex.app 时,父进程是 launchd —— 环境里根本没有 `RECODEX_KEY`,
+/// 直接 401。线上 24h 内 5005 次 macOS 401 就是这么来的(占全部 401 的 86%)。
+/// 把变量交给 launchd 之后,无论从哪里启动都读得到。
+///
+/// **两个用户可见面,别当成实现细节**:
+///
+/// 1. macOS Ventura 起,`~/Library/LaunchAgents/` 下的东西会出现在
+///    「系统设置 → 通用 → 登录项 → 允许在后台」里,首次还会弹一条系统通知。
+///    用户会看到一个自己没主动装的后台项目 —— Label 里带 `recodex` 就是为了
+///    让他至少认得出是谁的。
+/// 2. 用户可以在那里**把它关掉**。文件还在(所以 `ensure_launchd_registered`
+///    不会重建),但登录时不再执行 —— 从 Dock 启动的 Codex 又读不到 key 了。
+///    这个状态**客户端自己检测不到**。两条信号只能间接看出来:走启动器时
+///    `launcher.recodex_key_refreshed_from_user_scope` 会触发(进程环境里没有 key
+///    = launchd 那条路没生效);完全不走启动器的用户则只剩服务端 nginx 上的 401 ——
+///    那正是这次修复要压下去的数字,压不下去就说明这条路被绕开了。
+///
+/// 为什么还是要用 LaunchAgent:只靠 launcher 启动时 `launchctl setenv` 覆盖不了
+/// 「重启之后用户直接从 Dock 点 Codex.app」那一次 —— 而那恰恰是要修的场景本身。
+///
+/// 放在 `cfg(target_os)` **之外**:纯文本构造,非 mac 机器也要能跑它的转义测试。
+pub(crate) fn macos_launch_agent_plist(name: &str, value: &str) -> String {
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
+    out.push_str("<plist version=\"1.0\">\n<dict>\n");
+    out.push_str(&format!(
+        "\t<key>Label</key>\n\t<string>{}</string>\n",
+        escape_xml(&macos_launch_agent_label(name))
+    ));
+    out.push_str("\t<key>ProgramArguments</key>\n\t<array>\n");
+    for arg in ["/bin/launchctl", "setenv", name, value] {
+        out.push_str(&format!("\t\t<string>{}</string>\n", escape_xml(arg)));
+    }
+    out.push_str("\t</array>\n");
+    out.push_str("\t<key>RunAtLoad</key>\n\t<true/>\n");
+    out.push_str("</dict>\n</plist>\n");
+    out
+}
+
+/// LaunchAgent 在用户家目录下的落点。
+///
+/// 和 label / plist 一样放在 `cfg(target_os)` **之外**:mac 专属的那段代码在
+/// Windows 上根本不参与编译,写错了要到 mac 构建时才炸。能抽出来的纯逻辑就抽出来,
+/// 让它在**任何**平台上都被编译和测试覆盖到,cfg 里只剩最直白的 fs / Command 调用。
+///
+/// 路径本身还是跨语言契约的一部分 —— Go 侧 internal/clientcfg 写的是同一个文件。
+pub(crate) fn macos_launch_agent_path_in(home: &Path, name: &str) -> PathBuf {
+    home.join("Library")
+        .join("LaunchAgents")
+        .join(format!("{}.plist", macos_launch_agent_label(name)))
+}
+
+/// key 里出现 `&` 或 `<` 而不转义,plist 就是非法 XML,launchd 会**静默**跳过它。
+/// 表现是「重启之后又 401 了」,没有任何报错可查。
+fn escape_xml(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// mac 侧「用户级环境变量」的替身。Windows 有 setx+注册表,mac 没有对应物。
@@ -801,6 +1065,113 @@ mod mac_env {
         let text = text.trim().to_owned();
         (!text.is_empty()).then_some(text)
     }
+
+    fn launch_agent_path(name: &str) -> io::Result<PathBuf> {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME 未设置"))?;
+        Ok(super::macos_launch_agent_path_in(
+            std::path::Path::new(&home),
+            name,
+        ))
+    }
+
+    /// 把变量交给 launchd,这样从 Dock / 访达 / 聚焦启动的 Codex.app 也读得到。
+    ///
+    /// 两步缺一不可:`setenv` 管**当前登录会话**(不用注销重登),
+    /// LaunchAgent 管**下次开机**(setenv 活不过重启)。
+    pub(super) fn register_launchd(name: &str, value: &str) -> io::Result<()> {
+        // launchctl 写的是**进程外**的登录会话状态,HOME 重定向关不住它 ——
+        // 和 Windows 的 setx 同一类风险,所以共用同一个沙箱开关。
+        if super::env_sandbox_path(name).is_some() {
+            return Ok(());
+        }
+        let path = launch_agent_path(name)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // 原子写,而且**权限要在 rename 之前定好**。
+        //
+        // 两个理由叠在一起:
+        //   - 原子:换发 key 时若让 launchd 撞见半个 plist,它会当成非法 XML
+        //     静默跳过,表现又是「重启之后 401」;
+        //   - 先 chmod 再 rename:反过来的话,从 rename 到 chmod 之间这份含**明文
+        //     长期凭据**的 plist 是默认的 0644(~/Library/LaunchAgents 就是 0644)。
+        //     Go 侧 internal/clientcfg 的 writeFileAtomic 正是先 chmod tmp 再 rename,
+        //     两个实现写的是同一个文件,权限保证必须对齐,不能一边严一边松。
+        //
+        // tmp 名带 pid:同一台机器上 CLI 和桌面端可能同时走到这里。
+        let tmp = path.with_file_name(format!(
+            "{}.{}.tmp",
+            super::macos_launch_agent_label(name),
+            std::process::id()
+        ));
+        debug_assert_eq!(tmp.parent(), path.parent(), "tmp 必须和目标同目录才能 rename");
+        fs::write(&tmp, super::macos_launch_agent_plist(name, value).as_bytes())?;
+        if let Err(error) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+            .and_then(|()| fs::rename(&tmp, &path))
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        // 不做 launchctl load:agent 会在下次登录被 launchd 自动扫到,
+        // 本次会话已由下面这行 setenv 覆盖。
+        run_launchctl(&["setenv", name, value])
+    }
+
+    /// 只补**缺失**的那次注册,已经有 LaunchAgent 就什么都不做。
+    ///
+    /// 给存量用户用:1.2.66 及以前登录过的机器只有 0600 文件、没有 LaunchAgent。
+    /// 每次启动都重写会白白动文件 mtime,给「谁改了我的配置」这类排查添噪音;
+    /// 内容过期由 `set_user_env` 在登录/换发时负责更新,不归这里管。
+    ///
+    /// 全程 best-effort:这是顺手的修补,失败不该影响启动。
+    pub(super) fn ensure_launchd_registered(name: &str, value: &str) {
+        if super::env_sandbox_path(name).is_some() {
+            return;
+        }
+        let Ok(path) = launch_agent_path(name) else {
+            return;
+        };
+        if path.exists() {
+            return;
+        }
+        let _ = register_launchd(name, value);
+    }
+
+    /// 撤销 `register_launchd`。两步都要做:漏掉 plist,下次登录会把已作废的 key
+    /// 又 setenv 回去。
+    pub(super) fn unregister_launchd(name: &str) -> io::Result<()> {
+        if super::env_sandbox_path(name).is_some() {
+            return Ok(());
+        }
+        let mut first_error = None;
+        if let Ok(path) = launch_agent_path(name) {
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match run_launchctl(&["unsetenv", name]) {
+            Ok(()) => first_error.map_or(Ok(()), Err),
+            Err(error) => Err(first_error.unwrap_or(error)),
+        }
+    }
+
+    fn run_launchctl(args: &[&str]) -> io::Result<()> {
+        let status = std::process::Command::new("launchctl").args(args).status()?;
+        if status.success() {
+            return Ok(());
+        }
+        // 只回操作名和变量名,**绝不**把 args 整个拼进去 —— `setenv` 的第三个参数
+        // 就是明文 API key。现在调用方都把这个错误吞掉了,可它一旦被谁记进日志
+        // 或抛给用户,密钥就跟着出去了。错误信息里不该出现密钥,哪怕暂时没人看。
+        let operation = args.first().copied().unwrap_or("?");
+        let name = args.get(1).copied().unwrap_or("?");
+        Err(io::Error::other(format!(
+            "launchctl {operation} {name} 失败: {status}"
+        )))
+    }
 }
 
 /// Persists `name=value` to the user environment so a freshly launched Codex can
@@ -817,9 +1188,16 @@ pub fn set_user_env(name: &str, value: &str) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        // mac 没有 setx/注册表这一层。这个值是 sub2api 的 API key —— 是**密钥**,
-        // 所以落钥匙串,而不是往 ~/.zshrc 或明文文件里写。
-        return mac_env::save(name, value);
+        // mac 没有 setx/注册表这一层,用 0600 文件顶替。
+        mac_env::save(name, value)?;
+        // 光有文件不够:它只有走 ReCodex 启动器时才会被 refresh_key_env_from_user_scope
+        // 读回来。用户从 Dock / 访达直接点 Codex.app 时父进程是 launchd,环境里
+        // 什么都没有 —— 线上 5005 次 macOS 401 的来源。所以再交给 launchd 一份。
+        //
+        // best-effort:失败不能让登录失败。config.toml 和 0600 文件都已经写好了,
+        // 半途 abort 只会留下更糟的半套状态;走启动器这条路仍然可用。
+        let _ = mac_env::register_launchd(name, value);
+        return Ok(());
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -839,8 +1217,11 @@ pub fn unset_user_env(name: &str) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        // 钥匙串能真删,不像 setx 只能置空
-        return mac_env::clear(name);
+        // 文件能真删,不像 setx 只能置空
+        let cleared = mac_env::clear(name);
+        // 即使删文件失败也要撤 launchd,否则下次登录会把已注销的 key 又设回来。
+        let _ = mac_env::unregister_launchd(name);
+        return cleared;
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -873,6 +1254,12 @@ pub fn apply_login(
 /// gateway's `/backend-api/codex` root). This is the step the desktop was missing
 /// — selecting a gateway now actually routes Codex through it.
 pub fn route_through_gateway(codex_base_url: &str) -> io::Result<()> {
+    if !base_url_is_safe(codex_base_url) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "网关地址含有不能写进配置的字符",
+        ));
+    }
     apply_config(&render_sub2api_block(codex_base_url))
 }
 
@@ -888,8 +1275,68 @@ pub fn restore_all() -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// 自诊断拿托管块里的 base_url 去问网关 —— 读错了就会去探错地方,
-    /// 把「网关连不上」报成「凭据失效」。用户自己的 base_url 不能被读成我们的。
+    /// plist 必须是合法 XML。key 里出现 `&` 或 `<` 而不转义,launchd 会**静默**
+    /// 跳过这个 agent —— 用户看到的是「重启之后又 401 了」,查无可查。
+    #[test]
+    fn launch_agent_plist_escapes_xml_specials() {
+        let plist = macos_launch_agent_plist(SUB2API_ENV_KEY, "sk-a&b<c>\"d\"");
+
+        assert!(
+            !plist.contains("sk-a&b<c>"),
+            "值没转义就塞进 XML 了:\n{plist}"
+        );
+        assert!(plist.contains("sk-a&amp;b&lt;c&gt;&quot;d&quot;"), "{plist}");
+        assert!(plist.contains(&format!(
+            "<string>{}</string>",
+            macos_launch_agent_label(SUB2API_ENV_KEY)
+        )));
+        // 少了 RunAtLoad,agent 登录时不会跑,重启后 key 就没了 —— 正是要修的病。
+        assert!(plist.contains("<key>RunAtLoad</key>"), "{plist}");
+        assert!(plist.contains("<true/>"), "{plist}");
+        // 参数顺序错了 launchctl 会静默不设值。
+        assert!(
+            plist.contains("<string>/bin/launchctl</string>")
+                && plist.contains("<string>setenv</string>")
+                && plist.contains(&format!("<string>{SUB2API_ENV_KEY}</string>")),
+            "{plist}"
+        );
+    }
+
+    /// 落点必须和 Go 侧(internal/clientcfg/envvar_macos.go)逐段一致 ——
+    /// 两个实现写的是**同一个文件**,路径漂了就变成两个 agent:
+    /// 一个设 key 一个不设,登录时谁后跑谁说了算,表现是「有时候能用有时候 401」。
+    #[test]
+    fn launch_agent_path_lands_in_the_user_launchagents_dir() {
+        let home = std::path::Path::new("/Users/tester");
+        let path = macos_launch_agent_path_in(home, SUB2API_ENV_KEY);
+
+        assert!(path.starts_with(home));
+        assert_eq!(
+            path.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("LaunchAgents"))
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("Library"))
+        );
+        assert_eq!(
+            path.file_name(),
+            Some(std::ffi::OsStr::new(&format!(
+                "ai.recodex.env.{SUB2API_ENV_KEY}.plist"
+            )[..]))
+        );
+    }
+
+    #[test]
+    fn launch_agent_label_is_namespaced_per_variable() {
+        assert_eq!(
+            macos_launch_agent_label(SUB2API_ENV_KEY),
+            format!("ai.recodex.env.{SUB2API_ENV_KEY}")
+        );
+    }
+
     #[test]
     fn managed_base_url_reads_the_block_and_only_the_block() {
         let block = render_sub2api_block("https://sg.gw.recodex.dev/backend-api/codex");
@@ -1003,5 +1450,181 @@ mod tests {
         assert_eq!(poll.auth_json, "{\"k\":1}");
         assert_eq!(poll.env_key, "RECODEX_KEY");
         assert_eq!(poll.env_value, "sk-secret");
+    }
+
+    // ---- 顶层 model 托管 -------------------------------------------------
+    // 契约:只碰带标记的行;用户自己的 model 一个字不动;绝不产生重复键;
+    // 绝不碰 [profiles.x] 里的同名键。
+
+    #[test]
+    fn managed_model_inserts_when_absent() {
+        let out = set_managed_model("model_provider = \"recodex\"
+", "gpt-6-astra");
+        assert!(out.starts_with("model = \"gpt-6-astra\" # recodex-managed-model
+"));
+        assert!(out.contains("model_provider = \"recodex\""));
+        assert_eq!(managed_model(&out).as_deref(), Some("gpt-6-astra"));
+    }
+
+    #[test]
+    fn managed_model_updates_its_own_line() {
+        let base = set_managed_model("", "gpt-5.6-sol");
+        let out = set_managed_model(&base, "gpt-6-astra");
+        assert_eq!(managed_model(&out).as_deref(), Some("gpt-6-astra"));
+        // 只能有一行 model,重复顶层键会让整份 config.toml 解析失败。
+        assert_eq!(out.matches("model = ").count(), 1);
+    }
+
+    #[test]
+    fn managed_model_never_touches_a_user_owned_model() {
+        let base = "model = \"gpt-5.6-terra\"
+model_provider = \"recodex\"
+";
+        assert_eq!(set_managed_model(base, "gpt-6-astra"), base);
+    }
+
+    #[test]
+    fn managed_model_is_idempotent() {
+        let once = set_managed_model("", "gpt-6-astra");
+        assert_eq!(set_managed_model(&once, "gpt-6-astra"), once);
+    }
+
+    #[test]
+    fn managed_model_ignores_keys_inside_tables() {
+        // [profiles.work] 里的 model 属于那张表,不是顶层键 —— 碰它就是改用户的 profile。
+        let base = "model_provider = \"recodex\"
+
+[profiles.work]
+model = \"gpt-5.5\"
+";
+        let out = set_managed_model(base, "gpt-6-astra");
+        assert!(out.contains("[profiles.work]
+model = \"gpt-5.5\""));
+        assert!(out.starts_with("model = \"gpt-6-astra\" # recodex-managed-model
+"));
+        assert_eq!(out.matches("model = ").count(), 2); // 顶层一行 + profile 里那行
+    }
+
+    #[test]
+    fn managed_model_does_not_confuse_similar_keys() {
+        // model_provider / model_providers / model_reasoning_effort 都不是 model。
+        let base = "model_provider = \"recodex\"
+model_reasoning_effort = \"high\"
+";
+        let out = set_managed_model(base, "gpt-6-astra");
+        assert!(out.contains("model_reasoning_effort = \"high\""));
+        assert_eq!(managed_model(&out).as_deref(), Some("gpt-6-astra"));
+    }
+
+    /// 模型名来自**网络**(上游 manifest 的 slug),而写入是纯字符串拼接。
+    /// 不校验的话,一个带双引号和换行的 slug 就能往用户的 config.toml 里注入
+    /// 任意 TOML —— 比如凭空加一个 provider,把所有对话导去别处。
+    /// 网关地址同样来自服务端,同样是纯字符串拼进托管块。
+    ///
+    /// 顺序也要对:校验必须排在 `stage_config_for_return` 之前,不然被注入的块
+    /// 已经进了官方模式快照,切回 ReCodex 时照样生效。
+    #[test]
+    fn gateway_url_refuses_anything_that_could_break_out_of_the_block() {
+        let quote = '"';
+
+        for good in [
+            "https://sg.gw.recodex.dev/backend-api/codex",
+            "http://127.0.0.1:8080/backend-api/codex",
+        ] {
+            assert!(base_url_is_safe(good), "{good} 被误挡了");
+        }
+
+        for bad in [
+            &format!("https://ok.dev{quote}
+[model_providers.evil]
+base_url = {quote}https://evil.dev"),
+            "https://ok.dev
+[x]",
+            &format!("https://ok.dev{quote}"),
+            "https://ok.dev # 注释",
+            "https://ok.dev\\x",
+            "ftp://ok.dev",
+            "javascript:alert(1)",
+            "",
+            "   ",
+            // `?` 不是注入,是静默失效:这个地址后面还要被拼上 /backend-api/codex,
+            // 拼完成了 https://ok.dev/?x=1/backend-api/codex —— 路径整段被吃进查询串,
+            // Codex 打向网关根路径且不报错。Go 侧 BaseURLIsSafe 同步拒。
+            "https://ok.dev/?x=1",
+            "https://ok.dev?",
+        ] {
+            assert!(!base_url_is_safe(bad), "{bad:?} 不该被接受");
+        }
+        assert!(!base_url_is_safe(&format!("https://{}", "a".repeat(600))));
+    }
+
+    #[test]
+    fn managed_model_refuses_names_that_could_inject_toml() {
+        let base = "model = \"old\" # recodex-managed-model
+";
+        let quote = '"';
+
+        // 关掉引号再另起一段表 —— 最直接的注入。
+        let injection = format!("gpt-5{quote}
+[model_providers.evil]
+base_url = {quote}https://evil.example{quote}
+name = {quote}x");
+        assert_eq!(set_managed_model(base, &injection), base, "注入串被写进去了");
+
+        // 单独的换行、引号、`#`、方括号、空格,一个都不能放行。
+        for bad in [
+            "gpt-5
+evil = 1",
+            &format!("gpt{quote}5"),
+            "gpt-5 # 注释",
+            "[table]",
+            "gpt 5",
+            "gpt	5",
+            &"g".repeat(129),
+            "",
+        ] {
+            assert_eq!(set_managed_model(base, bad), base, "{bad:?} 不该被接受");
+        }
+
+        // 真实模型名必须照常工作 —— 校验不能误伤。
+        for good in ["gpt-5.6-sol", "gpt-6-astra", "codex_auto_review", "o3"] {
+            assert!(
+                set_managed_model(base, good).contains(&format!("model = {quote}{good}{quote}")),
+                "{good} 被误挡了"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_model_ignores_empty_recommendation() {
+        // 拿不到推荐值时保持现状,绝不能把用户的 model 写没了。
+        let base = "model = \"gpt-5.6-sol\"
+";
+        assert_eq!(set_managed_model(base, ""), base);
+        assert_eq!(set_managed_model(base, "   "), base);
+    }
+
+    #[test]
+    fn model_is_managed_gates_the_network_call() {
+        assert!(model_is_managed(""));                                  // 还没有这个键
+        assert!(model_is_managed(&set_managed_model("", "gpt-5.6-sol"))); // 我们写的
+        assert!(!model_is_managed("model = \"gpt-5.6-terra\"
+"));      // 用户自己写的
+        // [profiles.x] 里的 model 不是顶层键,不该让我们误判成「用户接管了」。
+        assert!(model_is_managed("model_provider = \"recodex\"
+[profiles.work]
+model = \"gpt-5.5\"
+"));
+    }
+
+    #[test]
+    fn managed_model_survives_a_commented_out_model_line() {
+        // 注释掉的 model 不算数,应当照常插入我们的托管行。
+        let base = "# model = \"gpt-5.5\"
+";
+        let out = set_managed_model(base, "gpt-6-astra");
+        assert!(out.starts_with("model = \"gpt-6-astra\" # recodex-managed-model
+"));
+        assert!(out.contains("# model = \"gpt-5.5\""));
     }
 }
