@@ -658,6 +658,14 @@ fn parse_model_payload(payload: &Value) -> Vec<String> {
     let Some(object) = payload.as_object() else {
         return Vec::new();
     };
+    // Codex 的 models manifest 用 `slug`,不是 `id`/`model`/`name` —— 下面那圈通用
+    // 解析对它一个都取不出来(网关返回的就是这个形状,表现是模型列表为空)。
+    // 直接复用本地 model_catalog_json 那套:它认 slug,还顺带按 visibility 过滤掉
+    // `hide` 的条目(gpt-reserve、codex-auto-review 不该出现在选择器里)。
+    let manifest = parse_model_catalog_json_models(payload);
+    if !manifest.is_empty() {
+        return manifest;
+    }
     for key in ["data", "models", "items"] {
         if let Some(value) = object.get(key) {
             let nested = parse_model_payload(value);
@@ -757,6 +765,117 @@ fn parse_model_catalog_json_models(payload: &Value) -> Vec<String> {
         .filter(|slug| !slug.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// 取当前 `config.toml` 指向的 provider 的 models manifest,算出推荐模型。
+///
+/// 单开一个入口而不是把 `client_version` 串进 `read_codex_model_catalog_from_home`:
+/// 那条链上有两个 `fetch_models_from_source` 调用点和一串签名,而这件事只有写
+/// config.toml 时才用得上,不值得为它改动正在发版的公共路径。
+///
+/// 任何一步取不到都返回 `None`,由调用方**保持现状** —— 宁可让用户停在旧模型上,
+/// 也不能因为一次网络抖动把他的 `model` 改掉或写没了。
+pub async fn recommended_model_for_home(
+    home: &Path,
+    env: &HashMap<String, String>,
+    client_version: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    // 自带客户端而不是让调用方传:launcher 不依赖 reqwest,为这一件事给它加一个
+    // 传递依赖不值当。超时必须有 —— 这段跑在启动路径上,不能被慢网络拖住。
+    let client = reqwest::Client::builder()
+        .user_agent("CodexPlusPlus/1.0")
+        .timeout(timeout)
+        .build()
+        .ok()?;
+    let config_path = home.join("config.toml");
+    let auth_api_key = read_codex_auth_api_key(&home.join("auth.json"));
+    let (config, effective, error) = load_codex_config(&config_path);
+    // "missing" = 还没有 config.toml,不算错;其余解析错误就别猜了。
+    if error.as_deref().is_some_and(|error| error != "missing") {
+        return None;
+    }
+    let source = model_source_from_config(&config, &effective, env, &auth_api_key)?;
+    let endpoint = models_endpoint(&source.base_url);
+    if endpoint.is_empty() {
+        return None;
+    }
+    let mut request = client
+        .get(&endpoint)
+        .header(reqwest::header::ACCEPT, "application/json");
+    if !source.api_key.is_empty() {
+        request = request.bearer_auth(&source.api_key);
+    }
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let payload = response.json::<Value>().await.ok()?;
+    recommended_model(&payload, client_version)
+}
+
+/// 从 Codex models manifest 里选出「推荐模型」。
+///
+/// 规则**全部来自 manifest 自身**,我们不维护任何模型清单 —— 上游上新模型时它自带
+/// `priority = 1`,客户端下次刷新就跟上,不用改配置、不用发版、不用有人盯着:
+///
+///   - `visibility != "list"` 或 `supported_in_api == false` 的排除。
+///     `gpt-reserve`(hide)、`codex-auto-review`(hide)不该出现在选择器里。
+///   - `minimal_client_version` 高于本机 codex 版本的排除 —— 推荐一个本地跑不动的
+///     模型比不推荐更糟。`gpt-6-astra` 标的就是 `0.153.0`,与实测门槛一致。
+///   - 余下按 `priority` 升序取第一个(astra = 1,gpt-5.6-sol = 6)。并列时取 manifest
+///     里靠前的那个(`min_by_key` 对相等元素返回第一个)。
+///
+/// **档位不用我们判断**:manifest 是上游按**该账号的实际权限**裁剪后下发的,
+/// Plus 号的列表里根本没有 astra,所以 Plus 用户自然落到 gpt-5.6-sol。
+///
+/// `client_version` 解析不出来时不做版本过滤 —— responses 端点本身并不校验版本
+/// (实测 `codex_cli_rs/0.60.0` 一样能调 astra),版本只影响 manifest 里给不给看,
+/// 所以宁可多给一个选项,也不要因为版本号认不出来把用户卡在旧模型上。
+pub fn recommended_model(payload: &Value, client_version: &str) -> Option<String> {
+    let models = payload.get("models").and_then(Value::as_array)?;
+    let client = crate::update::parse_version_tag(client_version).ok();
+    models
+        .iter()
+        .filter(|model| catalog_model_visible_in_api(model))
+        .filter(|model| client_supports_model(model, client.as_deref()))
+        .filter_map(|model| {
+            let slug = model.get("slug").and_then(Value::as_str)?.trim();
+            if slug.is_empty() {
+                return None;
+            }
+            // priority 缺失的排到最后,而不是当成 0 抢占第一。
+            let priority = model
+                .get("priority")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            Some((priority, slug.to_string()))
+        })
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, slug)| slug)
+}
+
+/// 本机 codex 版本是否满足这个模型的 `minimal_client_version`。
+fn client_supports_model(model: &Value, client: Option<&[u64]>) -> bool {
+    let Some(minimum) = model.get("minimal_client_version").and_then(Value::as_str) else {
+        return true;
+    };
+    let minimum = minimum.trim();
+    if minimum.is_empty() {
+        return true;
+    }
+    let Ok(minimum) = crate::update::parse_version_tag(minimum) else {
+        return true;
+    };
+    let Some(client) = client else {
+        return true;
+    };
+    let len = client.len().max(minimum.len());
+    let mut left = client.to_vec();
+    left.resize(len, 0);
+    let mut right = minimum;
+    right.resize(len, 0);
+    left >= right
 }
 
 fn catalog_model_visible_in_api(model: &Value) -> bool {
