@@ -5,6 +5,13 @@ on:
     branches: [main]
     paths:
       - "crates/recodex-integration/**"
+      # 出货的 launcher 同样依赖 codex-plus-core:2026-09-05 只改 core 的那次推送
+      # 因为不在这个名单里,一次 mac 校验都没跑。堵过发布通道的那批跨文件依赖
+      # 恰恰住在 core 和 launcher 里。
+      - "crates/codex-plus-core/**"
+      - "apps/codex-plus-launcher/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "scripts/installer/macos/**"
 permissions:
   contents: read
