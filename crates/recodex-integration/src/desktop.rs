@@ -355,6 +355,12 @@ fn route_codex_through_gateway(endpoint: &str) -> Option<String> {
         return None;
     }
     let base = format!("{endpoint}/backend-api/codex");
+    // 校验必须排在 stage_config_for_return **之前**:那一步会把块写进官方模式
+    // 快照,等到后面 route_through_gateway 才拒绝就晚了 —— 快照里已经留下了
+    // 一个被注入的托管块,切回 ReCodex 时照样生效。
+    if !crate::codexcfg::base_url_is_safe(&base) {
+        return Some("网关地址含有不能写进配置的字符".to_string());
+    }
     // 官方模式下不能碰活配置 —— 否则「用最快网关」会把官方模式悄悄破坏掉:
     // 面板还显示官方模式,Codex 下次启动却已经走回 ReCodex 网关。
     // 记进快照,切回 ReCodex 时自动生效。
@@ -1095,6 +1101,7 @@ fn doctor_config_checks(checks: &mut Vec<Value>) -> bool {
 /// `data.fixable` 表示「重装配置」这一步能不能修好当前问题。
 pub fn recodex_doctor(state: &ReCodexState) -> Value {
     let mut checks = Vec::new();
+    let mut gateway_switchable = false;
     let config_ok = doctor_config_checks(&mut checks);
 
     let key = std::env::var(crate::codexcfg::SUB2API_ENV_KEY).unwrap_or_default();
@@ -1122,6 +1129,15 @@ pub fn recodex_doctor(state: &ReCodexState) -> Value {
                 }
                 KeyProbe::Unreachable(detail) => {
                     gateway_ok = false;
+                    // 光说「连不上」帮不上忙 —— 用户不知道是自己网络的事，
+                    // 还是恰好被分到了一条坏线路上。顺手在本机测一遍所有网关，
+                    // 有能用的就直接说「切到 X 就行」，这是他自己点一下就能修的。
+                    let alternative = reachable_gateway_hint(state);
+                    let detail = match &alternative {
+                        Some(hint) => format!("{detail}；{hint}"),
+                        None => detail.clone(),
+                    };
+                    gateway_switchable = alternative.is_some();
                     checks.push(check("gateway_reachable", false, &detail));
                 }
             }
@@ -1163,9 +1179,38 @@ pub fn recodex_doctor(state: &ReCodexState) -> Value {
             "needs_relogin": !key_ok || key_rejected,
             // 只差一次重启：面板据此给「立即重启」而不是「重新登录」。
             "needs_restart": restart_pending,
+            // 当前网关不通、但本机测出别的网关能用：面板据此给「切到最快网关」。
+            // 这条独立于 fixable —— 重装配置改不了「这条线路本身不通」。
+            "gateway_switchable": gateway_switchable,
             "checks": checks,
         }
     })
+}
+
+/// 当前网关不通时，在本机测一遍所有网关，给出可切换的建议。
+///
+/// 用本机实测而不是服务端给的延迟：服务端那份是它自己机房到网关的距离，
+/// 与用户所在网络无关（线上后台显示新加坡「30ms 最快」，而国内实测 230ms、
+/// 40% 丢包）。拿不到清单或一个都不通时返回 None —— 那说明是用户整体网络
+/// 的问题，建议切网关只会误导他。
+fn reachable_gateway_hint(state: &ReCodexState) -> Option<String> {
+    let guard = state.adapter.lock().ok()?;
+    let adapter = guard.as_ref()?;
+    let gateways = adapter.gateways().ok()?;
+    let candidates: Vec<crate::Gateway> = gateways
+        .into_iter()
+        .filter(|g| g.enabled && !g.maintenance && !g.endpoint.trim().is_empty())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let probes = crate::gateway_probe::probe_gateways(&candidates);
+    let best = crate::gateway_probe::fastest_reachable(&probes)?;
+    Some(format!(
+        "本机测下来「{}」可用（{}ms），可以切过去试试",
+        best.gateway.name.trim(),
+        best.latency_ms
+    ))
 }
 
 /// 网关对这把 key 的态度。

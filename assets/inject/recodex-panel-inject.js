@@ -114,6 +114,8 @@
       "增强功能": "增強功能", "微信连接": "微信連接", "加载中…": "載入中…",
       "邮箱": "郵箱", "套餐": "套餐", "网关": "網關", "未选": "未選",
       "用最快网关": "用最快網關", "刷新额度": "重新整理額度", "登出": "登出",
+      "切到最快网关": "切到最快網關", "正在切换…": "正在切換…",
+      "当前线路连不上,本机测出别的线路可用。": "目前線路連不上，本機測出其他線路可用。",
       "组织": "組織", "无生效订阅": "無生效訂閱", "切换组织失败": "切換組織失敗", "未选": "未選",
       "重置额度": "重設額度", "剩 %n 次": "剩 %n 次", "重置中…": "重設中…",
       "无重置次数": "無重設次數", "仅组织所有者可重置": "僅組織所有者可重設",
@@ -219,6 +221,8 @@
       "增强功能": "Улучшения", "微信连接": "WeChat", "加载中…": "Загрузка…",
       "邮箱": "Почта", "套餐": "Тариф", "网关": "Шлюз", "未选": "не выбран",
       "用最快网关": "Самый быстрый шлюз", "刷新额度": "Обновить квоту", "登出": "Выйти",
+      "切到最快网关": "Переключиться на быстрый шлюз", "正在切换…": "Переключение…",
+      "当前线路连不上,本机测出别的线路可用。": "Текущий канал недоступен; на этом устройстве работает другой.",
       "使用情况": "Использование", "邀请好友": "Пригласить друзей", "退出登录": "Выйти",
       "设备数已达上限,请先撤销一台再继续。": "Достигнут лимит устройств: сначала отзовите одно.",
       "打开设备管理": "Открыть управление устройствами",
@@ -1712,6 +1716,9 @@
           : d.needs_relogin
           ? `<button class="rcx-act" id="rcx-doc-login">${t("重新登录 ReCodex")}</button>` +
             `<div class="rcx-muted" style="font-size:12px;margin-top:4px">${t("凭据只在登录时下发一次,重装配置取不回来。")}</div>`
+          : d.gateway_switchable
+          ? `<button class="rcx-act" id="rcx-doc-gateway">${t("切到最快网关")}</button>` +
+            `<div class="rcx-muted" style="font-size:12px;margin-top:4px">${t("当前线路连不上,本机测出别的线路可用。")}</div>`
           : d.fixable
             ? `<button class="rcx-act" id="rcx-doc-fix">${t("自动修复")}</button>`
             : `<div class="rcx-muted" style="font-size:12px">${t("请先登录 ReCodex,再回来修复。")}</div>`) +
@@ -1724,6 +1731,25 @@
     if (relogin) relogin.onclick = () => { showTab("account"); doLogin(); };
     const recheck = box.querySelector("#rcx-doc-recheck");
     if (recheck) recheck.onclick = () => renderDoctor(box);
+    // 切网关排在重启/重登之后、自动修复之前:线路本身不通的时候,
+    // 重启和重装配置都没用 —— 换一条能通的线才是唯一有效的动作。
+    const gwBtn = box.querySelector("#rcx-doc-gateway");
+    if (gwBtn) gwBtn.onclick = async () => {
+      gwBtn.disabled = true;
+      gwBtn.textContent = t("正在切换…");
+      const r = await bridge("/recodex/gateway/fastest", {});
+      if (!r || r.status === "error") {
+        gwBtn.disabled = false;
+        gwBtn.textContent = t("切到最快网关");
+        const line = document.createElement("div");
+        line.className = "rcx-err";
+        line.style.cssText = "font-size:12px;margin-top:4px";
+        line.textContent = (r && r.error && r.error.message) || t("切换失败");
+        box.appendChild(line);
+        return;
+      }
+      renderDoctor(box);
+    };
     const fix = box.querySelector("#rcx-doc-fix");
     if (fix) fix.onclick = async () => {
       fix.disabled = true;

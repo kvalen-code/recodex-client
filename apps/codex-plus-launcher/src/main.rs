@@ -108,6 +108,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
+    // 这里是唯一允许弹窗的地方:user_alert 默认关闭,免得任何链接了 codex-plus-core
+    // 的东西(尤其是集成测试里故意触发错误路径的用例)往用户桌面上弹框。
+    codex_plus_core::user_alert::enable();
     let options = parse_launch_options(args.iter());
     if let Err(error) = launcher_main(args, helper_only, options.clone()).await {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -133,6 +136,65 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// recodex-overlay: 把顶层 `model` 跟到上游 manifest 的推荐值。
+///
+/// 为什么要替用户改:装了 ReCodex 之后 Codex 以自定义 provider 接入,多数机器上
+/// 它**根本不从我们的网关拉模型列表**(线上实测:某用户 6349 次 `/responses`、
+/// 0 次 `/models`),于是上游新出的模型对他不可见 —— 只能靠人告诉他名字,
+/// 再手工去改 config.toml。这里替他改掉。
+///
+/// 推荐值完全由 manifest 推导(priority 最小的可见模型),我们**不维护任何模型
+/// 清单**:上游上新模型自带 priority=1,下次启动就跟上,不用改配置也不用发版。
+/// 档位也不用判断 —— manifest 是上游按该账号权限裁剪后下发的,Plus 号的列表里
+/// 根本没有 Pro 专属模型。
+///
+/// 三条自保:
+///   - 用户自己写过 `model`(那一行没有我们的标记)→ 直接返回,连网络都不发;
+///   - 拉不到 / 超时 / manifest 解析不了 → 保持现状,绝不动他的配置;
+///   - 5 秒超时,不为这件事拖慢启动。
+async fn follow_upstream_recommended_model() {
+    let Ok(config_path) = recodex_integration::codexcfg::config_path() else {
+        return;
+    };
+    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    if !recodex_integration::codexcfg::model_is_managed(&content) {
+        return;
+    }
+    let Some(home) = config_path.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let client_version = codex_plus_core::app_paths::resolve_codex_app_dir_with_saved(None, None)
+        .as_deref()
+        .and_then(codex_plus_core::app_paths::codex_app_version)
+        .unwrap_or_default();
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let Some(model) = codex_plus_core::model_catalog::recommended_model_for_home(
+        &home,
+        &env,
+        &client_version,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    else {
+        return;
+    };
+    match recodex_integration::codexcfg::apply_managed_model(&model) {
+        Ok(true) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.recodex_model_followed_upstream",
+                json!({ "model": model, "client_version": client_version }),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.recodex_model_write_failed",
+                json!({ "model": model, "error": error.to_string() }),
+            );
+        }
+    }
+}
+
 async fn launcher_main(
     args: Vec<String>,
     helper_only: bool,
@@ -146,16 +208,38 @@ async fn launcher_main(
     if recodex_integration::codexcfg::refresh_key_env_from_user_scope() {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "launcher.recodex_key_refreshed_from_user_scope",
-            json!({}),
+            // macOS 上这条**同时**是「launchd 那条通道没生效」的指标,而且比「注册那
+            // 一刻有没有报错」更可靠 —— 它看的是最终状态。launchd 注册对了的话,
+            // 从 Dock / 访达启动的进程环境里本来就该带着正确的 key,这里根本不会触发。
+            // 拿它盯 5005 次 macOS 401 收敛得怎么样(注册失败本身在适配器里是静默的,
+            // recodex-integration 不依赖 core,写不了诊断日志)。
+            json!({ "os": std::env::consts::OS }),
         );
     }
     if helper_only {
         let hooks = LauncherHooks::default();
-        hooks.start_helper(options.helper_port).await?;
+        // 用实际绑定端口:请求端口被占时会换一个,拿旧值去 shutdown 会关错对象。
+        let helper_port = hooks.start_helper(options.helper_port).await?;
+        // --helper-only 是让**外部**按约定端口来连的(协议代理的 base_url 就写在
+        // config.toml 里)。换了端口就等于失联:进程活着、日志正常、没人连得上。
+        // 与其静默跑一个找不到的 helper,不如当场失败。
+        if helper_port != options.helper_port {
+            hooks.shutdown_helper(helper_port).await;
+            anyhow::bail!(
+                "helper 端口 {} 被占用(只能绑到 {helper_port})。请关掉占用该端口的程序后重试。",
+                options.helper_port
+            );
+        }
         std::future::pending::<()>().await;
-        hooks.shutdown_helper(options.helper_port).await;
+        hooks.shutdown_helper(helper_port).await;
         return Ok(());
     }
+    // recodex-overlay: 让上游新出的模型自动生效。
+    // 位置有两个约束:必须在 key 刷新**之后**(拉 manifest 要带 key),
+    // 也必须在 helper_only 分支**之后** —— helper 进程根本不启动 Codex,
+    // 让它白等一次网络请求只会拖慢每一次 helper 拉起,还会和主进程抢着写
+    // 同一份 config.toml。
+    follow_upstream_recommended_model().await;
     // recodex-overlay: 由「切换模式/更新后重启」拉起时带 --await-guard —— 旧 launcher
     // 还要 1 秒左右才退出,不等的话会误判成「已有实例」而直接退出,页面就失去后端。
     let await_guard = args.iter().any(|arg| arg == "--await-guard");
@@ -285,7 +369,7 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
 
 async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
     let hooks = LauncherHooks::default();
-    let helper_port = hooks.select_helper_port(options.helper_port);
+    let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
@@ -312,7 +396,9 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         )
         .await;
     if settings.enhancements_enabled {
-        hooks.start_helper(helper_port).await?;
+        // 接住实际绑定端口:下面的 ensure_injection / start_bridge_watchdog 都用它,
+        // 换过端口还拿旧值 = 注入和看门狗一直连一个没人监听的地址。
+        helper_port = hooks.start_helper(helper_port).await?;
     }
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     #[cfg(windows)]
@@ -336,6 +422,16 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         hooks.write_status("running").await;
     } else if settings.enhancements_enabled {
         hooks.write_status("running_degraded").await;
+        // 「激活已在运行的 Codex」这条路同样会降级,别让它成为唯一不吭声的分支。
+        //
+        // 用**阻塞**版:这条路返回之后 launcher_main 紧跟着就 `return Ok(())`,
+        // 进程随即退出。Windows 上那条弹窗线程会跟着被掐掉,对话框一闪而过 ——
+        // 判据不是「是不是致命错误」,而是「提示之后进程还活不活着」。
+        codex_plus_core::user_alert::alert_once_blocking(
+            "ReCodex 增强功能未启动",
+            "已经切回正在运行的 Codex,但汉化、宠物、侧边栏等增强功能没能接上。
+请先完全退出 Codex,再用 ReCodex 重新启动;若仍然不行请联系客服。",
+        );
     }
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "launcher.activate_existing_codex",
@@ -568,7 +664,7 @@ impl LaunchHooks for LauncherHooks {
         self.core.ensure_plugin_marketplace_config(settings).await
     }
 
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         self.core.start_helper(helper_port).await
     }
 
@@ -586,7 +682,7 @@ impl LaunchHooks for LauncherHooks {
         if recodex_integration::codexcfg::refresh_key_env_from_user_scope() {
             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                 "launcher.recodex_key_refreshed_before_launch",
-                json!({}),
+                json!({ "os": std::env::consts::OS }),
             );
         }
         self.core
@@ -637,6 +733,31 @@ impl LaunchHooks for LauncherHooks {
             )
         });
         self.core.set_bridge_reinjector(reinjector).await;
+
+        // 桥被判定为彻底断掉之后的恢复动作：停掉没有 CDP 的 Codex，再由启动器
+        // 带着调试端口重新拉起。
+        //
+        // 这正是原来那个弹窗要用户手工做的事（「请先退出 Codex，再用 ReCodex
+        // 重新启动」）。线上诊断上报里这一类占了一半（281 条里 146 条），根因
+        // 全是 CDP 端口连接被拒 —— Codex 不是被我们拉起的，端口根本不存在，
+        // 光靠重新注入永远修不好。既然我们做得到，就不该让用户去做。
+        let recovery: codex_plus_core::launcher::BridgeRecovery = Arc::new(move || {
+            Box::pin(async move {
+                // 和 /restart-codex 走同一条路：拉起接班的 launcher，然后**本进程必须退出**。
+                // 不退的话两个 launcher 会抢单实例锁，接班那个会以为已有实例在跑，
+                // 直接退出 —— 于是谁都没带起调试端口，桥还是断的。
+                codex_plus_core::watcher::restart_with_fresh_launcher()
+                    .context("restart codex to restore the bridge")?;
+                tokio::spawn(async {
+                    // 留出时间让接班进程起来、也让本轮诊断日志落盘。
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                    std::process::exit(0);
+                });
+                Ok(())
+            })
+        });
+        self.core.set_bridge_recovery(recovery).await;
+
         self.core
             .start_bridge_watchdog(debug_port, helper_port)
             .await

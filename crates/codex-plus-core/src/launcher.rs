@@ -31,6 +31,17 @@ const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 pub type BridgeReinjector =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
 
+/// 桥彻底断定之后的**恢复**动作（区别于 [`BridgeReinjector`] 的「再注入一次」）。
+///
+/// 重新注入解决的是「页面刷新/换了 target」这类还有 CDP 端口可用的情况。
+/// 但线上最高频的那类根本没有端口可连（`os error 10061 / 61`，连接被拒）：
+/// Codex 不是被启动器带 `--remote-debugging-port` 拉起的（自更新后自重启、
+/// 从开始菜单直开、Store 激活），端口永远起不来，再注入多少次都是白打。
+/// 那时唯一有效的动作是「把这个没有 CDP 的 Codex 停掉，再由我们带着端口拉起」——
+/// 也正是原来弹窗要用户手工做的事。
+pub type BridgeRecovery =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexLaunch {
     Process {
@@ -166,7 +177,11 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
+    /// 启动 helper,返回**实际绑定**的端口。
+    ///
+    /// 返回值不能省:请求的端口可能被占,实现会换一个 —— 调用方(桥、注入、看门狗)
+    /// 必须拿到真实端口,否则会一直去连一个没人监听的地址。
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16>;
     async fn launch_codex(
         &self,
         app_dir: &Path,
@@ -191,7 +206,9 @@ pub trait LaunchHooks: Send + Sync {
         self.inject(debug_port, helper_port).await
     }
     async fn ensure_injection(&self, debug_port: u16, helper_port: u16, app_dir: &Path) -> bool {
-        for attempt in 1..=120 {
+        const MAX_ATTEMPTS: u32 = 120;
+        let mut last_error = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
             let result = match self.bridge_context(debug_port, app_dir).await {
                 Ok(Some(ctx)) => self.inject_bridge(debug_port, helper_port, ctx).await,
                 Ok(None) => self.inject(debug_port, helper_port).await,
@@ -200,19 +217,43 @@ pub trait LaunchHooks: Send + Sync {
             match result {
                 Ok(()) => return true,
                 Err(error) => {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.ensure_injection_retry_failed",
-                        serde_json::json!({
-                            "debug_port": debug_port,
-                            "helper_port": helper_port,
-                            "attempt": attempt,
-                            "message": error.to_string()
-                        }),
-                    );
+                    last_error = error.to_string();
+                    // 采样落日志:Codex 没起 CDP 时这里会一路跑满 120 次
+                    // (线上见过 attempt 72),条条同因,只会把首因冲掉。
+                    if crate::diagnostic_log::should_log_retry_attempt(attempt) {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.ensure_injection_retry_failed",
+                            serde_json::json!({
+                                "debug_port": debug_port,
+                                "helper_port": helper_port,
+                                "attempt": attempt,
+                                "message": error.to_string()
+                            }),
+                        );
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
         }
+        // 终态:采样会把最后一次(120 不是 2 的幂)丢掉,而「到底是跑了三次就好了
+        // 还是整整两分钟都没成」正是排查时最想知道的一件事。native_menu 那条路
+        // 已经有 localization_failed 兜底,这里补齐。
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.ensure_injection_exhausted",
+            serde_json::json!({
+                "debug_port": debug_port,
+                "helper_port": helper_port,
+                "attempts": MAX_ATTEMPTS,
+                // 现在还能不能绑上这个端口 —— 这一条把两种完全不同的故障分开:
+                //   true(能绑)= 没人占着,是 Codex 自己没把 CDP 起起来;
+                //   false(绑不上)= 被别的进程占了,才是端口冲突。
+                // 线上那几台只报「连不上」,分不清是哪种,只能靠猜。这里花一次
+                // bind/close 换掉那个猜测 —— 只在彻底放弃时做一次,不进重试循环。
+                "debug_port_free": crate::ports::can_bind_loopback_port(debug_port),
+                // 同上:字段名用 error,这条终态才会被上报挑中。
+                "error": last_error
+            }),
+        );
         false
     }
     async fn start_bridge_watchdog(
@@ -238,6 +279,7 @@ pub struct DefaultLaunchHooks {
     helper: Mutex<Option<HelperRuntime>>,
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
     bridge_reinjector: Mutex<Option<BridgeReinjector>>,
+    bridge_recovery: Mutex<Option<BridgeRecovery>>,
 }
 
 struct HelperRuntime {
@@ -325,8 +367,28 @@ where
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            hooks.start_helper(helper_port).await?;
+            // 用实际绑定的端口覆盖:被占时实现会换端口,后面的桥/注入/看门狗都要用真实值。
+            let bound_port = hooks.start_helper(helper_port).await?;
+            // 先记上:下面万一 bail,错误路径要靠这个标志把已经绑上的 helper 收掉。
             helper_started = true;
+            if !helper_port_fallback_is_safe(protocol_proxy_enabled, helper_port, bound_port) {
+                // 走到这里启动已经必败了,多花 1 秒把「是谁占着」问清楚是值得的:
+                // 线上那台机器就是拿着「请关掉占用该端口的程序」这句话,反复重启了 9 小时。
+                let squatter = describe_port_squatter(helper_port).await;
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.protocol_proxy_port_taken",
+                    serde_json::json!({
+                        "requested": helper_port,
+                        "fallback_bound": bound_port,
+                        "squatter": squatter,
+                        "error": "protocol proxy port unavailable",
+                    }),
+                );
+                anyhow::bail!(
+                    "协议代理端口 {helper_port} 被占用。{squatter}\n\n(协议代理的地址写在 Codex 配置里,不能临时换端口,所以这次只能停在这里。)"
+                );
+            }
+            helper_port = bound_port;
         }
 
         let launch = hooks
@@ -359,6 +421,13 @@ where
                 );
                 options.status_store.save_latest(&degraded)?;
                 hooks.write_status("running_degraded").await;
+                // running_degraded 只有我们自己读得到。线上客户就是这样在「看起来正常」
+                // 的界面里用了 9 小时,自己完全不知道增强功能是死的。
+                crate::user_alert::alert_once(
+                    "ReCodex 增强功能未启动",
+                    "Codex 已经打开,但汉化、宠物、侧边栏等增强功能没能接上。
+请先退出 Codex,再用 ReCodex 重新启动;若仍然不行请联系客服。",
+                );
                 injection_degraded = true;
             }
         }
@@ -399,6 +468,28 @@ where
                 }
             }
             let message = error.to_string();
+            // 启动**彻底**失败比降级更严重,原来却更安静 —— 只写状态文件和诊断日志,
+            // 用户界面上一点动静都没有。线上那台付费客户机器 07:01 就有一条
+            // launcher.failed,客户完全不知道,一路用到晚上。
+            //
+            // 这里必须用阻塞版:提示完这个进程马上就结束,不等的话 Windows 上
+            // 弹窗线程会随进程一起被掐掉,对话框一闪而过。放进 spawn_blocking
+            // 是为了不占住 runtime 的 worker 线程。
+            {
+                let message = message.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::user_alert::alert_once_blocking(
+                        "ReCodex 启动失败",
+                        &format!(
+                            "ReCodex 没能启动增强功能:
+{message}
+
+请重启 ReCodex 再试;若仍然不行请联系客服。"
+                        ),
+                    )
+                })
+                .await;
+            }
             let failure = launch_status("failed", &message, debug_port, helper_port, &app_dir);
             let _ = status_store.save_latest(&failure);
             hooks.write_status("failed").await;
@@ -432,7 +523,12 @@ fn start_native_menu_localizer(inspector_port: u16) {
                 "native_menu.localization_failed",
                 serde_json::json!({
                     "inspector_port": inspector_port,
-                    "message": error.to_string()
+                    // 和 ensure_injection_exhausted / bridge.gave_up 一致:三条等 CDP
+                    // 的路都在终态留下端口证据,不然又要靠猜。这里尤其能证伪端口猜想 ——
+                    // inspector 端口(debug_port+100)通常在动态端口范围**之外**,
+                    // 真被占的概率很低,超时才是主因(所以这一版把 10 秒提到 120 秒)。
+                    "inspector_port_free": crate::ports::can_bind_loopback_port(inspector_port),
+                    "error": error.to_string()
                 }),
             );
         }
@@ -499,9 +595,226 @@ impl DefaultLaunchHooks {
     }
 
     /// Configures the launcher-specific callback used by subsequent watchdog reinjections.
+    /// 装上「桥断定后的恢复动作」。不装的话看门狗只会提醒用户手动处理。
+    pub async fn set_bridge_recovery(&self, recovery: BridgeRecovery) {
+        *self.bridge_recovery.lock().await = Some(recovery);
+    }
+
     pub async fn set_bridge_reinjector(&self, reinjector: BridgeReinjector) {
         *self.bridge_reinjector.lock().await = Some(reinjector);
     }
+}
+
+/// helper 绑的地址是不是只有本机能连。
+///
+/// `CODEX_PLUS_HELPER_BIND` 没有任何校验(大概是给调试留的口子),设成 `0.0.0.0`
+/// 就把 helper 暴露到局域网 —— 而它背后是账号、额度、登录这些接口。
+/// 这里不拦(可能有人真在这么用),但必须让它**可见**:默认那条 helper.listening
+/// 不带错误关键词,压根传不回服务端,等于出了事我们也不知道。
+pub fn is_loopback_bind_host(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// 这个 Origin 看起来是不是本机的 Electron 页面发来的。
+///
+/// Electron 里页面 origin 的几种形态:`file://` 页面发出的是字面量 `"null"`,
+/// 自定义协议是 `app://…`,本地开发服务器是 `http://127.0.0.1:…`。
+/// 而恶意网页只会是 `https://某个域名` —— 这条线足够把两者分开。
+pub fn helper_origin_is_local(origin: &str) -> bool {
+    let origin = origin.trim();
+    origin.eq_ignore_ascii_case("null")
+        || origin.starts_with("app://")
+        || origin.starts_with("file://")
+        || ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+            .iter()
+            .any(|prefix| origin_host_is_exactly(origin, prefix))
+}
+
+/// `origin` 是否**正好**是 `prefix` 这个主机(可以带端口),而不是以它开头的别的域名。
+///
+/// 光用 `starts_with` 会被 `http://localhost.evil.com` / `http://127.0.0.1.evil.com`
+/// 骗过去 —— 攻击者注册这种域名就能让告警永远不触发。主机名后面只允许是端口号
+/// (`:`)或直接结束。
+fn origin_host_is_exactly(origin: &str, prefix: &str) -> bool {
+    origin
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+}
+
+/// 最多记住多少个不同的 Origin。
+///
+/// 必须有上限:这个集合是**攻击者可控**的 —— 恶意页面用 sub1.evil.com、sub2.evil.com…
+/// 轮着来,每个都是新 origin,不封顶就是无限增长的内存 + 刷屏的日志,
+/// 等于我为了观察攻击反倒给了对方一个放大器。
+///
+/// 32 足够装下真实场景(Electron 页面的 origin 就那么一两个),
+/// 满了之后只是不再记新的,已经记下的告警不受影响。
+const MAX_TRACKED_HELPER_ORIGINS: usize = 32;
+
+/// origin / path 记进日志前的长度上限。
+///
+/// 两者**完全由请求方决定**。虽然请求头本身受 MAX_HTTP_HEADER_BYTES 限制、
+/// origin 集合又封了 32 个,最坏也就几 MB,但没必要把几万字符的路径抄进日志。
+///
+/// 用 `chars().take()` 而不是 `&s[..n]`:后者切在多字节字符中间会 **panic**,
+/// 而这两个值攻击者随手就能塞非 ASCII —— 那样截断本身就成了 DoS 向量。
+const MAX_LOGGED_ORIGIN_CHARS: usize = 256;
+
+pub fn truncate_for_log(value: &str) -> String {
+    value.chars().take(MAX_LOGGED_ORIGIN_CHARS).collect()
+}
+
+fn seen_helper_origins() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// 记下每个访问过 helper 的 Origin —— **只观察,不拦截**。
+///
+/// 背景:helper 对所有响应都回 `Access-Control-Allow-Origin: *`,而且完全不校验来源。
+/// 它背后是 /uninstall、/self-update、/delete、/settings/set、/llm-proxy 这些接口 ——
+/// 用户在浏览任意网页时,那个网页都能拿默认端口 57321 直接调它们。
+///
+/// 真正的修复是白名单或 token,但那要先知道**合法**的 origin 长什么样,改错了会让
+/// 所有用户的注入脚本调不通、增强功能全挂。所以先用这一条把真实数据收上来:
+///   - 每个 origin 只记一次,不产生噪声;
+///   - 本机形态的只落本地日志(不占上报额度),给我们定白名单用;
+///   - **非本机 origin 带 error 字段,会传回服务端** —— 那就是有网页在调我们了。
+fn note_helper_request_origin(headers: &str, method: &str, path: &str) {
+    let Some(origin) = header_value_from_headers(headers, "origin") else {
+        // 没有 Origin 头 = 不是浏览器发起的跨域请求,不用管。
+        return;
+    };
+    let origin = truncate_for_log(origin.trim());
+    if origin.is_empty() {
+        return;
+    }
+    {
+        let mut seen = match seen_helper_origins().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if seen.contains(&origin) {
+            return;
+        }
+        // 先判上限再插:满了就当没见过,既不增长也不刷日志。
+        if seen.len() >= MAX_TRACKED_HELPER_ORIGINS {
+            return;
+        }
+        seen.insert(origin.clone());
+    }
+    let local = helper_origin_is_local(&origin);
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "helper.request_origin",
+        serde_json::json!({
+            "origin": origin,
+            "local": local,
+            // 只有外来 origin 才记它**想调什么** —— 光有一个陌生域名分不清是
+            // 误触还是冲着 /uninstall、/llm-proxy 来的。自家 origin 不记路径,
+            // 免得把用户的正常操作轨迹也传上去。
+            "method": if local {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(truncate_for_log(method))
+            },
+            "path": if local {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(truncate_for_log(path))
+            },
+            // 只有非本机来源才带 error —— 上报挑的就是这个字段,
+            // 正常的注入脚本 origin 不该去挤匿名口的限流额度。
+            "error": if local {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!("non-local origin reached the helper")
+            },
+        }),
+    );
+}
+
+/// 这个请求该不该拒。返回 `Some(origin)` 表示拒,值是要记进日志的来源。
+///
+/// 两件事同时成立才拒:
+///   1. 路径会花用户的额度(协议代理);
+///   2. 请求带了 `Origin`,而且不是本机形态。
+///
+/// **合法调用方一个都挡不到。** 协议代理的客户端是 Codex 本体 —— 一个 Rust 进程,
+/// 不是浏览器,压根不发 `Origin`。而恶意页面发出的每一个跨源 fetch,浏览器都会
+/// 强制带上真实 `Origin`,页面自己改不掉(改 `Origin` 是被 fetch 规范禁止的
+/// forbidden header)。所以这条判据把两者分得干干净净。
+///
+/// 为什么必须挡:协议代理端口默认写死 57321(`DEFAULT_PROTOCOL_PROXY_PORT`),
+/// 任意网页都能 `fetch('http://127.0.0.1:57321/v1/chat/completions')` 拿用户的
+/// 凭据跑自己的推理 —— 烧的是用户的钱。注意 `Access-Control-Allow-Origin: *`
+/// 从来不是防线:攻击方**不需要读响应**,请求发出去副作用就已经产生了。
+///
+/// 为什么不顺手把 `/backend/status`、`/overlay/image`、`/diagnostics/log` 也挡了:
+/// 那几条是注入脚本从 Electron 页面里调的,**带 Origin**。它们的真实 origin 目前
+/// 只有推测(就是 `helper_origin_is_local` 列的那几种形态),挡错一次就是全体用户的
+/// 增强功能全挂。而它们被外部网页调到最多泄漏一点本地状态,不值得拿这个风险换。
+/// 等 `helper.request_origin` 收到真机数据,再决定要不要收紧。
+/// 探一下占着这个端口的是谁,给用户一句照着能做的话。
+///
+/// 只在「协议代理端口被占、启动即将失败」这一条路径上调用一次 —— 正常启动完全不走
+/// 这里,零开销。
+///
+/// 为什么值得多花这 1 秒:线上那台机器 07:01 绑 57321 失败,一直报到 16:02,
+/// 9 小时里用户看到的只有「端口被占用,请关掉占用该端口的程序」—— 哪个程序?
+/// 没人知道,于是重启 ReCodex 一次又一次,每次都一样。
+///
+/// 而端口被占 9 小时这件事本身就说明**有活着的进程一直持有它**(socket 的
+/// TIME_WAIT 最多几分钟就没了),所以这一探基本必然有回应。
+///
+/// 不自动去 kill:光凭「某个端口上有个东西回了我们的 JSON」就去终止进程太危险 ——
+/// 任何本地程序都能伪造这段响应,那等于给了它一把杀任意进程的刀。真要自动清理,
+/// 得先按 PID 反查进程名核对身份,那是另一件事。
+async fn describe_port_squatter(port: u16) -> &'static str {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+    // `/backend/status` 的响应里这句是 helper 独有的,拿它认自己人。
+    const SELF_MARKER: &str = "后端已连接";
+
+    let probe = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        stream
+            .write_all(
+                b"GET /backend/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()?;
+        // 只读开头就够认人,别把对方可能的大响应整个吞进来。
+        let mut head = [0u8; 512];
+        let read = stream.read(&mut head).await.ok()?;
+        Some(String::from_utf8_lossy(&head[..read]).into_owned())
+    };
+
+    match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+        Ok(Some(response)) if response.contains(SELF_MARKER) => {
+            "占用它的是另一个还在运行的 ReCodex —— 请到任务管理器里结束 ReCodex 进程后重试。"
+        }
+        Ok(Some(_)) => "占用它的是另一个程序(不是 ReCodex)。",
+        // 连得上但没按 HTTP 回话,或者压根连不上(有进程 bind 着却不 accept)。
+        _ => "占用它的程序没有响应,无法判断是什么。",
+    }
+}
+
+fn cross_origin_credit_spend_to_block(headers: &str, path: &str) -> Option<String> {
+    if !crate::protocol_proxy::path_spends_upstream_credits(path) {
+        return None;
+    }
+    let origin = header_value_from_headers(headers, "origin")?;
+    let origin = origin.trim();
+    if origin.is_empty() || helper_origin_is_local(origin) {
+        return None;
+    }
+    Some(truncate_for_log(origin))
 }
 
 fn helper_bind_host() -> String {
@@ -638,13 +951,58 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         let bind_host = helper_bind_host();
-        let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
-            .await
-            .with_context(|| {
-                format!("failed to bind helper runtime on {bind_host}:{helper_port}")
-            })?;
+        // 直接绑,不走「先探测再绑」—— select_helper_port 在启动流程最开头就跑完了,
+        // 而真正 bind 发生在 provider_sync(网络 I/O)、远程恢复、SQLite 清理之后,
+        // 中间是**秒级**窗口,端口足够被别人(常常是上一次没退干净的自己)抢走。
+        //
+        // 抢走之后的老行为是 `?` 直接让整个启动失败:helper 起不来 → 桥/注入/汉化/宠物
+        // 全线不可用,而用户只看到「功能没了」,日志里那条 launcher.failed 没人看得到。
+        // 线上实测:一台付费客户机器 07:01 绑 57321 失败,增强功能挂了 9 小时。
+        // 所以这里改成换端口继续,绝不让一个被占的端口废掉整个增强层。
+        let (listener, bound_port) =
+            match tokio::net::TcpListener::bind((bind_host.as_str(), helper_port)).await {
+                Ok(listener) => (listener, helper_port),
+                Err(error) => {
+                    // 端口 0 让内核挑一个空闲端口并**当场持有**,不像 find_available_loopback_port
+                    // 那样「绑一下再放开」—— 那会把刚刚消除的竞态又引回来。
+                    let listener = tokio::net::TcpListener::bind((bind_host.as_str(), 0))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to bind helper runtime on {bind_host}:{helper_port}, and falling back to an ephemeral port also failed"
+                            )
+                        })?;
+                    let fallback = listener.local_addr()?.port();
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "helper.port_fallback",
+                        serde_json::json!({
+                            "requested": helper_port,
+                            "bound": fallback,
+                            "bind_host": bind_host,
+                            // 字段名必须是 error:诊断上报按「事件名带 fail/error…
+                            // 或 detail 里有 error 字段」挑要传的。这条按定义不是失败
+                            // (换成端口就正常跑了),名字里没有关键词 —— 可它恰恰是
+                            // 端口竞态修复救到人的唯一证据,不能只留在本地。
+                            "error": error.to_string(),
+                        }),
+                    );
+                    (listener, fallback)
+                }
+            };
+        let helper_port = bound_port;
+        if !is_loopback_bind_host(&bind_host) {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.bound_to_non_loopback",
+                serde_json::json!({
+                    "bind_host": bind_host,
+                    "helper_port": helper_port,
+                    // 用 error 字段才传得回来 —— 事件名里没有 fail/error 关键词。
+                    "error": "helper is reachable from outside this machine",
+                }),
+            );
+        }
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "helper.listening",
             serde_json::json!({
@@ -672,7 +1030,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             shutdown: shutdown_tx,
             task,
         });
-        Ok(())
+        Ok(helper_port)
     }
 
     async fn launch_codex(
@@ -833,16 +1191,26 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
     async fn start_bridge_watchdog(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         let bridge_reinjector = self.bridge_reinjector.lock().await.clone();
+        let bridge_recovery = self.bridge_recovery.lock().await.clone();
         let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             #[cfg(windows)]
             let pet_cursor_task = tokio::spawn(run_pet_real_mouse_cursor_driver(debug_port));
             let mut observed_browser_id: Option<String> = None;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            // 连续失败计数 → 退避。固定 5 秒是给「桥偶尔抖一下」设计的,但线上出现过
+            // Codex 一直没有 CDP 的情况(付费客户机器 9 小时):那时每一跳都会调
+            // retry_injection(20 次 × 500ms = 10 秒),比 5 秒的间隔还长,tokio interval
+            // 默认还会把积压的 tick 补发 —— 等于对着一个死端口连续不断地打 HTTP,
+            // 顺带把本地诊断日志刷成上万条。退避让「死透了」的代价降到每分钟一次。
+            let mut consecutive_failures: u32 = 0;
             loop {
+                // 先睡再查,和原来的 interval 不同:tokio 的 interval 首跳是**立即**
+                // 返回的。而看门狗恰好是在 ensure_injection 成功之后才启动的,
+                // 那一刻桥必然是通的 —— 立刻再查一次纯属浪费一次 CDP 往返。
+                let delay = bridge_watchdog_delay(consecutive_failures);
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
-                    _ = interval.tick() => {
+                    _ = tokio::time::sleep(delay) => {
                         let current_browser_id = match crate::cdp::browser_identity(debug_port).await {
                             Ok(identity) => identity.browser_id().ok(),
                             Err(_) => None,
@@ -855,15 +1223,69 @@ impl LaunchHooks for DefaultLaunchHooks {
                         if let Some(current) = current_browser_id {
                             observed_browser_id = Some(current);
                         }
-                        let (pet_result, _) = tokio::join!(
+                        let (pet_result, outcome) = tokio::join!(
                             sync_pet_real_mouse_overlay(debug_port, helper_port),
-                            check_and_reinject_bridge_inner(
+                            check_and_reinject_bridge(
                                 debug_port,
                                 helper_port,
                                 identity_changed,
                                 bridge_reinjector.clone(),
                             ),
                         );
+                        // 只有「断了而且没修回来」才退避。桥健康(什么都没做)
+                        // 和刚重注入成功都必须把计数清零,否则正常机器也会一路
+                        // 退到 60 秒一跳 —— 那就等于把看门狗关掉了。
+                        if outcome.bridge_is_usable() {
+                            consecutive_failures = 0;
+                        } else {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            if should_recover_bridge(consecutive_failures) {
+                                // 「彻底放弃」的唯一明确标记。现场原本只有一串
+                                // health_check_failed,既看不出何时算断定,也分不清
+                                // 端口是被别人占了还是 Codex 自己没起 CDP ——
+                                // 那 4 台设备就卡在这个盲区里。和 exhausted 一样,
+                                // 只在判定成立的这一次花一次 bind/close。
+                                let _ = crate::diagnostic_log::append_diagnostic_log(
+                                    "bridge.gave_up",
+                                    serde_json::json!({
+                                        "debug_port": debug_port,
+                                        "helper_port": helper_port,
+                                        "consecutive_failures": consecutive_failures,
+                                        "elapsed_secs": bridge_watchdog_elapsed_secs(
+                                            consecutive_failures,
+                                        ),
+                                        "debug_port_free":
+                                            crate::ports::can_bind_loopback_port(debug_port),
+                                        "error": "bridge unreachable after repeated reinjection",
+                                    }),
+                                );
+                                // 先尝试自己修好,修不动再打扰用户。
+                                //
+                                // 线上这一类占了全部诊断上报的一半(281 条里 146 条),
+                                // 而每一条的根因都一样:CDP 端口连接被拒(os error
+                                // 10061 / 61)—— Codex 不是被我们带着调试端口拉起的,
+                                // 端口压根不存在,再注入多少次都是白打。真正有效的动作
+                                // 只有「把它停掉、由我们重新拉起」,也正是下面这段文案
+                                // 要用户手工做的事。既然做得到,就别让用户去做。
+                                let recovered = run_bridge_recovery(
+                                    bridge_recovery.clone(),
+                                    debug_port,
+                                    helper_port,
+                                )
+                                .await;
+                                if recovered {
+                                    // 重启后端口和页面都是新的,计数清零重新观察;
+                                    // 真没修好的话下一轮会再次累计到阈值,那时才提醒。
+                                    consecutive_failures = 0;
+                                } else {
+                                    crate::user_alert::alert_once(
+                                        "ReCodex 增强功能已断开",
+                                        "与 Codex 页面的连接断开,汉化、宠物、侧边栏等增强功能已经停止工作。
+请先退出 Codex,再用 ReCodex 重新启动;若仍然不行请联系客服。",
+                                    );
+                                }
+                            }
+                        }
                         record_pet_overlay_sync_result(debug_port, helper_port, pet_result);
                     }
                 }
@@ -1005,6 +1427,27 @@ async fn handle_helper_connection(
     let method = parts.next().unwrap_or_default();
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path);
+    note_helper_request_origin(&request_headers, method, path);
+    if let Some(blocked_origin) = cross_origin_credit_spend_to_block(&request_headers, path) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "helper.cross_origin_blocked",
+            serde_json::json!({
+                "origin": blocked_origin,
+                "path": truncate_for_log(path),
+                "method": truncate_for_log(method),
+                // 事件名里没有 fail/error 关键词,靠这个字段才传得回服务端 ——
+                // 而这条恰恰是「真的有网页在打我们」的唯一证据。
+                "error": "cross-origin request to a credit-spending endpoint",
+            }),
+        );
+        // 不回任何 CORS 头:回了就等于告诉浏览器「这次预检通过」,
+        // 下一发真实请求照样会打进来。
+        stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
     let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
     let request_content_type = header_value_from_headers(&request_headers, "content-type");
     let request_content_encoding = header_value_from_headers(&request_headers, "content-encoding");
@@ -2265,8 +2708,75 @@ async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Codex injection failed")))
 }
 
-pub async fn check_and_reinject_bridge(debug_port: u16, helper_port: u16) -> bool {
-    check_and_reinject_bridge_inner(debug_port, helper_port, false, None).await
+/// 看门狗一跳的结果。
+///
+/// 为什么必须三态而不是 `bool`:原来的 `bool` 把「桥好好的,这一跳什么都不用做」
+/// 和「重注入也失败了」**都表达成 false**。退避逻辑要是照着这个 bool 走,
+/// 一切正常的机器也会一路退到 60 秒一跳 —— 等于把看门狗关掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeWatchdogOutcome {
+    /// 桥是通的,这一跳什么都没做。
+    Healthy,
+    /// 桥断了,重注入成功。
+    Reinjected,
+    /// 桥断了,重注入也失败 —— 只有这一种该退避。
+    Failed,
+}
+
+impl BridgeWatchdogOutcome {
+    /// 这一跳算不算「桥当前是可用的」。健康和刚修好都算。
+    pub fn bridge_is_usable(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+/// 看门狗下一跳的间隔:健康时 5 秒(桥抖一下要马上补回来),连续失败就退避到每分钟。
+///
+/// 为什么必须退避:失败路径上的 retry_injection 本身要 20 次 × 500ms = 10 秒,
+/// 比健康间隔还长。Codex 没有 CDP 时(线上真实发生过 9 小时),固定间隔等于
+/// 对死端口连续打 HTTP,还会把本地诊断日志刷到上万条。
+/// 上限 60 秒:再长就会让「Codex 刚起来」的恢复迟迟等不到。
+/// 连续失败到第几次才提醒用户。
+///
+/// 按 `bridge_watchdog_delay` 的节奏,第 6 次失败大约在断连 60 秒后 —— 足够躲开
+/// 「Codex 正在重启」这种几秒钟就自愈的抖动,又不至于让人像线上那样蒙 9 小时。
+pub const BRIDGE_ALERT_AFTER_FAILURES: u32 = 6;
+
+/// 连续失败 `consecutive_failures` 次之后,累计已经等了多久(秒)。
+///
+/// 只用来说明/校验提醒阈值挑得合不合理:太短会在 Codex 正常重启时误报。
+pub fn bridge_watchdog_elapsed_secs(consecutive_failures: u32) -> u64 {
+    (0..consecutive_failures)
+        .map(|failures| bridge_watchdog_delay(failures).as_secs())
+        .sum()
+}
+
+/// helper 换端口之后还能不能继续跑。
+///
+/// helper 端口有两种截然不同的语义,不能一视同仁:
+///   - **增强功能**(注入 / 桥 / 汉化 / 宠物):端口只在进程内传递,注入脚本拿到的是
+///     运行时的真实值。被占时换一个完全无感 —— 换端口远好过整个增强层不可用
+///     (线上那台付费客户机器就是因为绑不上 57321,增强功能挂了 11 个小时)。
+///   - **协议代理**:端口被 `local_responses_proxy_base_url` 写进了 config.toml 的
+///     `base_url`,是和 Codex 之间的**契约**。换端口之后 Codex 仍然往老端口发请求,
+///     那里没人监听 —— 表现是「能启动、界面正常、但一句话都发不出去」,
+///     比起不来更难查。这种情况必须失败。
+pub fn helper_port_fallback_is_safe(
+    protocol_proxy_enabled: bool,
+    requested_port: u16,
+    bound_port: u16,
+) -> bool {
+    bound_port == requested_port || !protocol_proxy_enabled
+}
+
+pub fn bridge_watchdog_delay(consecutive_failures: u32) -> std::time::Duration {
+    let secs = match consecutive_failures {
+        0..=2 => 5,
+        3..=5 => 15,
+        6..=10 => 30,
+        _ => 60,
+    };
+    std::time::Duration::from_secs(secs)
 }
 
 pub fn browser_identity_changed(previous: Option<&str>, current: &str) -> bool {
@@ -2281,12 +2791,12 @@ fn should_probe_launcher_cdp(is_windows: bool, has_codex_process: bool) -> bool 
     is_windows && !has_codex_process
 }
 
-async fn check_and_reinject_bridge_inner(
+async fn check_and_reinject_bridge(
     debug_port: u16,
     helper_port: u16,
     browser_identity_changed: bool,
     bridge_reinjector: Option<BridgeReinjector>,
-) -> bool {
+) -> BridgeWatchdogOutcome {
     let healthy = if browser_identity_changed {
         false
     } else {
@@ -2306,7 +2816,7 @@ async fn check_and_reinject_bridge_inner(
         }
     };
     if healthy {
-        return false;
+        return BridgeWatchdogOutcome::Healthy;
     }
 
     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -2329,11 +2839,64 @@ async fn check_and_reinject_bridge_inner(
                     "helper_port": helper_port
                 }),
             );
-            true
+            BridgeWatchdogOutcome::Reinjected
         }
         Err(error) => {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "bridge.reinject_failed",
+                serde_json::json!({
+                    "debug_port": debug_port,
+                    "helper_port": helper_port,
+                    "message": error.to_string()
+                }),
+            );
+            BridgeWatchdogOutcome::Failed
+        }
+    }
+}
+
+/// 连续失败到第几次时动手恢复（停掉没有 CDP 的 Codex 再拉起）。
+///
+/// 与 [`BRIDGE_ALERT_AFTER_FAILURES`] 同一时刻：先自己修，修不动才提醒用户。
+/// 不更早动手是因为重启会打断用户正在进行的对话 —— 得先给「Codex 正在重启」
+/// 这类几秒钟自愈的抖动留出窗口，确认是真断了才值得付这个代价。
+pub const BRIDGE_RECOVER_AFTER_FAILURES: u32 = BRIDGE_ALERT_AFTER_FAILURES;
+
+/// 这一轮该不该动手恢复。
+///
+/// 只在**恰好**达到阈值的那一次返回 true：桥一直不通的话计数会继续涨，
+/// 每涨一次就重启一遍 Codex 会让用户彻底没法用。修一次不成，就交给提醒。
+pub fn should_recover_bridge(consecutive_failures: u32) -> bool {
+    consecutive_failures == BRIDGE_RECOVER_AFTER_FAILURES
+}
+
+/// 执行桥恢复。返回是否真的动手修了（修没修好由下一轮观察说了算）。
+///
+/// 没装恢复回调时返回 false —— 那种部署（比如只用核心库、自己管进程的场景）
+/// 由调用方自己决定怎么处置，我们不擅自去杀别人的进程。
+async fn run_bridge_recovery(
+    bridge_recovery: Option<BridgeRecovery>,
+    debug_port: u16,
+    helper_port: u16,
+) -> bool {
+    let Some(recovery) = bridge_recovery else {
+        return false;
+    };
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "bridge.recovery_start",
+        serde_json::json!({ "debug_port": debug_port, "helper_port": helper_port }),
+    );
+    match recovery().await {
+        Ok(()) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.recovery_ok",
+                serde_json::json!({ "debug_port": debug_port, "helper_port": helper_port }),
+            );
+            true
+        }
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.recovery_failed",
                 serde_json::json!({
                     "debug_port": debug_port,
                     "helper_port": helper_port,
@@ -2945,6 +3508,94 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// 协议代理端口写死 57321,任意网页都能拿它烧用户的额度。这里钉住三件事:
+    /// 拒恶意页面、放行 Codex 本体(不发 Origin)、不误伤只读路径。
+    ///
+    /// 中间那条是这个改动能不能上线的关键:合法调用方一旦也带 Origin,
+    /// 这道校验就会把用户的 Codex 直接打死。
+    #[test]
+    fn cross_origin_block_hits_only_pages_spending_credits() {
+        let evil = "GET /v1/chat/completions HTTP/1.1\r\nOrigin: https://evil.example\r\n";
+        assert_eq!(
+            cross_origin_credit_spend_to_block(evil, "/v1/chat/completions").as_deref(),
+            Some("https://evil.example"),
+        );
+
+        // Codex 本体是 Rust 进程,不发 Origin —— 这条必须放行,否则正常链路全断。
+        let codex = "POST /v1/responses HTTP/1.1\r\nContent-Type: application/json\r\n";
+        assert!(cross_origin_credit_spend_to_block(codex, "/v1/responses").is_none());
+
+        // Electron 页面的几种本机形态。
+        for origin in ["null", "app://codex", "file://", "http://127.0.0.1:57321"] {
+            let headers = format!("POST /v1/responses HTTP/1.1\r\nOrigin: {origin}\r\n");
+            assert!(
+                cross_origin_credit_spend_to_block(&headers, "/v1/responses").is_none(),
+                "{origin} 被误挡了",
+            );
+        }
+
+        // 只读路径不在这一版的拦截范围内:注入脚本的真实 origin 还没有现场数据,
+        // 挡错了是全体用户增强功能全挂,代价远大于这几条泄漏的本地状态。
+        for path in ["/backend/status", "/overlay/image", "/diagnostics/log"] {
+            let headers = format!("GET {path} HTTP/1.1\r\nOrigin: https://evil.example\r\n");
+            assert!(cross_origin_credit_spend_to_block(&headers, path).is_none());
+        }
+
+        // localhost.evil.com 这种前缀骗术不能算本机。
+        let spoof = "POST /v1/responses HTTP/1.1\r\nOrigin: http://localhost.evil.com\r\n";
+        assert!(cross_origin_credit_spend_to_block(spoof, "/v1/responses").is_some());
+    }
+
+    /// 端口被占时那句提示能不能真的分清「是我们自己」和「是别人」。
+    ///
+    /// 这句话是用户唯一能拿到的线索 —— 线上那台机器就是因为只有一句
+    /// 「请关掉占用该端口的程序」,反复重启了 9 小时。分错了等于没提示。
+    #[tokio::test]
+    async fn port_squatter_probe_tells_our_own_helper_from_a_stranger() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_once(body: &'static str) -> u16 {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut discard = [0u8; 256];
+                    let _ = stream.read(&mut discard).await;
+                    let _ = stream
+                        .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{body}").as_bytes())
+                        .await;
+                }
+            });
+            port
+        }
+
+        let ours = serve_once(r#"{"status":"ok","message":"后端已连接"}"#).await;
+        assert!(
+            describe_port_squatter(ours).await.contains("ReCodex"),
+            "没认出自己的 helper",
+        );
+
+        let stranger = serve_once("<html>某个开发服务器</html>").await;
+        let verdict = describe_port_squatter(stranger).await;
+        assert!(
+            verdict.contains("另一个程序"),
+            "把陌生服务当成了自己人: {verdict}",
+        );
+
+        // 绑着端口却不 accept:connect 会因为内核 backlog 成功,但永远读不到东西。
+        // 这正是「进程还在、逻辑已经死了」的形态,必须被超时兜住而不是挂在那里。
+        let deaf = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let deaf_port = deaf.local_addr().expect("addr").port();
+        assert!(
+            describe_port_squatter(deaf_port).await.contains("没有响应"),
+            "沉默的占用者没有被超时兜住",
+        );
+    }
 
     fn counted_reinjector(calls: Arc<AtomicUsize>) -> BridgeReinjector {
         Arc::new(move || {
