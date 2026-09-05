@@ -191,11 +191,37 @@ fn report_from_line(line: &[u8], device_id: &str, client_version: &str, os: &str
     Some(report)
 }
 
+/// 不是报错、但**必须**传回来的少数事件。
+///
+/// 判据只有一条:没有它就无法验证某个修复到底有没有生效。别往里加「看着有用」
+/// 的东西 —— 匿名口有限流,每挤进来一条就少一条真故障的位置。
+const ALWAYS_REPORT: &[&str] = &[
+    // ①c:提示真的推到用户眼前了几次。按定义它不是错误(是我们主动告知),
+    //     名字里也不该塞 fail,但没有它就只能猜「用户到底看没看见」。
+    "launcher.user_alert",
+    // ②:macOS 上这条一触发就说明 launchd 通道没生效 —— 从 Dock 启动的 Codex
+    //     读不到 key,也就是那 5005 次 401 的来源。它是修复收敛与否的唯一指标。
+    "launcher.recodex_key_refreshed_from_user_scope",
+    // ①b 的**对照组**,没有它就会把修复效果读反。
+    //
+    // 看门狗加退避之后,`bridge.health_check_failed` 会从每 5 秒一条变成每 60 秒一条 ——
+    // 失败计数天然掉 12 倍,可那只是记得少了,不代表桥不断了。只有把「断了之后有没有
+    // 自己修回来」也传上来,才分得清「真的好了」和「只是不记了」。
+    //
+    // 它按定义不是错误(是成功),名字里也不该有 fail;dedup 保证每轮 flush 最多一条。
+    "bridge.reinject_ok",
+];
+
 fn is_reportable(event: &str, detail: &Value) -> bool {
     let lower = event.to_ascii_lowercase();
-    ERROR_MARKERS.iter().any(|m| lower.contains(m))
-        || detail.get("error").is_some()
-        || detail.get("err").is_some()
+    ALWAYS_REPORT.contains(&event)
+        || ERROR_MARKERS.iter().any(|m| lower.contains(m))
+        // 必须排掉显式的 null:`json!({"error": null})` 的 get() 返回的是
+        // Some(Value::Null),光用 is_some() 会把「这次没错」也当成错误传上去,
+        // 白占匿名口的限流额度。想按条件带错误的地方(如 helper.request_origin)
+        // 正是这么写的。
+        || detail.get("error").is_some_and(|value| !value.is_null())
+        || detail.get("err").is_some_and(|value| !value.is_null())
 }
 
 /// 粗分类给服务端聚合。ponytail: 按事件名前缀猜,猜不到就 runtime。
@@ -509,5 +535,58 @@ mod tests {
         assert!(is_reportable("x.failed", &Value::Null));
         assert!(is_reportable("x.ok", &serde_json::json!({"error": "e"})));
         assert!(!is_reportable("x.ok", &Value::Null));
+        // 显式 null 不算错误 —— get() 对它返回 Some,曾因此误报。
+        assert!(!is_reportable("x.ok", &serde_json::json!({ "error": null })));
+        assert!(!is_reportable("x.ok", &serde_json::json!({ "err": null })));
+
+        // 这四条是这次修复的**效果验证信号**:名字里都没有 fail/error 关键词,
+        // 传不上来的话,发版之后就没有任何办法判断修复到底有没有用。
+        // 前两条靠白名单,后两条靠 detail 里的 error 字段(改过字段名)。
+        assert!(is_reportable("launcher.user_alert", &Value::Null));
+        // 恢复信号:没有它,退避导致的「失败少了」会被误读成「问题解决了」。
+        assert!(is_reportable("bridge.reinject_ok", &Value::Null));
+        assert!(is_reportable(
+            "launcher.recodex_key_refreshed_from_user_scope",
+            &serde_json::json!({ "os": "macos" })
+        ));
+        assert!(is_reportable(
+            "helper.port_fallback",
+            &serde_json::json!({ "requested": 57321, "bound": 49812, "error": "in use" })
+        ));
+        assert!(is_reportable(
+            "launcher.ensure_injection_exhausted",
+            &serde_json::json!({ "attempts": 120, "error": "no cdp" })
+        ));
+        // 看门狗判定「彻底断了」的标记,名字里也没有 fail/error 关键词。
+        assert!(is_reportable(
+            "bridge.gave_up",
+            &serde_json::json!({ "debug_port_free": true, "error": "bridge unreachable" })
+        ));
+
+        // 白名单是精确匹配,不能被前缀/大小写混进来 —— 匿名口有限流。
+        assert!(!is_reportable("launcher.user_alert_extra", &Value::Null));
+        assert!(!is_reportable("helper.listening", &serde_json::json!({ "helper_port": 57321 })));
+        // 但绑到非 loopback 必须传回来:helper 背后是账号/额度/登录接口,
+        // 暴露到局域网而我们不知道,是最坏的情况。
+        // 日志被压缩过 —— 水位可能指进被改写的内容,之后的上报可能有缺口。
+        assert!(is_reportable(
+            "diagnostics.log_compacted",
+            &serde_json::json!({ "was_bytes": 52428800u64, "error": "watermark may be stale" })
+        ));
+        // 外部网站调到了 helper —— 这是攻击信号,必须传回来。
+        assert!(is_reportable(
+            "helper.request_origin",
+            &serde_json::json!({ "origin": "https://evil.example", "local": false,
+                                 "error": "non-local origin reached the helper" })
+        ));
+        // 而自家注入脚本的 origin 不带 error,不该去挤限流额度。
+        assert!(!is_reportable(
+            "helper.request_origin",
+            &serde_json::json!({ "origin": "app://-", "local": true, "error": Value::Null })
+        ));
+        assert!(is_reportable(
+            "helper.bound_to_non_loopback",
+            &serde_json::json!({ "bind_host": "0.0.0.0", "error": "reachable from outside" })
+        ));
     }
 }

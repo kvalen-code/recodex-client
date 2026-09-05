@@ -536,3 +536,120 @@ fn spawn_models_server(payload: serde_json::Value) -> ModelsServer {
     });
     ModelsServer { base_url, handle }
 }
+
+// ---------------------------------------------------------------------------
+// 推荐模型:规则全部来自 manifest,我们不维护模型清单。
+// 语料按真实上游返回裁剪(2026-09-05 从 Pro 账号取的 manifest)。
+// ---------------------------------------------------------------------------
+
+fn pro_manifest() -> serde_json::Value {
+    json!({"models": [
+        {"slug": "gpt-6-astra",         "priority": 1,  "visibility": "list", "minimal_client_version": "0.153.0"},
+        {"slug": "gpt-reserve",         "priority": 3,  "visibility": "hide", "minimal_client_version": "0.144.0"},
+        {"slug": "gpt-5.6-sol",         "priority": 6,  "visibility": "list", "minimal_client_version": "0.144.0"},
+        {"slug": "gpt-5.6-terra",       "priority": 7,  "visibility": "list", "minimal_client_version": "0.144.0"},
+        {"slug": "gpt-5.3-codex-spark", "priority": 26, "visibility": "list", "minimal_client_version": "0.100.0"},
+        {"slug": "codex-auto-review",   "priority": 43, "visibility": "hide", "minimal_client_version": "0.98.0"}
+    ]})
+}
+
+#[test]
+fn recommended_model_picks_the_highest_priority_visible_model() {
+    let got = codex_plus_core::model_catalog::recommended_model(&pro_manifest(), "0.153.4");
+    assert_eq!(got.as_deref(), Some("gpt-6-astra"));
+}
+
+#[test]
+fn recommended_model_skips_models_the_local_codex_is_too_old_for() {
+    // 0.152.1 够不到 astra 的 0.153.0,应退回下一个够得到的(sol,priority 6)。
+    let got = codex_plus_core::model_catalog::recommended_model(&pro_manifest(), "0.152.1");
+    assert_eq!(got.as_deref(), Some("gpt-5.6-sol"));
+}
+
+#[test]
+fn recommended_model_accepts_prerelease_client_versions() {
+    // IDE 扩展报的是 `0.146.0-alpha.3` 这种形状,不能因为解析不了就当成不支持。
+    let got = codex_plus_core::model_catalog::recommended_model(&pro_manifest(), "0.153.0-alpha.5");
+    assert_eq!(got.as_deref(), Some("gpt-6-astra"));
+}
+
+#[test]
+fn recommended_model_never_returns_hidden_models() {
+    // gpt-reserve(priority 3)比 sol 靠前,但它是 hide,不能被选中。
+    let manifest = json!({"models": [
+        {"slug": "gpt-reserve", "priority": 3, "visibility": "hide"},
+        {"slug": "gpt-5.6-sol", "priority": 6, "visibility": "list"}
+    ]});
+    let got = codex_plus_core::model_catalog::recommended_model(&manifest, "0.153.4");
+    assert_eq!(got.as_deref(), Some("gpt-5.6-sol"));
+}
+
+#[test]
+fn recommended_model_handles_plus_manifest_without_astra() {
+    // Plus 号的 manifest 里根本没有 astra —— 档位区分是上游裁剪好的,我们不判断。
+    let manifest = json!({"models": [
+        {"slug": "gpt-5.6-sol",   "priority": 6, "visibility": "list"},
+        {"slug": "gpt-5.6-terra", "priority": 7, "visibility": "list"}
+    ]});
+    let got = codex_plus_core::model_catalog::recommended_model(&manifest, "0.153.4");
+    assert_eq!(got.as_deref(), Some("gpt-5.6-sol"));
+}
+
+#[test]
+fn recommended_model_returns_none_when_nothing_is_usable() {
+    // 拿不到就返回 None,由调用方保持现状 —— 绝不能因此把用户的 model 写没了。
+    for payload in [json!({}), json!({"models": []}), json!({"models": [
+        {"slug": "gpt-reserve", "priority": 1, "visibility": "hide"}
+    ]})] {
+        assert_eq!(
+            codex_plus_core::model_catalog::recommended_model(&payload, "0.153.4"),
+            None
+        );
+    }
+}
+
+#[test]
+fn recommended_model_ignores_version_gate_when_client_version_is_unknown() {
+    // 版本号认不出来时不做过滤:responses 端点本身不校验版本(实测 0.60.0 也能调
+    // astra),没必要因为解析失败把用户卡在旧模型上。
+    let got = codex_plus_core::model_catalog::recommended_model(&pro_manifest(), "");
+    assert_eq!(got.as_deref(), Some("gpt-6-astra"));
+}
+
+#[tokio::test]
+async fn model_catalog_parses_the_codex_manifest_shape() {
+    // 网关返回的就是 manifest 形状(`models[].slug`)。此前通用解析只认
+    // id/model/name,对它一个都取不出来 —— 表现是模型列表整个为空。
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_models_server(pro_manifest());
+    write_config(
+        temp.path(),
+        &format!(
+            r#"
+model = "gpt-5.6-sol"
+model_provider = "recodex"
+
+[model_providers.recodex]
+name = "ReCodex"
+base_url = "{}"
+experimental_bearer_token = "gw-key"
+"#,
+            server.base_url
+        ),
+    );
+
+    let result = read_codex_model_catalog_from_home(
+        temp.path(),
+        &HashMap::new(),
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    )
+    .await;
+
+    let models = result["models"].as_array().expect("models array");
+    let slugs: Vec<&str> = models.iter().filter_map(|v| v.as_str()).collect();
+    assert!(slugs.contains(&"gpt-6-astra"), "得到 {slugs:?}");
+    assert!(slugs.contains(&"gpt-5.6-sol"), "得到 {slugs:?}");
+    // hide 的条目不该出现在选择器里。
+    assert!(!slugs.contains(&"gpt-reserve"), "得到 {slugs:?}");
+    assert!(!slugs.contains(&"codex-auto-review"), "得到 {slugs:?}");
+}

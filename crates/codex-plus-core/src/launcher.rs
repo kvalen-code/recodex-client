@@ -539,24 +539,35 @@ fn start_native_menu_localizer(inspector_port: u16) {
 fn apply_codexplusplus_window_icon_after_launch(process_id: u32) {
     let icon_resource_path =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codex-plus-plus.exe"));
+    const ATTEMPTS: u32 = 30;
     tokio::spawn(async move {
-        for attempt in 1..=30 {
+        for attempt in 1..=ATTEMPTS {
             if crate::windows_apply_codexplusplus_icon_to_process_window(
                 process_id,
                 icon_resource_path.clone(),
             ) {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if attempt == 30 {
+            if attempt == ATTEMPTS {
+                // 光有 pid 和图标路径查不出东西:线上那 3 台的安装路径各不相同,
+                // 所以既排除不掉路径,也说不出到底是窗口没出来还是 pid 不对。
+                // 这一句把三种可能分开,其中「进程在、名下没有窗口」就直接指向
+                // MSIX 打包应用的窗口挂在 ApplicationFrameHost 名下这个猜想。
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "launcher.window_icon.apply_failed",
                     serde_json::json!({
                         "process_id": process_id,
-                        "icon_resource_path": icon_resource_path.to_string_lossy()
+                        "icon_resource_path": icon_resource_path.to_string_lossy(),
+                        "waited_secs": ATTEMPTS / 2,
+                        // 事件名里没有 fail/error 关键词以外的线索,而这条恰恰要靠
+                        // 上报才看得到 —— 本地日志没人会去翻。
+                        "error": crate::windows_describe_window_lookup_failure(process_id),
                     }),
                 );
+                // 最后一次失败之后没有下一轮了,再睡 500ms 是白等。
+                return;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     });
 }
@@ -778,8 +789,13 @@ async fn describe_port_squatter(port: u16) -> &'static str {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-    // `/backend/status` 的响应里这句是 helper 独有的,拿它认自己人。
-    const SELF_MARKER: &str = "后端已连接";
+    // 认自己人用 `transport` 这个**协议标识**,不用 message 那句 UI 文案。
+    //
+    // 差别在跨版本:占着端口的多半是用户机器上跑着的**旧版本** ReCodex。
+    // 文案是随时会被改措辞的东西,改一次,新版本就认不出旧版本,
+    // 然后给用户一句「占用它的是另一个程序」—— 方向完全错了。
+    // transport 是内部协议契约,不会因为改文案而动。
+    const SELF_MARKER: &str = r#""transport":"http-helper""#;
 
     let probe = async {
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
@@ -1328,7 +1344,13 @@ impl LaunchHooks for DefaultLaunchHooks {
                             "launcher.packaged_process_wait_failed_nonfatal",
                             serde_json::json!({
                                 "process_id": process_id,
-                                "message": error.to_string()
+                                // `{:#}` 而不是 to_string():后者只给最外层那句
+                                // 「failed to open Windows process id N」,把底下的
+                                // Win32 错误码整条丢掉 —— 线上收到的就是这么一句
+                                // 什么也说明不了的话。而错误码恰恰是分水岭:
+                                // ACCESS_DENIED 是权限(线上那台跑在 Administrator 下),
+                                // INVALID_PARAMETER 是进程压根已经没了,两者修法不同。
+                                "message": format!("{error:#}"),
                             }),
                         );
                     }
@@ -3572,10 +3594,20 @@ mod tests {
             port
         }
 
-        let ours = serve_once(r#"{"status":"ok","message":"后端已连接"}"#).await;
+        // 夹具照抄线上 /backend/status 的紧凑 JSON 形状 —— 认人靠的就是这段字节。
+        let ours =
+            serve_once(r#"{"status":"ok","message":"后端已连接","transport":"http-helper"}"#).await;
         assert!(
             describe_port_squatter(ours).await.contains("ReCodex"),
             "没认出自己的 helper",
+        );
+
+        // 只改文案、不动协议标识时必须照样认得出 —— 占着端口的往往是旧版本。
+        let renamed = serve_once(r#"{"status":"ok","message":"后端就绪","transport":"http-helper"}"#)
+            .await;
+        assert!(
+            describe_port_squatter(renamed).await.contains("ReCodex"),
+            "改了 UI 文案就认不出自己人了",
         );
 
         let stranger = serve_once("<html>某个开发服务器</html>").await;

@@ -3,8 +3,34 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use serde_json::json;
 
-const MENU_LOCALIZATION_RETRIES: usize = 20;
-const MENU_LOCALIZATION_RETRY_DELAY: Duration = Duration::from_millis(500);
+// ⚠️ 未证实的怀疑:这个功能可能**根本跑不通**,而不只是慢。
+//
+// `--inspect` 走的是 Electron 的 **Node** inspector,和 `--remote-debugging-port`
+// (Chromium DevTools)是两套东西。两个参数在 `build_codex_arguments_with_native_menu_inspector`
+// 里是**同一批**传给 Codex 的 —— 现场 CDP 通、inspector 不通,说明参数到达了,
+// 是 Electron 自己没开。最可能是打包时烧了 Fuse `EnableNodeCliInspectArguments=false`
+// (处理用户凭据的应用这么做很合理),那样等多久都没用。
+//
+// 吻合的旁证:6 台上报设备**全部**失败、终态清一色 `failed to query CDP targets`
+// (连不上,不是执行失败)、Windows 和 macOS 都有 —— fuse 是打包烧录的,跨平台一致。
+//
+// 没有直接证据(本机没装 Codex,查不了它二进制里的 fuse wire),所以先不下线功能。
+// **发版后看 `native_menu.localization_failed` 里新加的 `inspector_port_free`**:
+// 端口空着=没人监听=坐实 fuse;端口被占=另一回事。坐实了就该把这个功能摘掉,
+// 而不是继续每次启动空转两分钟。
+//
+// 等的和 `ensure_injection` 是**同一个 Codex 进程**开出来的两个端口
+// (CDP 9229 / 菜单 inspector 9329),没道理一个等 120 秒、一个只等 10 秒。
+//
+// 线上实测(2026-09-05):20×500ms=10 秒的老配置下,6 台设备报重试失败、3 台跑到
+// 终态彻底失败,其中 desktop-61ac49b6… 这台**桥完全正常、只有菜单汉化挂了** ——
+// 说明不是 Codex 没起来,是慢机器上 inspector 就绪得比 10 秒晚。attempt 分布
+// (1/2/3/5/18 都有)也印证:多数机器重试几次就成,少数跑满。
+//
+// 拉长不花钱:这条路跑在 `tokio::spawn` 的后台任务里,不挡启动;失败日志已经按
+// 2 的幂次采样(120 次最多留 7 条)。
+const MENU_LOCALIZATION_RETRIES: usize = 120;
+const MENU_LOCALIZATION_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 const MENU_LABEL_TRANSLATIONS: &[(&str, &str)] = &[
     ("File", "文件"),
@@ -97,19 +123,30 @@ pub async fn install_native_menu_localizer(inspector_port: u16) -> anyhow::Resul
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "native_menu.localization_retry_failed",
-                    json!({
-                        "inspector_port": inspector_port,
-                        "attempt": attempt,
-                        "message": last_error.as_ref().map(ToString::to_string).unwrap_or_default()
-                    }),
-                );
+                // 同 ensure_injection:CDP 不可达时 20 次全会失败且同因,
+                // 线上见过 attempt 18。采样留第 1、2、4、8、16 次。
+                if crate::diagnostic_log::should_log_retry_attempt(attempt as u32) {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "native_menu.localization_retry_failed",
+                        json!({
+                            "inspector_port": inspector_port,
+                            "attempt": attempt,
+                            "message": last_error.as_ref().map(ToString::to_string).unwrap_or_default()
+                        }),
+                    );
+                }
                 tokio::time::sleep(MENU_LOCALIZATION_RETRY_DELAY).await;
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("native menu localization failed")))
+    // 带上「跑满了多少次」:光看错误信息分不清是等满了才放弃,还是中途因为别的
+    // 原因提前退出。和 launcher.ensure_injection_exhausted 的 attempts 字段对称。
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("native menu localization failed"))
+        .context(format!(
+            "放弃于第 {MENU_LOCALIZATION_RETRIES} 次尝试(共等 {} 秒)",
+            MENU_LOCALIZATION_RETRIES as u64 * MENU_LOCALIZATION_RETRY_DELAY.as_secs()
+        )))
 }
 
 pub fn native_menu_localizer_script() -> anyhow::Result<String> {
