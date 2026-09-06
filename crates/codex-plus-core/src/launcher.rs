@@ -1176,7 +1176,40 @@ impl LaunchHooks for DefaultLaunchHooks {
                 else {
                     unreachable!();
                 };
-                let process_id = activate_packaged_app(app_user_model_id, arguments).await?;
+                // 这一步之前可能刚硬杀过一个正在跑的 Codex(上面那段重启逻辑,
+                // Windows 走的是 TerminateProcess)。激活要是再失败,用户手上就
+                // **什么都不剩了** —— 比「能用但没有增强功能」糟得多。
+                //
+                // 失败是真会发生的:刚终止完 COM 侧还可能持着激活锁,MSIX 包在
+                // 更新/重注册期间也会拒绝激活。所以隔一会儿重试一次。
+                //
+                // 这条路径原先是个光秃秃的 `?`,失败时一条诊断都不留 ——
+                // 而它刚从「MSIX 用户永远走不到」变成「所有 Windows 用户都走」,
+                // 正是最需要看得见的时候。macOS 分支在下面 30 行处为同一个问题
+                // 做过一次同样的加固(那边的注释写得更细)。
+                let process_id = match activate_packaged_app(app_user_model_id, arguments).await {
+                    Ok(process_id) => process_id,
+                    Err(first_error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.windows_activation_retry",
+                            serde_json::json!({ "error": format!("{first_error:#}") }),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        match activate_packaged_app(app_user_model_id, arguments).await {
+                            Ok(process_id) => process_id,
+                            Err(second_error) => {
+                                let _ = crate::diagnostic_log::append_diagnostic_log(
+                                    "launcher.windows_activation_failed",
+                                    serde_json::json!({
+                                        "first": format!("{first_error:#}"),
+                                        "error": format!("{second_error:#}"),
+                                    }),
+                                );
+                                return Err(second_error);
+                            }
+                        }
+                    }
+                };
                 apply_codexplusplus_window_icon_after_launch(process_id);
                 if let Some(inspector_port) = native_menu_inspector_port {
                     start_native_menu_localizer(inspector_port, debug_port);

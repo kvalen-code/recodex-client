@@ -2577,6 +2577,10 @@ fn always_report_whitelist_matches_the_events_we_actually_emit() {
         "launcher.user_alert",
         "bridge.reinject_ok",
         "launcher.recodex_key_refreshed_from_user_scope",
+        // 这一条刚从死代码变活(原先写在 MSIX 分支的 return 之后,0 次 0 设备),
+        // 现在会真的去杀进程。名字里没有 fail/error、detail 只有 debug_port,
+        // 不上白名单就等于继续看不见 —— 那正是它当初能悄悄死掉的原因。
+        "launcher.windows_existing_app_without_cdp_restart_requested",
     ] {
         // 必须带引号比对:白名单里是 `"launcher.user_alert",` 这种字面量,
         // 光用 contains(event) 的话,改成 `"launcher.user_alert_RENAMED"` 也能
@@ -2785,16 +2789,51 @@ fn macos_quit_request_checks_the_osascript_exit_status() {
 #[test]
 fn windows_restart_without_cdp_runs_before_the_msix_branch() {
     let source = include_str!("../src/launcher.rs");
-    let restart = source
+    // 把比较限制在 launch_codex 函数体内。原先是全文件 find(),
+    // 意味着把这段挪进任何一个出现得更早的函数(哪怕永不被调用)守卫照样绿 ——
+    // 而"代码在,只是没人执行"正是这条守卫要防的那个 bug。
+    let body = source
+        .split_once("async fn launch_codex")
+        .expect("找不到 launch_codex —— 改名了就更新这条守卫")
+        .1;
+    let restart = body
         .find("launcher.windows_existing_app_without_cdp_restart_requested")
         .expect("找不到 Windows 重启分支 —— 改名了就更新这条守卫");
-    // MSIX 激活那条 return:它一旦先执行,后面的一切对 Windows 用户都是死代码。
-    let msix_return = source
-        .find("let process_id = activate_packaged_app(app_user_model_id, arguments).await?;")
+    // MSIX 激活:它一旦先执行,后面的一切对 Windows 用户都是死代码。
+    // 只钉函数名不钉整行 —— 那一行现在带了失败重试,再钉原文就是每改一次红一次。
+    let msix_activation = body
+        .find("activate_packaged_app(app_user_model_id, arguments).await")
         .expect("找不到 MSIX 激活调用");
 
     assert!(
-        restart < msix_return,
+        restart < msix_activation,
         "重启逻辑排在 MSIX 激活之后 —— 所有 Windows 用户都是 MSIX 安装,这段永远执行不到"
+    );
+}
+
+/// 激活失败不能让用户手上什么都不剩。
+///
+/// 这条路径上一步可能刚 TerminateProcess 掉一个正在跑的 Codex,
+/// 而它原先是个光秃秃的 `?`:激活一失败,整个 launch_codex 返回 Err,
+/// 用户的 Codex 已经死了、新的没起来。在这段代码还是死代码时没人碰得到,
+/// 现在所有 Windows 用户都走这条路。
+#[test]
+fn windows_activation_failure_retries_before_giving_up() {
+    let source = include_str!("../src/launcher.rs");
+    let body = source
+        .split_once("async fn launch_codex")
+        .expect("找不到 launch_codex")
+        .1;
+    let activation = body
+        .split_once("activate_packaged_app(app_user_model_id, arguments).await")
+        .expect("找不到 MSIX 激活调用")
+        .1;
+    assert!(
+        activation.contains("activate_packaged_app(app_user_model_id, arguments).await"),
+        "激活只调了一次 —— 刚杀完进程 COM 侧可能还持着激活锁,必须重试一次"
+    );
+    assert!(
+        body.contains("launcher.windows_activation_failed"),
+        "激活彻底失败没有任何上报 —— 这条路径刚从「谁也走不到」变成「所有 Windows 用户都走」"
     );
 }

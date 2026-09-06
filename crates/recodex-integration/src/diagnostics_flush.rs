@@ -226,6 +226,16 @@ const ALWAYS_REPORT: &[&str] = &[
     // 最终是恢复了还是彻底放弃了增强功能 —— 与 launcher.ready 同一个对照组道理。
     // 每台机器每次启动最多一条,量可忽略。
     "renderer.service_tier_dispatcher_patch_skipped",
+    // Windows 上「发现 Codex 在跑但没有调试端口,于是把它重启掉」这个决定。
+    //
+    // 这段逻辑从前写在 MSIX 分支的 return 之后,而所有 Windows 用户都是 MSIX ——
+    // 一次都没执行过,线上诊断 0 条 0 设备。现在挪到了分支之前,它会**真的开始杀进程**。
+    //
+    // 名字里没有 fail/error(它按定义不是失败,是一个主动决定),detail 里只有
+    // debug_port,两条既有规则都放不过它 —— 也就是说,不显式白名单的话,
+    // 我们照样看不见它到底有没有在跑、跑了多少次:和当初让它悄悄死掉半年的
+    // 盲区一模一样。这次要能看见。
+    "launcher.windows_existing_app_without_cdp_restart_requested",
 ];
 
 fn is_reportable(event: &str, detail: &Value) -> bool {
