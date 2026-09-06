@@ -2415,6 +2415,22 @@ fn menu_failure_says_how_long_it_waited() {
         tail.contains("MENU_LOCALIZATION_RETRIES") && tail.contains("MENU_LOCALIZATION_RETRY_DELAY"),
         "等待时长必须由两个常量算出,写死的话改超时就对不上了"
     );
+    // 这条守的是**这个守卫自己漏掉过的那一类**:上一版用
+    // `MENU_LOCALIZATION_RETRIES as u64 * MENU_LOCALIZATION_RETRY_DELAY.as_secs()`,
+    // 两个常量都在、断言全绿,可延迟是 500ms,`as_secs()` 截断成 0,乘出来永远是 0 ——
+    // 线上 122 条上报全写着「共等 0 秒」,读日志的人会以为重试压根没退避,
+    // 照着去查一个不存在的问题(实测被带偏过一次)。
+    //
+    // 常量是 from_millis 声明的,那么算式就必须走 as_millis;用 as_secs 就是在
+    // 亚秒延迟上做整数除法,结果注定是 0。
+    assert!(
+        !tail.contains("as_secs()"),
+        "延迟常量是毫秒级,as_secs() 会截断成 0 —— 用 as_millis()"
+    );
+    assert!(
+        tail.contains("as_millis()"),
+        "等待时长要按毫秒算再换算成秒,否则亚秒延迟会被整除没"
+    );
 }
 
 /// helper 绑的地址只有 loopback 才是安全的。
@@ -2665,4 +2681,90 @@ fn bridge_recovery_fires_exactly_once_at_the_give_up_point() {
 
     // 自愈和提醒在同一时刻判定：先尝试修，修不动才打扰用户。
     assert_eq!(BRIDGE_RECOVER_AFTER_FAILURES, BRIDGE_ALERT_AFTER_FAILURES);
+}
+
+/// 两种「等 CDP」失败的处置完全相反,必须在上报里分得开。
+///
+/// 线上它们共用 bridge.health_check_failed / bridge.reinject_failed /
+/// launcher.ensure_injection_retry_failed 三个事件名,报文里只有一段自由文本,
+/// 服务端聚合时糊成一团 —— 查那 111 条 health_check_failed 时,得逐条读 message
+/// 才知道是哪种,而两者一个不会自愈、一个会。
+#[test]
+fn cdp_failures_are_classified_into_actionable_kinds() {
+    use codex_plus_core::launcher::classify_cdp_failure;
+
+    // 端口没监听:macOS 上的主要形态,实测 attempt 到 64 仍是这个,不会自愈。
+    for unreachable in [
+        "failed to query CDP targets on loopback addresses: http://127.0.0.1:9229/json: \
+         client error (Connect): tcp connect error: Connection refused (os error 61)",
+        // Windows 的中文系统错误,不能靠匹配英文 "Connection refused" 认出来。
+        "tcp connect error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)",
+    ] {
+        assert_eq!(
+            classify_cdp_failure(unreachable),
+            "cdp_unreachable",
+            "端口拒连要归到 cdp_unreachable:{unreachable}"
+        );
+    }
+
+    // 端口通了但匹配不上:Windows 上的主要形态,多是页面还没加载完,会自愈。
+    assert_eq!(
+        classify_cdp_failure("No injectable Codex page target found; observed: [page url=x title=y]"),
+        "no_target"
+    );
+
+    // 认不出来的不能硬塞进前两类 —— 归错比不归更糟,会让告警阈值失准。
+    assert_eq!(classify_cdp_failure("websocket handshake failed"), "other");
+}
+
+/// macOS 退不掉 Codex 时不能把用户整个挡在门外。
+///
+/// 原来是 `quit_macos_app_and_wait(app_dir).await?`:没在窗口内退出 → 启动直接挂,
+/// 弹一个 blocking 的「ReCodex 启动失败」。可那一刻用户手上的 Codex 是好的,
+/// 只是没有调试端口 —— 该走的是「能用但没有增强功能」,不是一个都不给。
+#[test]
+fn macos_debug_takeover_degrades_instead_of_failing_the_launch() {
+    let source = include_str!("../src/launcher.rs");
+    let takeover = source
+        .split_once("MacosDebugLaunchAction::RestartRunningApp =>")
+        .expect("找不到 macOS 重启接管分支")
+        .1;
+    let takeover = &takeover[..takeover.find("};").unwrap_or(takeover.len())];
+
+    assert!(
+        !takeover.contains("quit_macos_app_and_wait(app_dir).await?"),
+        "退不掉不能用 `?` 让整个启动失败 —— 用户此时的 Codex 是好的"
+    );
+    assert!(
+        takeover.contains("SkipQuitBecauseAlreadyRunning"),
+        "退不掉要降级复用正在跑的实例"
+    );
+    assert!(
+        takeover.contains("launcher.macos_debug_takeover_degraded"),
+        "降级要留下证据,否则线上只会看到「增强功能没起来」而不知道为什么"
+    );
+}
+
+/// osascript 的退出码不能吞。
+///
+/// `tell application "X" to quit` 要 macOS 的自动化授权(TCC)。没授权时 osascript
+/// 非零退出,吞掉状态之后「用户拒了授权」和「app 退得慢」在日志里一模一样 ——
+/// 线上那条 "did not exit before debug relaunch" 就是这么变成无法定性的。
+#[test]
+fn macos_quit_request_checks_the_osascript_exit_status() {
+    let source = include_str!("../src/launcher.rs");
+    let body = source
+        .split_once("async fn run_macos_cleanup_command(")
+        .expect("找不到 run_macos_cleanup_command")
+        .1;
+    let body = &body[..body.find("\nasync fn ").unwrap_or(body.len())];
+
+    assert!(
+        !body.contains("let _ = Command::new(executable)"),
+        "osascript 的退出状态被丢掉了,授权被拒会伪装成「退得慢」"
+    );
+    assert!(
+        body.contains("status.success()"),
+        "要显式检查退出码"
+    );
 }

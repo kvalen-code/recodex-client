@@ -135,13 +135,19 @@ pub async fn install_native_menu_localizer(inspector_port: u16) -> anyhow::Resul
             }
         }
     }
-    // 带上「跑满了多少次」:光看错误信息分不清是等满了才放弃,还是中途因为别的
-    // 原因提前退出。和 launcher.ensure_injection_exhausted 的 attempts 字段对称。
+    // 带上「跑满了多少次、一共等了多久」:光看错误信息分不清是等满了才放弃,还是
+    // 中途因为别的原因提前退出。和 launcher.ensure_injection_exhausted 的
+    // attempts 字段对称。
+    //
+    // 用 as_millis 而不是 as_secs:延迟是 500ms,`as_secs()` 截断成 0,
+    // 再乘多少次都还是 0 —— 上线后所有上报都写着「共等 0 秒」,读的人会以为
+    // 重试压根没退避,照着这条去查一个不存在的问题(实测被带偏过一次)。
     Err(last_error
         .unwrap_or_else(|| anyhow::anyhow!("native menu localization failed"))
         .context(format!(
-            "放弃于第 {MENU_LOCALIZATION_RETRIES} 次尝试(共等 {} 秒)",
-            MENU_LOCALIZATION_RETRIES as u64 * MENU_LOCALIZATION_RETRY_DELAY.as_secs()
+            "放弃于第 {MENU_LOCALIZATION_RETRIES} 次尝试(共等 {:.1} 秒)",
+            (MENU_LOCALIZATION_RETRY_DELAY.as_millis() * MENU_LOCALIZATION_RETRIES as u128) as f64
+                / 1000.0
         )))
 }
 
