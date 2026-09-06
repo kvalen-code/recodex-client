@@ -210,6 +210,13 @@ const ALWAYS_REPORT: &[&str] = &[
     //
     // 它按定义不是错误(是成功),名字里也不该有 fail;dedup 保证每轮 flush 最多一条。
     "bridge.reinject_ok",
+    // 启动成功的**分母**。降级那条已经能传(走 launcher.user_alert),失败也能传,
+    // 唯独「这次启动好好的」没有任何记录 —— 于是「桥的失败少了」永远分不清是
+    // 修好了还是记少了(与 bridge.reinject_ok 同一个对照组道理)。
+    //
+    // 2026-09-06 查那 636 条上报时就卡在这:算不出菜单汉化、注入、桥的成功率,
+    // 也就无法判断刚做的几个修复到底有没有用。每次启动最多一条,dedup 再兜一道。
+    "launcher.ready",
 ];
 
 fn is_reportable(event: &str, detail: &Value) -> bool {
@@ -545,6 +552,12 @@ mod tests {
         assert!(is_reportable("launcher.user_alert", &Value::Null));
         // 恢复信号:没有它,退避导致的「失败少了」会被误读成「问题解决了」。
         assert!(is_reportable("bridge.reinject_ok", &Value::Null));
+        // 启动成功是**分母**:没有它,「失败变少了」分不清是修好了还是记少了。
+        // 它名字里没有 fail、detail 里也没有 error,只能靠白名单放行。
+        assert!(is_reportable(
+            "launcher.ready",
+            &serde_json::json!({ "debug_port": 9229, "enhancements_enabled": true })
+        ));
         assert!(is_reportable(
             "launcher.recodex_key_refreshed_from_user_scope",
             &serde_json::json!({ "os": "macos" })
