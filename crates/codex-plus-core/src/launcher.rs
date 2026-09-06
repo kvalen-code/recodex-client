@@ -1130,6 +1130,32 @@ impl LaunchHooks for DefaultLaunchHooks {
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
         let launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
+
+        // Windows:Codex 已经在跑、但没有带调试端口(自更新后自己重启、用户从开始菜单
+        // 直接打开、Store 激活)—— 直接再 spawn 一个只会被 Electron 的单实例锁交给
+        // 老进程然后退出,调试端口永远起不来,面板永远「桥未就绪」;重启启动器也无济于事
+        // (有 Codex 进程就只激活窗口)。macOS 早有同款分支
+        // (launcher.macos_existing_app_without_cdp_restart_requested),这里对齐:
+        // 先把无 CDP 的 Codex 退掉,再由我们带着端口拉起。
+        //
+        // **位置要紧**:这段原先写在 MSIX 分支的 return 之后,而所有 Windows 用户
+        // 都是 MSIX 安装 —— 于是它从来没被执行过。线上诊断可证:
+        //   select count(*) from client_diagnostic_reports
+        //   where event like '%existing_app_without_cdp%';  → 0 次 / 0 设备
+        // 而同期 launcher.ready 有 33 条、ensure_injection_retry_failed 有 30 条,
+        // 说明上报链路是通的,单单这一条一次都没触发过。
+        // 移到分支之前,MSIX 与非 MSIX 两条路径才都覆盖得到。
+        #[cfg(windows)]
+        if !crate::watcher::find_codex_processes().is_empty()
+            && !crate::cdp::endpoint_available(debug_port)
+        {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.windows_existing_app_without_cdp_restart_requested",
+                serde_json::json!({ "debug_port": debug_port }),
+            );
+            crate::watcher::stop_codex_processes_and_wait();
+        }
+
         if cfg!(windows) {
             let activation = if let Some(inspector_port) = native_menu_inspector_port {
                 build_packaged_activation_with_native_menu_inspector(
@@ -1241,22 +1267,6 @@ impl LaunchHooks for DefaultLaunchHooks {
             });
         }
 
-        // Windows:Codex 已经在跑、但没有带调试端口(自更新后自己重启、用户从开始菜单
-        // 直接打开、Store 激活)—— 直接再 spawn 一个只会被 Electron 的单实例锁交给
-        // 老进程然后退出,调试端口永远起不来,面板永远「桥未就绪」;重启启动器也无济于事
-        // (有 Codex 进程就只激活窗口)。macOS 早有同款分支
-        // (launcher.macos_existing_app_without_cdp_restart_requested),这里对齐:
-        // 先把无 CDP 的 Codex 退掉,再由我们带着端口拉起。
-        #[cfg(windows)]
-        if !crate::watcher::find_codex_processes().is_empty()
-            && !crate::cdp::endpoint_available(debug_port)
-        {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "launcher.windows_existing_app_without_cdp_restart_requested",
-                serde_json::json!({ "debug_port": debug_port }),
-            );
-            crate::watcher::stop_codex_processes_and_wait();
-        }
         let command = if let Some(inspector_port) = native_menu_inspector_port {
             build_codex_command_with_native_menu_inspector(
                 app_dir,

@@ -2768,3 +2768,33 @@ fn macos_quit_request_checks_the_osascript_exit_status() {
         "要显式检查退出码"
     );
 }
+
+/// 「重启无 CDP 的 Codex」必须排在 MSIX 激活分支**之前**。
+///
+/// 这段代码原先写在 `if cfg!(windows) { ... return ... }` 之后,而所有 Windows
+/// 用户都是 MSIX 安装 —— 于是它从来没被执行过。线上诊断可证:
+///
+///   select count(*) from client_diagnostic_reports
+///   where event like '%existing_app_without_cdp%';   → 0 次 / 0 设备
+///
+/// 同期 launcher.ready 有 33 条、ensure_injection_retry_failed 有 30 条,
+/// 上报链路是通的,单单这一条一次都没触发 —— 死代码的典型形状。
+///
+/// 位置错了不会有编译错误、不会有测试变红,只会静默地什么都不做,
+/// 所以这里按**文本位置**钉住。
+#[test]
+fn windows_restart_without_cdp_runs_before_the_msix_branch() {
+    let source = include_str!("../src/launcher.rs");
+    let restart = source
+        .find("launcher.windows_existing_app_without_cdp_restart_requested")
+        .expect("找不到 Windows 重启分支 —— 改名了就更新这条守卫");
+    // MSIX 激活那条 return:它一旦先执行,后面的一切对 Windows 用户都是死代码。
+    let msix_return = source
+        .find("let process_id = activate_packaged_app(app_user_model_id, arguments).await?;")
+        .expect("找不到 MSIX 激活调用");
+
+    assert!(
+        restart < msix_return,
+        "重启逻辑排在 MSIX 激活之后 —— 所有 Windows 用户都是 MSIX 安装,这段永远执行不到"
+    );
+}
