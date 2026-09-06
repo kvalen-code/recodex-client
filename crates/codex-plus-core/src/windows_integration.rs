@@ -50,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    HICON, ICON_BIG, ICON_SMALL, SendMessageW, WM_SETICON,
+    HICON, ICON_BIG, ICON_SMALL, PostMessageW, SendMessageW, WM_CLOSE, WM_SETICON,
 };
 #[cfg(windows)]
 use windows::core::{Interface, PCWSTR, PROPVARIANT, PWSTR};
@@ -325,6 +325,73 @@ pub fn enumerate_processes() -> Vec<WindowsProcessInfo> {
         }
     }
     processes
+}
+
+/// 请求这个进程自己关掉:给它每一个顶层窗口发一条 `WM_CLOSE`。
+/// 返回发出去的窗口数,0 表示没找到窗口(无头进程,只能硬杀)。
+///
+/// 为什么要有这一步:重启无 CDP 的 Codex 时,Windows 侧一直是直接 `TerminateProcess`
+/// ——进程当场消失,没有 `beforeunload`、没有保存、没有清理。这段逻辑原先写在
+/// MSIX 分支的 return 之后,所有 Windows 用户都执行不到,所以一直没人碰到;
+/// 2026-09-07 把它挪到分支之前,它就对**每一个** Windows 用户生效了。
+/// macOS 那边走的是 osascript quit(优雅),Windows 不该比它粗暴。
+///
+/// 用 `PostMessageW` 而不是 `SendMessageW`:后者要等对方消息循环处理完才返回,
+/// 目标要是弹了个「确定要退出吗」的对话框,我们就跟着一起卡死。Post 只投递不等。
+///
+/// 不含 `visible_only` 过滤:隐藏的顶层窗口(托盘宿主之类)同样要收到关闭请求,
+/// 漏掉它们的话进程不会退,白等一场超时。
+#[cfg(windows)]
+pub fn request_process_close(process_id: u32) -> usize {
+    let mut state = CloseRequestState {
+        process_id,
+        hwnds: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect_process_windows_proc),
+            LPARAM((&mut state as *mut CloseRequestState) as isize),
+        );
+    }
+    let mut posted = 0;
+    for hwnd in state.hwnds {
+        if unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok() {
+            posted += 1;
+        }
+    }
+    posted
+}
+
+#[cfg(windows)]
+struct CloseRequestState {
+    process_id: u32,
+    hwnds: Vec<HWND>,
+}
+
+/// 这个窗口该不该收到关闭请求。
+///
+/// 抽成纯函数只为一件事:让那个 pid 判断**可测**。`EnumWindows` 枚举的是
+/// 桌面上**每一个**顶层窗口 —— Word、浏览器、全部;这一句是「关掉 Codex」和
+/// 「关掉一切」之间唯一的东西,而它此前零覆盖(实测把它去掉,watcher 那 22 条测试
+/// 全绿)。unsafe FFI 回调里一次手滑就能碰掉它,所以判断挪出来单测。
+///
+/// pid 为 0 一律不匹配:`GetWindowThreadProcessId` 失败时不改写出参,
+/// 调用方那个初值 0 会原样留着 —— 拿它去比对等于把失败当成"命中 pid 0"。
+pub(crate) fn window_belongs_to_process(window_process_id: u32, target_process_id: u32) -> bool {
+    window_process_id != 0 && window_process_id == target_process_id
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn collect_process_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = unsafe { &mut *(lparam.0 as *mut CloseRequestState) };
+    let mut window_process_id = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut window_process_id));
+    }
+    if window_belongs_to_process(window_process_id, state.process_id) {
+        state.hwnds.push(hwnd);
+    }
+    BOOL(1)
 }
 
 #[cfg(windows)]
@@ -720,5 +787,29 @@ mod tests {
         assert!(app_score > ime_score);
         assert_eq!(ime_score, tool_score);
         assert_eq!(auxiliary_app_score, ProcessWindowScore::Fallback);
+    }
+}
+
+#[cfg(test)]
+mod close_request_tests {
+    use super::window_belongs_to_process;
+
+    /// 只给目标进程的窗口发 WM_CLOSE。
+    ///
+    /// EnumWindows 枚举的是桌面上**所有**顶层窗口 —— 这条判断一旦失效,
+    /// 「重启 Codex」就变成「关掉用户正在用的一切」。它此前没有任何测试覆盖。
+    #[test]
+    fn only_the_target_process_gets_the_close_request() {
+        assert!(window_belongs_to_process(4321, 4321), "目标进程自己的窗口要发");
+        assert!(!window_belongs_to_process(9999, 4321), "别人的窗口绝对不能发");
+    }
+
+    /// pid 0 一律不匹配。`GetWindowThreadProcessId` 失败时不改写出参,
+    /// 调用点那个初值 0 会原样留着 —— 拿它去比对等于把「查询失败」当成命中。
+    #[test]
+    fn a_failed_pid_lookup_never_matches() {
+        assert!(!window_belongs_to_process(0, 0), "查询失败不能当成命中");
+        assert!(!window_belongs_to_process(0, 4321));
+        assert!(!window_belongs_to_process(4321, 0));
     }
 }

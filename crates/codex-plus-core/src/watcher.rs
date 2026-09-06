@@ -115,6 +115,21 @@ fn is_windowsapps_codex_app_process(executable: &str) -> bool {
             .is_some_and(crate::app_paths::is_supported_app_executable_name)
 }
 
+/// 这个 exe 文件名是不是我们自己的启动器。
+///
+/// 必须连改名前的 `codex-plus-plus.exe` 一起认:自更新是「用新内容盖掉自己那个 exe」
+/// (selfupdate.rs 的 stage_replacement 走 `current_exe()`),**文件名不会跟着变**。
+/// 所以老用户升级到新版之后,磁盘上那个 exe 仍然叫旧名字,里面跑的是新代码 ——
+/// 只认新名字的话,新代码找不到自己的残留实例,而且不会有任何报错。
+fn is_launcher_exe_file(exe_file: &str) -> bool {
+    [
+        crate::install::SILENT_BINARY,
+        crate::install::LEGACY_SILENT_BINARY,
+    ]
+    .iter()
+    .any(|name| exe_file.eq_ignore_ascii_case(&format!("{name}.exe")))
+}
+
 pub fn filter_killable_launcher_processes<'a>(
     processes: impl IntoIterator<Item = (u32, u32, &'a str)>,
     current_process_id: u32,
@@ -132,7 +147,7 @@ pub fn filter_killable_launcher_processes<'a>(
     processes
         .into_iter()
         .filter(|(process_id, _, exe_file)| {
-            !protected.contains(process_id) && exe_file.eq_ignore_ascii_case("codex-plus-plus.exe")
+            !protected.contains(process_id) && is_launcher_exe_file(exe_file)
         })
         .map(|(process_id, _, _)| process_id)
         .collect()
@@ -552,15 +567,19 @@ fn terminate_macos_process(process_id: u32) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// macOS 上启动器可能以两个名字出现在进程表里。
+/// macOS 上启动器可能以三个名字出现在进程表里。
 ///
 /// 直接跑二进制时是 SILENT_BINARY;从 .app 启动时,`Contents/MacOS/` 下那个
 /// 启动脚本的名字来自 Info.plist 的 CFBundleExecutable,是另一个字符串。
 /// `pgrep -x` 精确匹配可执行名,只查前者就漏掉后者 —— 而用户几乎都是点图标启动的。
+///
+/// 第三个是改名前的旧二进制名:自更新只换内容不换文件名,所以老安装升上来之后
+/// 磁盘上仍然是旧名字,里面跑的却是新代码。不认它就等于新代码看不见自己。
 #[cfg(target_os = "macos")]
-pub fn macos_launcher_process_names() -> [&'static str; 2] {
+pub fn macos_launcher_process_names() -> [&'static str; 3] {
     [
         crate::install::SILENT_BINARY,
+        crate::install::LEGACY_SILENT_BINARY,
         crate::install::MACOS_SILENT_EXECUTABLE,
     ]
 }
@@ -628,33 +647,103 @@ fn macos_codex_process_ids_for_debug_port<'a>(
     ids
 }
 
+/// 先礼后兵:等优雅关闭的时间。超过就硬杀,别把用户晾在那儿。
+///
+/// 3 秒是按「Electron 应用收到 WM_CLOSE 后跑完 beforeunload 并退出」估的。
+/// 剩下的预算留给硬杀之后的等待,所以两段加起来仍在 RESTART_STOP_WAIT_TIMEOUT_MS
+/// 的量级上,不会让"重启 Codex"这件事明显变慢。
 #[cfg(windows)]
-fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_ms: u64) {
-    if process_ids.is_empty() {
-        return;
-    }
-    for process_id in &process_ids {
-        let _ = crate::windows_integration::terminate_process(*process_id);
-    }
+const GRACEFUL_CLOSE_WAIT_MS: u64 = 3_000;
+
+/// 等这批进程退出,返回仍然活着的。到点就返回,不保证空。
+#[cfg(windows)]
+fn wait_for_process_exit(process_ids: &[u32], timeout_ms: u64, interval_ms: u64) -> Vec<u32> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         let running_process_ids = crate::windows_integration::enumerate_processes()
             .into_iter()
             .map(|process| process.process_id);
-        let remaining = process_ids_still_running(&process_ids, running_process_ids);
+        let remaining = process_ids_still_running(process_ids, running_process_ids);
         if remaining.is_empty() || std::time::Instant::now() >= deadline {
-            if !remaining.is_empty() {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "watcher.stop_wait_timeout",
-                    serde_json::json!({
-                        "remaining_process_ids": remaining,
-                        "timeout_ms": timeout_ms
-                    }),
-                );
-            }
-            break;
+            return remaining;
         }
         std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+/// 停掉这批进程:**先请求它们自己关**,只对赖着不走的用 TerminateProcess。
+///
+/// 从前这里是直接 TerminateProcess ——进程当场消失,没有 beforeunload、没有保存。
+/// 一直没人碰到是因为唯一的调用点写在 MSIX 分支的 return 之后,所有 Windows
+/// 用户都执行不到(线上诊断 0 次 0 设备)。2026-09-07 把它挪到分支之前之后,
+/// 它对**每一个** Windows 用户生效了 —— 只要 Codex 在跑且当前调试端口上没有 CDP,
+/// 从面板启动就会走到这里。同样的场景 macOS 走的是 osascript quit(优雅),
+/// Windows 没理由更粗暴。
+#[cfg(windows)]
+fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_ms: u64) {
+    if process_ids.is_empty() {
+        return;
+    }
+
+    // 第一步:请求自己关。没有任何窗口可发(无头进程)就没必要白等,直接进第二步。
+    let posted: usize = process_ids
+        .iter()
+        .map(|process_id| crate::windows_integration::request_process_close(*process_id))
+        .sum();
+    let mut remaining = if posted > 0 {
+        wait_for_process_exit(
+            &process_ids,
+            GRACEFUL_CLOSE_WAIT_MS.min(timeout_ms),
+            interval_ms,
+        )
+    } else {
+        process_ids.clone()
+    };
+    if remaining.is_empty() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "watcher.graceful_close_succeeded",
+            serde_json::json!({ "process_ids": process_ids, "windows_asked": posted }),
+        );
+        return;
+    }
+
+    // 第二步:赖着不走的才硬杀。
+    // 名字用 `timeout` 不是 `timed_out`:上报规则按**子串**认关键词
+    // (diagnostics_flush.rs 的 ERROR_MARKERS 里是 `timeout`),`timed_out` 中间那个
+    // 下划线让它一个词都不命中 —— 这条会被静默丢弃,而它是"优雅关闭没生效"的
+    // 唯一信号。同一个函数里的 watcher.stop_wait_timeout 就是对的写法。
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "watcher.graceful_close_timeout",
+        serde_json::json!({
+            "remaining_process_ids": remaining,
+            "windows_asked": posted,
+            "waited_ms": if posted > 0 { GRACEFUL_CLOSE_WAIT_MS.min(timeout_ms) } else { 0 },
+        }),
+    );
+    for process_id in &remaining {
+        let _ = crate::windows_integration::terminate_process(*process_id);
+    }
+    // 用**剩余**预算,不是完整的 timeout_ms —— 否则两段加起来最坏 3+5=8 秒,
+    // 而这段是 std::thread::sleep,从 async 的 launch_codex 里直接调,
+    // 阻塞的是 tokio 的工作线程。整段总时长必须守住 timeout_ms。
+    let graceful_spent = if posted > 0 {
+        GRACEFUL_CLOSE_WAIT_MS.min(timeout_ms)
+    } else {
+        0
+    };
+    remaining = wait_for_process_exit(
+        &remaining,
+        timeout_ms.saturating_sub(graceful_spent),
+        interval_ms,
+    );
+    if !remaining.is_empty() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "watcher.stop_wait_timeout",
+            serde_json::json!({
+                "remaining_process_ids": remaining,
+                "timeout_ms": timeout_ms
+            }),
+        );
     }
 }
 

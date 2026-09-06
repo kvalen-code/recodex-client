@@ -22,6 +22,16 @@ pub struct UpdateManifest {
     pub url: String,
     /// 包体 sha256(十六进制)
     pub sha256: String,
+    /// 运维显式开的回滚开关:允许装一个**比当前旧**的版本。
+    ///
+    /// 没有它的话,下面那道降级闸会把**回滚这条退路一起堵死** —— 而回滚正是
+    /// 发版出问题时唯一的应急手段(把服务端的 manifest_url 指回上一版,
+    /// 让所有人自愈)。以现在的发版节奏,这条退路比多一道闸值钱。
+    ///
+    /// 默认 false:清单是我们自己生成的,不写这个字段就是正常发版。
+    /// 要回滚时手工在那一版的 manifest.json 里加 `"allow_downgrade": true`。
+    #[serde(default)]
+    pub allow_downgrade: bool,
 }
 
 fn require_https(url: &str, what: &str) -> anyhow::Result<url::Url> {
@@ -46,7 +56,55 @@ pub async fn fetch_manifest(manifest_url: &str) -> anyhow::Result<UpdateManifest
     if manifest.sha256.trim().is_empty() {
         anyhow::bail!("更新清单缺少 sha256,拒绝安装");
     }
+    if !manifest.allow_downgrade {
+        reject_non_upgrade(&manifest.version, crate::version::VERSION)?;
+    }
     Ok(manifest)
+}
+
+/// 拒绝安装一个不比当前新的包。
+///
+/// 2026-09-07 线上踩到:服务端有**两个**独立设置项 —— `recodex_client_latest_version`
+/// 和 `recodex_client_manifest_url`,发版时要一起改。只改了前者,于是所有用户被告知
+/// 「有新版本 1.3.3」,点下去下载的却是 1.3.0 的包。更糟的是服务端的 `AvailableFor`
+/// 根本不比较版本号(只看两个字段非空),所以连已经在 1.3.3 上的用户也被推更新 ——
+/// 装完变 1.3.0,重启后还是被告知有 1.3.3,**无限降级循环**。
+///
+/// 客户端这边本来一路照装:`self_update_value` 拿到清单就下载、校验 sha256、替换。
+/// sha256 只能保证「包没被掉包」,保证不了「这是个更新」。加这道闸之后,同类配置
+/// 失误只会变成一句"已经是最新版本",而不是把用户降级并锁死。
+///
+/// 版本号解析不出来时**放行**:出货的版本号一律是三段纯数字(publish-desktop.sh 会校验),
+/// 解析失败多半是将来换了格式(带 -beta 之类)。为一个没见过的格式把自更新永久堵死,
+/// 比放行一次更糟 —— sha256 与 https 那两道闸仍然在。
+fn reject_non_upgrade(candidate: &str, current: &str) -> anyhow::Result<()> {
+    let (Some(candidate_parts), Some(current_parts)) =
+        (parse_three_part(candidate), parse_three_part(current))
+    else {
+        return Ok(());
+    };
+    if candidate_parts > current_parts {
+        return Ok(());
+    }
+    if candidate_parts == current_parts {
+        anyhow::bail!("已经是最新版本 {current},无需更新");
+    }
+    anyhow::bail!(
+        "更新清单给的是 {candidate},比当前的 {current} 还旧 —— 拒绝降级。\
+         这多半是服务端的更新配置指错了版本,请联系管理员"
+    )
+}
+
+fn parse_three_part(value: &str) -> Option<[u64; 3]> {
+    let mut parts = value.trim().split('.');
+    let mut out = [0u64; 3];
+    for slot in &mut out {
+        *slot = parts.next()?.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -218,5 +276,106 @@ mod tests {
         assert_eq!(std::fs::read(&old).unwrap(), b"old", "旧版本要留着以便回退");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod upgrade_guard_tests {
+    use super::{parse_three_part, reject_non_upgrade, UpdateManifest};
+
+    // 线上那次的形状:清单指着 1.3.0,用户在 1.3.2。照装就是降级。
+    #[test]
+    fn rejects_an_older_package() {
+        let error = reject_non_upgrade("1.3.0", "1.3.2").unwrap_err().to_string();
+        assert!(error.contains("拒绝降级"), "错误信息要说清是降级:{error}");
+        assert!(error.contains("1.3.0") && error.contains("1.3.2"));
+    }
+
+    // 服务端的 AvailableFor 不比较版本号,所以已经在最新版的用户也会被推更新。
+    // 装一遍同版本不致命,但那正是「更新完还提示有更新」看起来的样子。
+    #[test]
+    fn rejects_the_same_version() {
+        let error = reject_non_upgrade("1.3.3", "1.3.3").unwrap_err().to_string();
+        assert!(error.contains("已经是最新版本"), "{error}");
+    }
+
+    #[test]
+    fn allows_a_real_upgrade() {
+        for (candidate, current) in [("1.3.4", "1.3.3"), ("1.4.0", "1.3.9"), ("2.0.0", "1.9.9")] {
+            reject_non_upgrade(candidate, current)
+                .unwrap_or_else(|error| panic!("{candidate} 应当放行(当前 {current}):{error}"));
+        }
+    }
+
+    // 逐段按数字比,不是按字符串 —— "1.3.10" 字符串比大小小于 "1.3.9"。
+    #[test]
+    fn compares_numerically_not_lexically() {
+        reject_non_upgrade("1.3.10", "1.3.9").expect("1.3.10 比 1.3.9 新");
+        assert!(reject_non_upgrade("1.3.9", "1.3.10").is_err());
+    }
+
+    // 解析不出来就放行:为一个没见过的版本号格式把自更新永久堵死,比放行一次更糟。
+    #[test]
+    fn allows_when_either_side_is_unparseable() {
+        for (candidate, current) in [
+            ("1.3.4-beta", "1.3.3"),
+            ("1.3.4", "dev"),
+            ("1.3", "1.3.3"),
+            ("1.3.4.5", "1.3.3"),
+        ] {
+            reject_non_upgrade(candidate, current)
+                .unwrap_or_else(|error| panic!("解析不了就该放行({candidate}/{current}):{error}"));
+        }
+    }
+
+    /// 光有纯函数不算数 —— 得确认它**真的被挂在了** fetch_manifest 上。
+    ///
+    /// 实测过:把 fetch_manifest 里那句调用删掉,上面 12 条全绿。
+    /// 而今天这次事故的形状恰恰就是「两个设置项只改了一个」——一个没人验证的接线。
+    /// fetch_manifest 本身要发 https 请求,单测里跑不起来,所以钉文本。
+    #[test]
+    fn the_guard_is_actually_wired_into_fetch_manifest() {
+        let source = include_str!("selfupdate.rs");
+        let body = source
+            .split_once("pub async fn fetch_manifest")
+            .expect("找不到 fetch_manifest")
+            .1;
+        let body = &body[..body.find("
+/// ").unwrap_or(body.len())];
+        assert!(
+            body.contains("reject_non_upgrade("),
+            "fetch_manifest 没有调用 reject_non_upgrade —— 降级闸只是躺在那儿"
+        );
+        assert!(
+            body.contains("allow_downgrade"),
+            "回滚开关没接上 —— 一旦某版有问题,把清单指回上一版也救不回用户"
+        );
+    }
+
+    /// 回滚开关放行降级,这是发版出事时唯一的自愈手段。
+    #[test]
+    fn allow_downgrade_lets_operations_roll_back() {
+        // 闸本身仍然拒绝(它不看这个字段),放行发生在调用点。
+        assert!(reject_non_upgrade("1.3.0", "1.3.4").is_err());
+        // 字段默认必须是 false:清单里不写就是正常发版,不能默认开着。
+        let manifest: UpdateManifest = serde_json::from_str(
+            r#"{"version":"1.3.5","url":"https://x/y.exe","sha256":"ab"}"#,
+        )
+        .expect("清单少了 allow_downgrade 也要能解析");
+        assert!(!manifest.allow_downgrade, "回滚开关默认必须是关的");
+        let rollback: UpdateManifest = serde_json::from_str(
+            r#"{"version":"1.3.3","url":"https://x/y.exe","sha256":"ab","allow_downgrade":true}"#,
+        )
+        .expect("带 allow_downgrade 的清单要能解析");
+        assert!(rollback.allow_downgrade);
+    }
+
+    #[test]
+    fn parses_only_three_numeric_parts() {
+        assert_eq!(parse_three_part("1.3.3"), Some([1, 3, 3]));
+        assert_eq!(parse_three_part(" 1.3.3 "), Some([1, 3, 3]));
+        assert_eq!(parse_three_part("1.3"), None);
+        assert_eq!(parse_three_part("1.3.3.1"), None);
+        assert_eq!(parse_three_part("1.3.x"), None);
     }
 }

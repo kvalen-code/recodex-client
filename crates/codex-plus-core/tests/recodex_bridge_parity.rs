@@ -88,3 +88,33 @@ fn the_panel_exposes_doctor_and_its_fix() {
         "doctor 的修复必须复用 install_login_config"
     );
 }
+
+/// 面板不能把「更新」按钮显示给已经在最新版的人。
+///
+/// 服务端的 `AvailableFor` **不比较版本号**(只看两个设置项非空 + 灰度名单),
+/// 所以它对所有人都回 available。1.3.4 起客户端会拒绝装不比自己新的包,
+/// 于是那一点就变成一个红色的「已经是最新版本」—— 看着像更新失败,会来工单。
+///
+/// 判断只能放在面板里(服务端那边改不动),所以在这儿钉住它还在。
+#[test]
+fn panel_hides_the_update_button_when_it_is_not_actually_newer() {
+    let panel = include_str!("../../../assets/inject/recodex-panel-inject.js");
+    assert!(
+        panel.contains("function isNewerVersion("),
+        "面板少了版本比较 —— 已在最新版的用户会被推更新,点下去得到一个红色报错"
+    );
+    assert!(
+        panel.contains("channel.available && isNewerVersion(channel.latest_version, current)"),
+        "isNewerVersion 定义了却没接到 hasUpdate 上 —— 等于没写"
+    );
+    // 逐段按数字比,不能按字符串:"1.3.10" 的字符串序小于 "1.3.9"。
+    assert!(
+        panel.contains("a[i] > b[i]"),
+        "版本比较退化成字符串比较了 —— 1.3.10 会被当成比 1.3.9 旧"
+    );
+    // 认不出的格式要放行,否则将来换版本号格式会把更新入口静默关掉。
+    assert!(
+        panel.contains("if (!a || !b) return true;"),
+        "解析失败时没有放行 —— 换个版本号格式就会把更新入口关死"
+    );
+}

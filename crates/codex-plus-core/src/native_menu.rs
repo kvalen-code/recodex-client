@@ -28,6 +28,24 @@ use serde_json::json;
 const MENU_LOCALIZATION_RETRIES: usize = 20;
 const MENU_LOCALIZATION_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// `--inspect` 被 fuse 关死的第一个世代。>= 这个数就别试了。
+///
+/// 分界线来自上面那段实测:151 世代 52 次里成 45 次(失败的是启动竞态,重试能救回来),
+/// 152 世代 6 次全败且清一色 connrefused —— 端口永不监听,重试多少次都一样。
+const MENU_LOCALIZATION_FUSED_FROM_MAJOR: u32 = 152;
+
+/// 从 `/json/version` 的 Browser 串里取主版本号,例如 `Chrome/152.0.7977.83` → 152。
+/// 取不出来返回 None ——**认不出就照常尝试**,别拿一个解析不了的串去关掉功能。
+pub(crate) fn chromium_major_version(browser: &str) -> Option<u32> {
+    let version = browser.rsplit_once('/')?.1;
+    version.split('.').next()?.trim().parse().ok()
+}
+
+/// 这个世代还值不值得试。
+pub(crate) fn menu_localization_worth_attempting(browser: &str) -> bool {
+    chromium_major_version(browser).is_none_or(|major| major < MENU_LOCALIZATION_FUSED_FROM_MAJOR)
+}
+
 const MENU_LABEL_TRANSLATIONS: &[(&str, &str)] = &[
     ("File", "文件"),
     ("Edit", "编辑"),
@@ -112,13 +130,47 @@ const MENU_LABEL_TRANSLATIONS: &[(&str, &str)] = &[
     ("Toggle React Scan", "切换 React Scan"),
 ];
 
-pub async fn install_native_menu_localizer(inspector_port: u16) -> anyhow::Result<()> {
+pub async fn install_native_menu_localizer(
+    inspector_port: u16,
+    debug_port: u16,
+) -> anyhow::Result<()> {
     let mut last_error = None;
     for attempt in 1..=MENU_LOCALIZATION_RETRIES {
         match try_install_native_menu_localizer(inspector_port).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
+                // 第一次失败之后问一次浏览器世代,152+ 就此收手。
+                //
+                // **位置要紧**:这道闸第一版写在循环之前,那是死代码 —— 我们是刚把
+                // Codex 拉起来就调到这儿的,它的 CDP 端口还没监听,`browser_identity`
+                // 直接 Err,整道闸落空。证据在同一个仓库里:ensure_injection 给了
+                // 120 次 × 1 秒还注释着「线上见过 attempt 72」,而原先那次
+                // browser_identity 查询正是放在 20 次重试全败(≈10 秒)之后才做的 ——
+                // 152/151 那份普查数据就是那样采到的。
+                //
+                // 放到第 1 次失败之后:那时 CDP 通常已经起来,152+ 在第 1~2 次就退出
+                // (省掉 18 次注定失败的重试和一串上报),151 的启动竞态照样重试救得回来。
+                if attempt == 1
+                    && let Ok(identity) = crate::cdp::browser_identity(debug_port).await
+                    && !menu_localization_worth_attempting(&identity.browser)
+                {
+                    // 只写本地日志、不回传:这不是故障,是预期内的不支持。
+                    // 名字里不能有 fail/error/timeout 这些词(上报规则按子串认),
+                    // `fused` 不含 `refused` —— 是特意选的,别改成 refused_runtime。
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "native_menu.localization_skipped_fused_runtime",
+                        json!({
+                            "inspector_port": inspector_port,
+                            "debug_port": debug_port,
+                            "cdp_browser": identity.browser,
+                            "attempt": attempt,
+                        }),
+                    );
+                    // Ok 而不是 Err:调用方的 Err 分支会上报 localization_failed,
+                    // 而"这台机器结构上不支持"不该占用故障额度。
+                    return Ok(());
+                }
                 // 同 ensure_injection:CDP 不可达时 20 次全会失败且同因,
                 // 线上见过 attempt 18。采样留第 1、2、4、8、16 次。
                 if crate::diagnostic_log::should_log_retry_attempt(attempt as u32) {
@@ -259,5 +311,52 @@ mod tests {
         assert!(script.contains("Toggle Sidebar"));
         assert!(script.contains("切换边栏"));
         assert!(!script.contains("app.asar"));
+    }
+}
+
+#[cfg(test)]
+mod fuse_gate_tests {
+    use super::{chromium_major_version, menu_localization_worth_attempting};
+
+    // 分界线来自本机 58 次启动的实测:151 成 45 次,152 全败。
+    #[test]
+    fn skips_the_fused_generation_and_newer() {
+        for browser in ["Chrome/152.0.7977.83", "Chrome/153.0.1.1", "Chrome/200.0.0.0"] {
+            assert!(
+                !menu_localization_worth_attempting(browser),
+                "{browser} 上 --inspect 被 fuse 关死,不该再空跑 20 次重试"
+            );
+        }
+    }
+
+    // 151 世代确实有启动竞态,重试能救回来 —— 不能一起关掉。
+    #[test]
+    fn still_tries_on_the_generation_that_works() {
+        for browser in ["Chrome/151.0.7519.0", "Chrome/120.0.0.0", "Chrome/99.9.9.9"] {
+            assert!(
+                menu_localization_worth_attempting(browser),
+                "{browser} 上重试是有意义的,不该跳过"
+            );
+        }
+    }
+
+    // 认不出来就照常尝试。拿一个解析不了的串去关掉功能,等于把「将来换了格式」
+    // 变成「功能静默消失」——那比多跑 20 次重试糟得多。
+    #[test]
+    fn attempts_when_the_version_cannot_be_read() {
+        for browser in ["", "Chrome", "HeadlessChrome/abc", "Chrome/", "unavailable: connrefused"] {
+            assert!(
+                menu_localization_worth_attempting(browser),
+                "{browser:?} 解析不出版本时应照常尝试"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_the_major_version() {
+        assert_eq!(chromium_major_version("Chrome/152.0.7977.83"), Some(152));
+        assert_eq!(chromium_major_version("HeadlessChrome/151.0.1.2"), Some(151));
+        assert_eq!(chromium_major_version("Chrome/abc"), None);
+        assert_eq!(chromium_major_version("Chrome"), None);
     }
 }

@@ -2837,3 +2837,57 @@ fn windows_activation_failure_retries_before_giving_up() {
         "激活彻底失败没有任何上报 —— 这条路径刚从「谁也走不到」变成「所有 Windows 用户都走」"
     );
 }
+
+/// 宠物层因为「CDP 连不上」而失败时不该回传 —— 桥自己已经报过了。
+///
+/// 光看代码很难发现这条守卫在防什么:事件名换掉之后,上报与否完全由
+/// diagnostics_flush 的 is_reportable 按**字符串**判定。谁把名字改回带 fail 的,
+/// 编译照过、测试照绿,pet 又会重新霸榜。所以两头一起钉。
+#[test]
+fn pet_overlay_cdp_unreachable_is_not_reported() {
+    let source = include_str!("../src/launcher.rs");
+    let body = source
+        .split_once("fn pet_overlay_sync_failure_event")
+        .expect("找不到 pet_overlay_sync_failure_event —— 改名了就更新这条守卫")
+        .1;
+    let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+
+    let quiet = body
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .filter(|name| name.starts_with("pet."))
+        })
+        .expect("取不到 cdp_unreachable 那条分支的事件名");
+
+    // 这四个词任意一个出现在事件名里,is_reportable 就会放它上传 —— 白改。
+    for marker in ["fail", "error", "unreachable", "timeout"] {
+        assert!(
+            !quiet.contains(marker),
+            "{quiet} 里有 {marker},上报规则会认它 —— 换名字等于没换"
+        );
+    }
+    // detail 里也不能出现 error/err 键(那是 is_reportable 的另一条规则)。
+    //
+    // 必须从**写 detail 的那个函数**切,不能从 pet_overlay_sync_failure_event 切:
+    // 后者只有 6 行、里面压根没有 detail json,断言恒真。实测过 ——
+    // 在 detail 里加回 `"error": message` 这条断言照样绿,而那正是它声称要防的事。
+    let emitter = source
+        .split_once("fn record_pet_overlay_sync_result")
+        .expect("找不到 record_pet_overlay_sync_result")
+        .1;
+    let emitter = &emitter[..emitter.find("
+pub fn ").unwrap_or(emitter.len())];
+    assert!(
+        !emitter.contains("\"error\"") && !emitter.contains("\"err\""),
+        "detail 里带了 error/err 键,is_reportable 会照样放它上传 —— 换名字等于白换"
+    );
+    // 其他 kind 仍然要回传:那才是宠物层自己的问题。
+    assert!(
+        body.contains("pet.real_mouse_overlay_sync_failed"),
+        "非 cdp_unreachable 的失败必须照旧回传"
+    );
+}

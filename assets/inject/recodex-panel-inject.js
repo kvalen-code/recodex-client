@@ -1529,6 +1529,26 @@
   //   update-channel.available → 有新版本可装(非强制)
   //   compatibility.supported=false → 当前版本已不受支持(强制更新)
   // 两者组合出「可更新 / 必须更新 / 已是最新」三种展示。
+  // candidate 比 current 新才算「有更新」。任何一边解析不出三段数字就返回 true ——
+  // **认不出就沿用服务端的判断**，别拿一个没见过的版本号格式把更新入口关掉。
+  // 逐段按数字比，不是按字符串："1.3.10" 的字符串序小于 "1.3.9"。
+  // 与 Rust 侧 selfupdate.rs 的 reject_non_upgrade 同一套规则，改一处要改两处。
+  function isNewerVersion(candidate, current) {
+    const parse = (value) => {
+      const parts = String(value == null ? "" : value).trim().split(".");
+      if (parts.length !== 3) return null;
+      const numbers = parts.map((part) => (/^\d+$/.test(part) ? Number(part) : NaN));
+      return numbers.some(Number.isNaN) ? null : numbers;
+    };
+    const a = parse(candidate);
+    const b = parse(current);
+    if (!a || !b) return true;
+    for (let i = 0; i < 3; i += 1) {
+      if (a[i] !== b[i]) return a[i] > b[i];
+    }
+    return false;
+  }
+
   async function renderUpdate(box) {
     if (!box) return;
     const res = await bridge("/recodex/check-client", {});
@@ -1544,7 +1564,11 @@
     const channel = data.update_channel || {};
     const current = compat.client_version || "—";
     const forced = compat.supported === false;
-    const hasUpdate = !!channel.available;
+    // 服务端的 available **不比较版本号**（只看两个设置项非空 + 灰度名单），
+    // 所以已经在最新版的人也会被推更新。1.3.4 起客户端会拒绝装不比自己新的包，
+    // 于是那一点就变成一个红色的「已经是最新版本」——看着像更新失败。
+    // 在这儿自己比一次：比不出来（版本号格式变了）就沿用服务端的说法。
+    const hasUpdate = !!channel.available && isNewerVersion(channel.latest_version, current);
     // 服务端给的是机器码(already_latest / not_in_rollout / not_configured),
     // 直接打印给用户等于没说。认识的翻译掉,不认识的原样透出(便于排查)。
     const REASONS = {
