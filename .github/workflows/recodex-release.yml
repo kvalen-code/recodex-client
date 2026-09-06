@@ -5,7 +5,7 @@
 # 装完之后客户端仍自报旧版本,会永远提示"有更新"陷入死循环,所以这里硬校验。
 #
 # 产物两份,用途不同,不要混:
-#   codex-plus-plus.exe            自更新用。客户端下载后校验 sha256 再替换自身。
+#   recodex.exe            自更新用。客户端下载后校验 sha256 再替换自身。
 #   ReCodex-<版本>-windows-x64-setup.exe   首次安装用。放到官网下载页。
 #
 # Windows + macOS(x64/arm64)。**没有 Linux**:这个客户端靠注入官方 ChatGPT
@@ -71,7 +71,7 @@ jobs:
       - name: 自检 —— exe 自报版本必须等于发布版本
         shell: pwsh
         run: |
-          $v = (Get-Item target/release/codex-plus-plus.exe).VersionInfo.FileVersion
+          $v = (Get-Item target/release/recodex.exe).VersionInfo.FileVersion
           if ($v -ne "${{ steps.ver.outputs.version }}") {
             throw "exe 自报 $v,与发布版本 ${{ steps.ver.outputs.version }} 不一致"
           }
@@ -83,7 +83,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/windows/app | Out-Null
-          Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
+          Copy-Item target/release/recodex.exe dist/windows/app/
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) { $makensis = "makensis" }
           Push-Location scripts/installer/windows
@@ -95,11 +95,11 @@ jobs:
         shell: pwsh
         run: |
           $v = "${{ steps.ver.outputs.version }}"
-          $exe = "target/release/codex-plus-plus.exe"
+          $exe = "target/release/recodex.exe"
           $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
           $manifest = [ordered]@{
             version = $v
-            url     = "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/codex-plus-plus.exe"
+            url     = "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/recodex.exe"
             sha256  = $sha
           }
           New-Item -ItemType Directory -Force "dist/upload/$v" | Out-Null
@@ -137,7 +137,7 @@ jobs:
         run: |
           $v = "${{ steps.ver.outputs.version }}"
           $m = Invoke-RestMethod -Uri "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/manifest.json" -TimeoutSec 30
-          $local = (Get-FileHash "dist/upload/$v/codex-plus-plus.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $local = (Get-FileHash "dist/upload/$v/recodex.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($m.sha256 -ne $local) { throw "线上 manifest 的 sha256 与本地包体不一致" }
           if ($m.version -ne $v) { throw "线上 manifest 版本号不对:$($m.version)" }
           Invoke-WebRequest -Uri $m.url -Method Head -UseBasicParsing -TimeoutSec 30 | Out-Null

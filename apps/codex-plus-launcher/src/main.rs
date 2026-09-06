@@ -257,9 +257,14 @@ async fn launcher_main(
         })?;
         return Ok(());
     };
-    tokio::spawn(async {
-        let _ = notify_manager_when_update_available().await;
-    });
+    // 这里原先每次启动都无条件去拉
+    // https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json,
+    // 是上游遗留。两个问题:
+    //   1. 它是**活的网络请求**,防火墙日志、抓包、企业代理里直接暴露上游仓库名 ——
+    //      比二进制里那些字符串外露得多;
+    //   2. 真判断出「有更新」时它去拉 MANAGER_BINARY,而 slim fork 根本不构建管理工具。
+    // 我们真正的自更新走 selfupdate.rs + 服务端下发的清单(routes.rs 的 /self-update),
+    // 与这条毫无关系。删掉。
     // recodex-overlay: 微信连接按已保存设置自动拉起(原由 manager 负责)
     codex_plus_core::connect::control::start_from_saved_settings();
     let hooks = LauncherHooks::default();
@@ -465,25 +470,6 @@ fn log_launcher_already_running(debug_port: u16) {
             "debug_port": debug_port
         }),
     );
-}
-
-async fn notify_manager_when_update_available() -> anyhow::Result<bool> {
-    let update =
-        codex_plus_core::update::check_for_update(codex_plus_core::version::VERSION).await?;
-    if !update.update_available {
-        return Ok(false);
-    }
-    open_manager_with_update_prompt()?;
-    Ok(true)
-}
-
-fn open_manager_with_update_prompt() -> anyhow::Result<()> {
-    codex_plus_core::install::spawn_companion(
-        codex_plus_core::install::MANAGER_BINARY,
-        ["--show-update"],
-    )
-    .map(|_| ())
-    .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))
 }
 
 fn parse_launch_options<I, S>(args: I) -> LaunchOptions

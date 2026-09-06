@@ -566,7 +566,12 @@ fn start_native_menu_localizer(inspector_port: u16, debug_port: u16) {
         return;
     }
     tokio::spawn(async move {
-        if let Err(error) = crate::native_menu::install_native_menu_localizer(inspector_port).await
+        // 152+ 上 `--inspect` 被 fuse 关死,这条路永远不通。判定在
+        // install_native_menu_localizer **循环内部**做(第 1 次失败之后),不在这儿 ——
+        // 这一刻 Codex 的 CDP 端口还没监听,在这里问 browser_identity 只会拿到 Err,
+        // 整道闸落空。第一版就是那么写的,是死代码。
+        if let Err(error) =
+            crate::native_menu::install_native_menu_localizer(inspector_port, debug_port).await
         {
             // 判死刑时顺手问一次 CDP 的浏览器世代。
             //
@@ -3298,6 +3303,25 @@ fn record_pet_cursor_driver_failure(
     }
 }
 
+/// CDP 连不上导致的宠物层同步失败**不回传**,换一个不带错误标记的事件名。
+///
+/// 那种情况桥自己已经报过 `bridge.health_check_failed` 了 —— 实测 48 小时内
+/// 57 次 pet 失败里有 55 次落在同设备桥故障的 5 分钟内(96%)。同一件事报两遍,
+/// 只会把 pet 顶进诊断榜单第 4 名,让人以为它是一个独立故障去单独查。
+///
+/// 名字里不能有 fail/error/unreachable 这些词,detail 里也不能有 error/err 键 ——
+/// 上报规则认这两样(见 diagnostics_flush.rs 的 is_reportable)。
+/// 本地日志照写:排查一台具体机器时它仍然是有用的一行。
+///
+/// 其他 kind 照常回传:那才是宠物层自己的问题,不是桥的陪葬。
+fn pet_overlay_sync_failure_event(kind: &str) -> &'static str {
+    if kind == "cdp_unreachable" {
+        "pet.real_mouse_overlay_sync_unavailable"
+    } else {
+        "pet.real_mouse_overlay_sync_failed"
+    }
+}
+
 fn record_pet_overlay_sync_result(debug_port: u16, helper_port: u16, result: anyhow::Result<()>) {
     match result {
         Ok(()) => {
@@ -3313,13 +3337,15 @@ fn record_pet_overlay_sync_result(debug_port: u16, helper_port: u16, result: any
         }
         Err(error) => {
             if !PET_OVERLAY_SYNC_FAILED.swap(true, Ordering::Relaxed) {
+                let message = format!("{error:#}");
+                let kind = classify_cdp_failure(&message);
                 let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "pet.real_mouse_overlay_sync_failed",
+                    pet_overlay_sync_failure_event(kind),
                     serde_json::json!({
                         "debug_port": debug_port,
                         "helper_port": helper_port,
-                        "kind": classify_cdp_failure(&format!("{error:#}")),
-                        "message": format!("{error:#}")
+                        "kind": kind,
+                        "message": message
                     }),
                 );
             }

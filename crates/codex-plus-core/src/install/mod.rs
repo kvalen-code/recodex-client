@@ -10,7 +10,23 @@ pub mod windows;
 pub const SILENT_NAME: &str = "ReCodex";
 // manager 已弃用(方案A),保留常量仅为兼容旧快捷方式清理
 pub const MANAGER_NAME: &str = "ReCodex";
-pub const SILENT_BINARY: &str = "codex-plus-plus";
+/// 出货二进制的文件名。
+///
+/// 用户看得见它:Windows 上装在 `%LOCALAPPDATA%\Programs\ReCodex\` 下,
+/// 任务管理器里也是这个名字。原先叫 `codex-plus-plus`,一眼就能看出上游是谁。
+pub const SILENT_BINARY: &str = "recodex";
+
+/// 改名之前的二进制名。**匹配自己的进程时必须连它一起认**。
+///
+/// 自更新是「用新内容盖掉自己那个 exe」(selfupdate.rs 的 stage_replacement 走
+/// `current_exe()`),文件名不会跟着变 —— 也就是说**老用户升级到新版之后,
+/// 磁盘上那个 exe 仍然叫 codex-plus-plus.exe**,而里面跑的是新代码。
+/// 只认新名字的话,新代码会找不到自己的进程:清理不了残留实例、重启逻辑失灵,
+/// 而且不会有任何报错。
+///
+/// 只有重新跑一遍安装包才会变成新名字(安装包会把旧的那个删掉)。
+/// 在还有老安装存活之前,这个常量不能删。
+pub const LEGACY_SILENT_BINARY: &str = "codex-plus-plus";
 /// macOS 上**出货包**里 `Contents/MacOS/` 下那个可执行文件名。
 ///
 /// 取自 scripts/installer/macos/package-recodex-dmg.sh:它把二进制直接
@@ -21,9 +37,17 @@ pub const SILENT_BINARY: &str = "codex-plus-plus";
 /// **启动脚本**,它 `exec` 真二进制 —— exec 会替换进程映像,进程名随即变回
 /// SILENT_BINARY。那条路径旧代码本来就覆盖得到,不需要新名字。
 pub const MACOS_SILENT_EXECUTABLE: &str = SILENT_NAME;
-pub const MANAGER_BINARY: &str = "codex-plus-plus-manager";
-pub const SILENT_BUNDLE_ID: &str = "com.bigpizzav3.codexplusplus";
-pub const MANAGER_BUNDLE_ID: &str = "com.bigpizzav3.codexplusplus.manager";
+/// 同上,manager 那个包里的可执行文件名。manager 已弃用不出货,
+/// 留着只为清理旧安装 —— 但它的名字照样会被编进二进制,所以一并去品牌。
+///
+/// **不能直接用 MANAGER_NAME**:它和 SILENT_NAME 都是 "ReCodex",两个包的
+/// 可执行文件就会重名,`macos_companion_binary_from_exe`(从一个包去找另一个包)
+/// 立刻退化成"找到自己"。改名时踩到过一次,由 installers.rs 那两条
+/// companion_binary_path_resolves_* 抓出来的。
+pub const MACOS_MANAGER_EXECUTABLE: &str = "ReCodexManager";
+pub const MANAGER_BINARY: &str = "recodex-manager";
+pub const SILENT_BUNDLE_ID: &str = "com.recodex.app";
+pub const MANAGER_BUNDLE_ID: &str = "com.recodex.app.manager";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -341,7 +365,7 @@ fn macos_companion_binary_from_exe(exe: &Path, binary: &str) -> Option<PathBuf> 
             return Some(macos_preferred_bundle_binary(
                 exe,
                 SILENT_BINARY,
-                "CodexPlusPlus",
+                MACOS_SILENT_EXECUTABLE,
             ));
         }
         let macos = applications_dir
@@ -353,7 +377,7 @@ fn macos_companion_binary_from_exe(exe: &Path, binary: &str) -> Option<PathBuf> 
                 .join(SILENT_BINARY)
                 .exists()
                 .then(|| macos.join(SILENT_BINARY))
-                .unwrap_or_else(|| macos.join("CodexPlusPlus")),
+                .unwrap_or_else(|| macos.join(MACOS_SILENT_EXECUTABLE)),
         );
     }
     if binary == MANAGER_BINARY {
@@ -361,7 +385,7 @@ fn macos_companion_binary_from_exe(exe: &Path, binary: &str) -> Option<PathBuf> 
             return Some(macos_preferred_bundle_binary(
                 exe,
                 MANAGER_BINARY,
-                "CodexPlusPlusManager",
+                MACOS_MANAGER_EXECUTABLE,
             ));
         }
         let macos = applications_dir
@@ -373,7 +397,7 @@ fn macos_companion_binary_from_exe(exe: &Path, binary: &str) -> Option<PathBuf> 
                 .join(MANAGER_BINARY)
                 .exists()
                 .then(|| macos.join(MANAGER_BINARY))
-                .unwrap_or_else(|| macos.join("CodexPlusPlusManager")),
+                .unwrap_or_else(|| macos.join(MACOS_MANAGER_EXECUTABLE)),
         );
     }
     None

@@ -8,8 +8,8 @@ use codex_plus_core::install::{
 fn windows_entrypoint_plan_contains_silent_and_manager_entrypoints() {
     let options = InstallOptions {
         install_root: Some("C:/Users/A/Desktop".into()),
-        launcher_path: Some("C:/Tools/codex-plus-plus.exe".into()),
-        manager_path: Some("C:/Tools/codex-plus-plus-manager.exe".into()),
+        launcher_path: Some("C:/Tools/recodex.exe".into()),
+        manager_path: Some("C:/Tools/recodex-manager.exe".into()),
         remove_owned_data: false,
     };
 
@@ -17,14 +17,16 @@ fn windows_entrypoint_plan_contains_silent_and_manager_entrypoints() {
 
     assert!(plan.silent_shortcut.ends_with("ReCodex.lnk"));
     assert!(plan.manager_shortcut.ends_with("ReCodex.lnk"));
-    assert_eq!(plan.launcher_path, "C:/Tools/codex-plus-plus.exe");
-    assert_eq!(plan.manager_path, "C:/Tools/codex-plus-plus-manager.exe");
-    assert_eq!(plan.silent_icon_path, "C:/Tools/codex-plus-plus.exe");
+    assert_eq!(plan.launcher_path, "C:/Tools/recodex.exe");
+    assert_eq!(plan.manager_path, "C:/Tools/recodex-manager.exe");
+    assert_eq!(plan.silent_icon_path, "C:/Tools/recodex.exe");
     assert_eq!(
         plan.manager_icon_path,
-        "C:/Tools/codex-plus-plus-manager.exe"
+        "C:/Tools/recodex-manager.exe"
     );
     assert_eq!(plan.uninstall_key, "ReCodex");
+    // legacy 键刻意**不**跟着去品牌:它的作用是清理**上游 Codex++** 装出来的
+    // 注册表项,改成 ReCodex 就等于再也清不掉那份残留。
     assert_eq!(plan.legacy_uninstall_key, "CodexPlusPlus");
     assert_eq!(
         plan.uninstaller_path.replace('\\', "/"),
@@ -40,7 +42,7 @@ fn windows_entrypoint_plan_contains_silent_and_manager_entrypoints() {
     );
     assert_ne!(
         plan.uninstall_command,
-        "\"C:/Tools/codex-plus-plus-manager.exe\""
+        "\"C:/Tools/recodex-manager.exe\""
     );
 }
 
@@ -64,8 +66,8 @@ fn windows_entrypoint_plan_can_request_owned_data_removal_without_shell_script()
 fn macos_bundle_metadata_contains_silent_and_manager_apps() {
     let options = InstallOptions {
         install_root: Some("/Applications".into()),
-        launcher_path: Some("/opt/ReCodex/codex-plus-plus".into()),
-        manager_path: Some("/opt/ReCodex/codex-plus-plus-manager".into()),
+        launcher_path: Some("/opt/ReCodex/recodex".into()),
+        manager_path: Some("/opt/ReCodex/recodex-manager".into()),
         remove_owned_data: false,
     };
 
@@ -85,17 +87,17 @@ fn macos_bundle_metadata_contains_silent_and_manager_apps() {
     assert!(!silent.info_plist.contains("<string>dreamskin</string>"));
     assert_eq!(
         silent.binary_target_name.as_deref(),
-        Some("codex-plus-plus")
+        Some("recodex")
     );
     assert_eq!(
         manager.binary_target_name.as_deref(),
-        Some("codex-plus-plus-manager")
+        Some("recodex-manager")
     );
-    assert!(silent.launch_script.contains("$DIR/codex-plus-plus"));
+    assert!(silent.launch_script.contains("$DIR/recodex"));
     assert!(
         manager
             .launch_script
-            .contains("$DIR/codex-plus-plus-manager")
+            .contains("$DIR/recodex-manager")
     );
 }
 
@@ -118,15 +120,26 @@ fn companion_binary_path_resolves_macos_silent_app_next_to_manager_app() {
     // 原来直接写死 /Applications/…,而实现是靠 `.exists()` 挑文件的 —— 于是只有
     // 「真装了 ReCodex 的 mac」才跑得过,别的机器一律红,等于常年没有这条守卫。
     // 自己把 bundle 造出来,任何平台都能真正验到这段路径解析。
-    let macos_dir = macos_bundle_fixture(&["CodexPlusPlus", "CodexPlusPlusManager"]);
-    let manager_exe = macos_dir.path().join("CodexPlusPlusManager");
+    let macos_dir = macos_bundle_fixture(&["ReCodex", "ReCodexManager"]);
+    let manager_exe = macos_dir.path().join("ReCodexManager");
 
     let companion = companion_binary_path_from_exe(&manager_exe, SILENT_BINARY);
 
-    assert_eq!(companion, macos_dir.path().join("CodexPlusPlus"));
-    // sidecar 名(codex-plus-plus)不存在时不能拿它顶包:bundle 里真正能跑的是
-    // CodexPlusPlus,挑错了就是启动一个不存在的二进制。
-    assert_ne!(companion, macos_dir.path().join("codex-plus-plus"));
+    // 只比文件名、且不分大小写:改名之后 SILENT_BINARY("recodex")与
+    // MACOS_SILENT_EXECUTABLE("ReCodex")只差大小写,而 Windows 与 macOS 默认卷
+    // 都**不区分大小写** —— 实现里那句 `.exists()` 探测因此分不出两者。
+    // 功能上无所谓(指向同一个文件),但断言不能再钉死某一种拼写。
+    let name = companion
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert_eq!(name, "recodex", "同伴应解析到 silent 那个可执行文件,实际 {companion:?}");
+    assert_eq!(companion.parent(), Some(macos_dir.path()));
+    // 原来这条钉的是「不能拿一个不存在的名字顶包」。改名后新旧只差大小写,
+    // 只比文件名的话,在**区分大小写**的卷上返回一个根本不存在的路径也会绿 ——
+    // 所以直接要求它指向一个真实存在的文件。
+    assert!(companion.exists(), "同伴路径指向了一个不存在的文件:{companion:?}");
 }
 
 /// 造一个 `<tmp>/ReCodex.app/Contents/MacOS/` 并放进指定的可执行文件,
@@ -161,22 +174,22 @@ impl MacosBundleFixture {
 
 #[test]
 fn companion_binary_path_resolves_macos_manager_app_next_to_silent_app() {
-    let macos_dir = macos_bundle_fixture(&["CodexPlusPlus", "CodexPlusPlusManager"]);
-    let silent_exe = macos_dir.path().join("CodexPlusPlus");
+    let macos_dir = macos_bundle_fixture(&["ReCodex", "ReCodexManager"]);
+    let silent_exe = macos_dir.path().join("ReCodex");
 
     let companion =
         companion_binary_path_from_exe(&silent_exe, codex_plus_core::install::MANAGER_BINARY);
 
-    assert_eq!(companion, macos_dir.path().join("CodexPlusPlusManager"));
+    assert_eq!(companion, macos_dir.path().join("ReCodexManager"));
 }
 
 #[test]
 fn macos_companion_launch_uses_bundle_ids_from_app_translocation() {
     let manager_exe = std::path::Path::new(
-        "/private/var/folders/x/AppTranslocation/manager-id/d/ReCodex.app/Contents/MacOS/CodexPlusPlusManager",
+        "/private/var/folders/x/AppTranslocation/manager-id/d/ReCodex.app/Contents/MacOS/ReCodexManager",
     );
     let silent_exe = std::path::Path::new(
-        "/private/var/folders/x/AppTranslocation/silent-id/d/ReCodex.app/Contents/MacOS/CodexPlusPlus",
+        "/private/var/folders/x/AppTranslocation/silent-id/d/ReCodex.app/Contents/MacOS/ReCodex",
     );
 
     assert_eq!(
@@ -194,7 +207,7 @@ fn macos_companion_launch_uses_bundle_ids_from_app_translocation() {
 
 #[test]
 fn macos_companion_launch_keeps_bare_binary_development_mode() {
-    let manager_exe = std::path::Path::new("/tmp/target/debug/codex-plus-plus-manager");
+    let manager_exe = std::path::Path::new("/tmp/target/debug/recodex-manager");
 
     assert_eq!(
         macos_companion_bundle_identifier_from_exe(manager_exe, SILENT_BINARY),
@@ -206,9 +219,9 @@ fn macos_companion_launch_keeps_bare_binary_development_mode() {
 fn macos_bundle_does_not_wrap_the_bundle_executable_in_itself() {
     let options = InstallOptions {
         install_root: Some("/Applications".into()),
-        launcher_path: Some("/Applications/ReCodex.app/Contents/MacOS/CodexPlusPlus".into()),
+        launcher_path: Some("/Applications/ReCodex.app/Contents/MacOS/ReCodex".into()),
         manager_path: Some(
-            "/Applications/ReCodex.app/Contents/MacOS/CodexPlusPlusManager".into(),
+            "/Applications/ReCodex.app/Contents/MacOS/ReCodexManager".into(),
         ),
         remove_owned_data: false,
     };
@@ -219,20 +232,20 @@ fn macos_bundle_does_not_wrap_the_bundle_executable_in_itself() {
     assert_eq!(
         silent.binary_source,
         Some(std::path::PathBuf::from(
-            "/Applications/ReCodex.app/Contents/MacOS/CodexPlusPlus"
+            "/Applications/ReCodex.app/Contents/MacOS/ReCodex"
         ))
     );
     assert_eq!(
         manager.binary_source,
         Some(std::path::PathBuf::from(
-            "/Applications/ReCodex.app/Contents/MacOS/CodexPlusPlusManager"
+            "/Applications/ReCodex.app/Contents/MacOS/ReCodexManager"
         ))
     );
-    assert!(silent.launch_script.contains("$DIR/codex-plus-plus"));
+    assert!(silent.launch_script.contains("$DIR/recodex"));
     assert!(
         manager
             .launch_script
-            .contains("$DIR/codex-plus-plus-manager")
+            .contains("$DIR/recodex-manager")
     );
 }
 

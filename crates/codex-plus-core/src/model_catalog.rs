@@ -51,7 +51,7 @@ pub async fn read_codex_model_catalog() -> Value {
         }
     }
     let env = std::env::vars().collect::<HashMap<_, _>>();
-    let client = match crate::http_client::proxied_client("CodexPlusPlus/1.0") {
+    let client = match crate::http_client::proxied_client("ReCodex/1.0") {
         Ok(client) => client,
         Err(error) => {
             return json!({
@@ -784,7 +784,7 @@ pub async fn recommended_model_for_home(
     // 自带客户端而不是让调用方传:launcher 不依赖 reqwest,为这一件事给它加一个
     // 传递依赖不值当。超时必须有 —— 这段跑在启动路径上,不能被慢网络拖住。
     let client = reqwest::Client::builder()
-        .user_agent("CodexPlusPlus/1.0")
+        .user_agent("ReCodex/1.0")
         .timeout(timeout)
         .build()
         .ok()?;

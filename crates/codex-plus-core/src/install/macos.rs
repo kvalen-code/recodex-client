@@ -5,17 +5,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use super::{
-    install_root_or_default, option_or_current_exe, InstallOptions, MacosAppBundle, MANAGER_BINARY,
-    MANAGER_NAME, SILENT_BINARY, SILENT_NAME,
+    install_root_or_default, option_or_current_exe, InstallOptions, MacosAppBundle,
+    MACOS_MANAGER_EXECUTABLE, MACOS_SILENT_EXECUTABLE, MANAGER_BINARY, MANAGER_NAME, SILENT_BINARY,
+    SILENT_NAME,
 };
 
 pub fn build_app_bundle(options: &InstallOptions, manager: bool) -> MacosAppBundle {
     let install_root = install_root_or_default(options);
     let display_name = if manager { MANAGER_NAME } else { SILENT_NAME };
     let executable_name = if manager {
-        "CodexPlusPlusManager"
+        MACOS_MANAGER_EXECUTABLE
     } else {
-        "CodexPlusPlus"
+        MACOS_SILENT_EXECUTABLE
     };
     let binary = if manager {
         MANAGER_BINARY
@@ -173,9 +174,9 @@ fn copy_icon(resources: &Path) -> anyhow::Result<()> {
     let source = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
-        .map(|path| path.join("codex-plus-plus.png"));
+        .map(|path| path.join("recodex.png"));
     if let Some(source) = source.filter(|path| path.exists()) {
-        fs::copy(source, resources.join("codex-plus-plus.png"))?;
+        fs::copy(source, resources.join("recodex.png"))?;
     }
     Ok(())
 }
@@ -187,7 +188,7 @@ fn executable_name_from_plist(plist: &str) -> String {
         .nth(1)
         .and_then(|tail| tail.split("<string>").nth(1))
         .and_then(|tail| tail.split("</string>").next())
-        .unwrap_or("CodexPlusPlus")
+        .unwrap_or(MACOS_SILENT_EXECUTABLE)
         .to_string()
 }
 
@@ -220,7 +221,7 @@ fn info_plist(display_name: &str, executable_name: &str, identifier_suffix: &str
   <key>CFBundleDisplayName</key>
   <string>{display_name}</string>
   <key>CFBundleIdentifier</key>
-  <string>com.bigpizzav3.codexplusplus{identifier_suffix}</string>
+  <string>com.recodex.app{identifier_suffix}</string>
   <key>CFBundleVersion</key>
   <string>{version}</string>
   <key>CFBundleShortVersionString</key>
@@ -230,7 +231,7 @@ fn info_plist(display_name: &str, executable_name: &str, identifier_suffix: &str
   <key>CFBundleExecutable</key>
   <string>{executable_name}</string>
   <key>CFBundleIconFile</key>
-  <string>codex-plus-plus.png</string>
+  <string>recodex.png</string>
 {url_types}  <key>LSUIElement</key>
   <true/>
   <key>LSMinimumSystemVersion</key>
