@@ -2160,6 +2160,10 @@
   const codexDefaultServiceTierSetting = { key: "default-service-tier", default: null };
   const codexServiceTierFallbackFastValue = "priority";
   const codexServiceTierModulePromises = new Map();
+  // namePart -> { at, attempts, error }。见 loadCodexAppModule 里的说明。
+  const codexAppModuleFailures = new Map();
+  const codexAppModuleRetryCooldownMs = 30000;
+  const codexAppModuleMaxAttempts = 8;
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
@@ -2206,14 +2210,41 @@
     return "";
   }
 
+  // 失败必须被**记住**。原来失败只是把 promise 从 map 里删掉,等于只缓存成功 ——
+  // 任何调用方下一次重试都会重新走一遍 codexAppAssetUrlFromScriptText():
+  // 遍历所有 script/link/resource 条目,对每个候选 fetch 全文再跑三条正则。
+  //
+  // 这个 loader 有 6 个调用方,其中 installCodexServiceTierDispatcherPatch() 挂在
+  // scanLightweight() 上,而 scan 由 MutationObserver 驱动(200ms 去抖)—— 用户打字
+  // 或流式输出时 DOM 一直在动,就是约 5 次/秒。Codex 侧 asset 改名后 dispatcher 永远
+  // 装不上,于是每秒 5 轮 × 3 个前缀 × 全量资产 fetch,成了永不停止的重扫。
+  // 上游实测(macOS 空闲态):301 次请求/秒、渲染进程 CPU 44.7%、JS 堆每秒涨约 1MB。
+  //
+  // 记住失败 + 冷却重试:下游即便还在轮询,也只会周期性地试一次。
+  // 冷却是**按 namePart 分桶**的,三个前缀各自计数,互不影响。
   async function loadCodexAppModule(namePart) {
     if (!codexServiceTierModulePromises.has(namePart)) {
+      const failure = codexAppModuleFailures.get(namePart);
+      if (failure
+          && (failure.attempts >= codexAppModuleMaxAttempts
+            || Date.now() - failure.at < codexAppModuleRetryCooldownMs)) {
+        throw failure.error;
+      }
       const promise = Promise.resolve().then(async () => {
         const url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
         if (!url) throw new Error(`未找到 Codex App asset: ${namePart}`);
         return await import(url);
+      }).then((module) => {
+        // Codex 更新后 asset 可能又出现了,成功时清掉失败记录,冷却计数重新开始。
+        codexAppModuleFailures.delete(namePart);
+        return module;
       }).catch((error) => {
         codexServiceTierModulePromises.delete(namePart);
+        codexAppModuleFailures.set(namePart, {
+          at: Date.now(),
+          attempts: (codexAppModuleFailures.get(namePart)?.attempts || 0) + 1,
+          error,
+        });
         throw error;
       });
       codexServiceTierModulePromises.set(namePart, promise);
@@ -3340,8 +3371,25 @@
     return dispatcherClass?.getInstance?.() || null;
   }
 
+  const serviceTierDispatcherPatchMaxMisses = 8;
+  let serviceTierDispatcherPatchMissCount = 0;
+  let serviceTierDispatcherPatchDisabled = false;
+  let serviceTierDispatcherPatchPromise = null;
+
+  // 早退哨兵 __codexServiceTierRequestOverrideInstalled **只在成功路径写入** ——
+  // 失败什么都不记,下一轮 scan 又从头穿过来。Codex 侧 asset 改名后就永远装不上,
+  // 于是每轮 scan 重新拉一遍全部 app asset,而且每轮都发一条相同的诊断。
+  //
+  // 三道守卫各管一件事:
+  //   - Disabled:连续失败够多次就停掉这一层,别再拖着整个渲染进程
+  //   - Promise :上一轮没跑完就不要再起一轮。loadDispatcher() 会依次试三个前缀,
+  //              没有这道去重时,scan 的频率就直接变成并发全量扫描的频率
+  //   - 首次上报:失败原因第一次就够定位了;第 2~7 次静默,第 8 次另发一条 _skipped
+  //              说明这一层已经放弃(线上那 14 条 _failed 就是没有这道闸门的结果)
   function installCodexServiceTierDispatcherPatch() {
     if (window.__codexServiceTierRequestOverrideInstalled === codexServiceTierRequestOverrideVersion) return;
+    if (serviceTierDispatcherPatchDisabled) return;
+    if (serviceTierDispatcherPatchPromise) return;
     const loadDispatcher = async () => {
       const errors = [];
       for (const assetPrefix of ["setting-storage-", "vscode-api-", "app-initial-"]) {
@@ -3367,15 +3415,29 @@
         };
         installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix);
         window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
+        // 装上了就把计数清零:Codex 更新后再坏一次,仍然值得再报一条。
+        serviceTierDispatcherPatchMissCount = 0;
         sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", { assetPrefix });
       } catch (error) {
-        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {
-          errorName: error?.name || "",
-          errorMessage: error?.message || String(error),
-        });
+        serviceTierDispatcherPatchMissCount += 1;
+        if (serviceTierDispatcherPatchMissCount === 1) {
+          sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {
+            errorName: error?.name || "",
+            errorMessage: error?.message || String(error),
+          });
+        }
+        if (serviceTierDispatcherPatchMissCount >= serviceTierDispatcherPatchMaxMisses
+            && !serviceTierDispatcherPatchDisabled) {
+          serviceTierDispatcherPatchDisabled = true;
+          sendCodexPlusDiagnostic("service_tier_dispatcher_patch_skipped", {
+            misses: serviceTierDispatcherPatchMissCount,
+          });
+        }
+      } finally {
+        serviceTierDispatcherPatchPromise = null;
       }
     };
-    void patch();
+    serviceTierDispatcherPatchPromise = patch();
   }
 
   async function loadBackendSettings() {
@@ -8787,9 +8849,17 @@
       if (isChatContentMutation(mutation)) return false;
       const target = mutation.target;
       if (isExtensionUiNode(target)) return false;
-      if (target?.nodeType === 1 && nodeSelfOrAncestorMatchesScanRelevance(target)) return true;
       const changedNodes = [...Array.from(mutation.addedNodes), ...Array.from(mutation.removedNodes)];
-      return changedNodes.some((node) => node.nodeType === 1 && isScanRelevantNode(node));
+      const changedElements = changedNodes.filter((node) => node.nodeType === 1);
+      // 我们自己插入的节点挂在 Codex 的容器里,而容器本身是 scan-relevant ——
+      // 于是「写入 → 观察到自己的写入 → 200ms 后再 scan → 再写入」形成自喂循环,
+      // 空闲时也每秒全量扫描五次。一次变更如果**只动了我们自己的 UI**,就不该再排一次 scan。
+      //
+      // 顺序要紧:这道早退必须排在 nodeSelfOrAncestorMatchesScanRelevance 之前 ——
+      // 那一行会因为容器 relevant 而先 return true,早退就永远走不到。
+      if (changedElements.length && changedElements.every(isExtensionUiNode)) return false;
+      if (target?.nodeType === 1 && nodeSelfOrAncestorMatchesScanRelevance(target)) return true;
+      return changedElements.some(isScanRelevantNode);
     });
   }
 
