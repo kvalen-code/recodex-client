@@ -2164,6 +2164,22 @@
   const codexAppModuleFailures = new Map();
   const codexAppModuleRetryCooldownMs = 30000;
   const codexAppModuleMaxAttempts = 8;
+
+  // 这批前缀是不是都已经试满、彻底放弃了。
+  //
+  // 上层(dispatcher / marketplace 补丁)不能自己数失败次数:它们挂在 scan 上,
+  // 而 scan 由 MutationObserver 驱动、约 5 次/秒。冷却期内的调用是**瞬时抛出、
+  // 零扫描**的,可上层看到的仍是一次失败 —— 数轮次的话 1.6 秒就能凑够 8 次,
+  // 负缓存那 8 次 × 30 秒 ≈ 4 分钟的重试预算一次都用不上。
+  // Codex 是渐进加载的 SPA,启动期一次时序竞争就足以让增强功能整场会话不可用。
+  //
+  // 判据交给负缓存自己:它按真实扫描计数,天然带 30 秒节流。
+  function codexAppModulesExhausted(nameParts) {
+    return nameParts.every((namePart) => {
+      const failure = codexAppModuleFailures.get(namePart);
+      return !!failure && failure.attempts >= codexAppModuleMaxAttempts;
+    });
+  }
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
@@ -3371,9 +3387,9 @@
     return dispatcherClass?.getInstance?.() || null;
   }
 
-  const serviceTierDispatcherPatchMaxMisses = 8;
-  let serviceTierDispatcherPatchMissCount = 0;
-  let serviceTierDispatcherPatchDisabled = false;
+  const codexServiceTierDispatcherAssetPrefixes = ["setting-storage-", "vscode-api-", "app-initial-"];
+  let serviceTierDispatcherPatchFailureReported = false;
+  let serviceTierDispatcherPatchSkipReported = false;
   let serviceTierDispatcherPatchPromise = null;
 
   // 早退哨兵 __codexServiceTierRequestOverrideInstalled **只在成功路径写入** ——
@@ -3388,11 +3404,19 @@
   //              说明这一层已经放弃(线上那 14 条 _failed 就是没有这道闸门的结果)
   function installCodexServiceTierDispatcherPatch() {
     if (window.__codexServiceTierRequestOverrideInstalled === codexServiceTierRequestOverrideVersion) return;
-    if (serviceTierDispatcherPatchDisabled) return;
+    if (codexAppModulesExhausted(codexServiceTierDispatcherAssetPrefixes)) {
+      if (!serviceTierDispatcherPatchSkipReported) {
+        serviceTierDispatcherPatchSkipReported = true;
+        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_skipped", {
+          attempts: codexAppModuleMaxAttempts,
+        });
+      }
+      return;
+    }
     if (serviceTierDispatcherPatchPromise) return;
     const loadDispatcher = async () => {
       const errors = [];
-      for (const assetPrefix of ["setting-storage-", "vscode-api-", "app-initial-"]) {
+      for (const assetPrefix of codexServiceTierDispatcherAssetPrefixes) {
         try {
           const module = await loadCodexAppModule(assetPrefix);
           const dispatcher = codexServiceTierDispatcherFromModule(module);
@@ -3415,22 +3439,17 @@
         };
         installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix);
         window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
-        // 装上了就把计数清零:Codex 更新后再坏一次,仍然值得再报一条。
-        serviceTierDispatcherPatchMissCount = 0;
+        // 装上了就允许下次再报:Codex 更新后再坏一次,仍然值得知道。
+        serviceTierDispatcherPatchFailureReported = false;
+        serviceTierDispatcherPatchSkipReported = false;
         sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", { assetPrefix });
       } catch (error) {
-        serviceTierDispatcherPatchMissCount += 1;
-        if (serviceTierDispatcherPatchMissCount === 1) {
+        // 只报首次。每轮 scan 都发一条相同诊断会把上报额度烧光,真故障挤不进来。
+        if (!serviceTierDispatcherPatchFailureReported) {
+          serviceTierDispatcherPatchFailureReported = true;
           sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {
             errorName: error?.name || "",
             errorMessage: error?.message || String(error),
-          });
-        }
-        if (serviceTierDispatcherPatchMissCount >= serviceTierDispatcherPatchMaxMisses
-            && !serviceTierDispatcherPatchDisabled) {
-          serviceTierDispatcherPatchDisabled = true;
-          sendCodexPlusDiagnostic("service_tier_dispatcher_patch_skipped", {
-            misses: serviceTierDispatcherPatchMissCount,
           });
         }
       } finally {

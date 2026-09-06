@@ -11,14 +11,16 @@ pub const SILENT_NAME: &str = "ReCodex";
 // manager 已弃用(方案A),保留常量仅为兼容旧快捷方式清理
 pub const MANAGER_NAME: &str = "ReCodex";
 pub const SILENT_BINARY: &str = "codex-plus-plus";
-/// macOS 的 .app 里 `Contents/MacOS/` 下那个可执行文件名。
+/// macOS 上**出货包**里 `Contents/MacOS/` 下那个可执行文件名。
 ///
-/// 它和 SILENT_BINARY **不是一回事**:bundle 里放的是启动脚本,名字取自
-/// Info.plist 的 CFBundleExecutable(见 install/macos.rs build_app_bundle),
-/// 与二进制名不同。`pgrep -x` 按可执行名匹配,只查 SILENT_BINARY 就看不见
-/// 从 .app 启动的那个进程 —— 旧实例还活着却被判定为"没有",于是新实例去抢
-/// 已被占用的 helper 端口,退化成 port_fallback。
-pub const MACOS_SILENT_EXECUTABLE: &str = "CodexPlusPlus";
+/// 取自 scripts/installer/macos/package-recodex-dmg.sh:它把二进制直接
+/// `cp "$BINARY" "$APP_DIR/Contents/MacOS/ReCodex"`,所以点图标启动后
+/// `pgrep -x` 看到的进程名是 **ReCodex**,不是二进制名 codex-plus-plus。
+///
+/// 注意还有第二条布局:应用内安装器(install/macos.rs)在同一位置写的是一个
+/// **启动脚本**,它 `exec` 真二进制 —— exec 会替换进程映像,进程名随即变回
+/// SILENT_BINARY。那条路径旧代码本来就覆盖得到,不需要新名字。
+pub const MACOS_SILENT_EXECUTABLE: &str = SILENT_NAME;
 pub const MANAGER_BINARY: &str = "codex-plus-plus-manager";
 pub const SILENT_BUNDLE_ID: &str = "com.bigpizzav3.codexplusplus";
 pub const MANAGER_BUNDLE_ID: &str = "com.bigpizzav3.codexplusplus.manager";

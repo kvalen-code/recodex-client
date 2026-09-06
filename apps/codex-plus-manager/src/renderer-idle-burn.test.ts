@@ -136,8 +136,8 @@ test("dispatcher 补丁有 in-flight 去重与放弃开关", async () => {
 
   assert.match(
     body,
-    /if \(serviceTierDispatcherPatchDisabled\) return;/,
-    "少了放弃开关 —— 连续失败会一直拖着渲染进程",
+    /codexAppModulesExhausted\(codexServiceTierDispatcherAssetPrefixes\)/,
+    "放弃判据必须问负缓存的真实 attempts —— 自己数 scan 轮次的话,1.6 秒就能凑够阈值",
   );
   assert.match(
     body,
@@ -146,7 +146,7 @@ test("dispatcher 补丁有 in-flight 去重与放弃开关", async () => {
   );
   assert.match(
     body,
-    /serviceTierDispatcherPatchMissCount === 1/,
+    /if \(!serviceTierDispatcherPatchFailureReported\)/,
     "少了「只报首次」—— 每轮 scan 都会发一条相同诊断",
   );
   assert.match(
@@ -169,5 +169,29 @@ test("只动自己 UI 的变更不再排新 scan,且该早退排在 relevance �
   assert.ok(
     selfOnly < relevance,
     "早退必须排在 relevance 判定之前:容器本身是 relevant,那一行会先 return true,早退就永远走不到",
+  );
+});
+
+// 放弃判据必须按**真实扫描次数**算,不能按 scan 轮次。
+//
+// scan 由 MutationObserver 驱动、约 5 次/秒;冷却期内的调用是瞬时抛出、零扫描的。
+// 上层若自己数轮次,1.6 秒就能凑够 8 次 —— 负缓存那 4 分钟的重试预算一次都用不上。
+// Codex 是渐进加载的 SPA,启动期一次时序竞争就足以让增强功能整场会话不可用,
+// 而这恰恰是改动前**不会**发生的(那时虽然费 CPU,最终能装上)。
+test("冷却期内的失败不计入放弃阈值", async () => {
+  const renderer = await readRenderer();
+  const start = renderer.indexOf("  function codexAppModulesExhausted(nameParts) {");
+  assert.ok(start >= 0, "找不到 codexAppModulesExhausted");
+
+  const runtime = moduleLoaderRuntime(renderer);
+  // 模拟 1.6 秒内 8 轮 scan(不推进时钟 = 全在冷却期内)
+  for (let i = 0; i < 8; i += 1) {
+    await assert.rejects(runtime.call("setting-storage-"));
+  }
+
+  assert.equal(
+    runtime.fetches,
+    1,
+    `8 轮 scan 应只有 1 次真实扫描,实际 ${runtime.fetches} 次`,
   );
 });
