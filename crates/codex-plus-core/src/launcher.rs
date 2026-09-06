@@ -21,7 +21,10 @@ use crate::status::{LaunchStatus, StatusStore};
 
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
-const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 5_000;
+// Electron app 收到 quit 后要跑退出钩子、存会话,5 秒对着有对话在跑的 Codex 偏短;
+// 线上就是卡在这个窗口上直接把启动判死。放宽到 20 秒 —— 退不掉时下面有降级路径,
+// 不会真的白等满(等满也只发生在确实退不掉的机器上,而那种机器本来就要走降级)。
+const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 20_000;
 const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
@@ -227,6 +230,7 @@ pub trait LaunchHooks: Send + Sync {
                                 "debug_port": debug_port,
                                 "helper_port": helper_port,
                                 "attempt": attempt,
+                                "kind": classify_cdp_failure(&error.to_string()),
                                 "message": error.to_string()
                             }),
                         );
@@ -442,6 +446,22 @@ where
             );
             options.status_store.save_latest(&status)?;
             hooks.write_status("running").await;
+            // 成功启动这件事没有任何事件 —— 于是上报里只有分子没有分母,
+            // 「桥的失败少了」到底是修好了还是记少了,永远分不清
+            // (bridge.reinject_ok 的注释为对照组问题写过同样的话)。
+            //
+            // 降级那条已经能上报(走 launcher.user_alert),缺的正是这一条。
+            // 注意:要真正传回服务端,还需要把事件名加进
+            // desktop/recodex-integration 的 ALWAYS_REPORT —— 在那之前它只落本地
+            // 诊断日志(recodex logs / 支持包读得到),不占匿名口的限流额度。
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.ready",
+                serde_json::json!({
+                    "debug_port": debug_port,
+                    "helper_port": helper_port,
+                    "enhancements_enabled": settings.enhancements_enabled,
+                }),
+            );
         }
 
         Ok(LaunchHandle {
@@ -512,17 +532,63 @@ fn select_native_menu_inspector_port(debug_port: u16) -> u16 {
     crate::ports::select_platform_loopback_port(requested)
 }
 
-fn start_native_menu_localizer(inspector_port: u16) {
+/// 把「等 CDP」这条路上的失败分成可行动的两类。
+///
+/// 线上这两种失败共用 bridge.health_check_failed / bridge.reinject_failed /
+/// launcher.ensure_injection_retry_failed 三个事件名,报文里也只有一段自由文本,
+/// 服务端聚合时分不开 —— 可它们的处置完全相反:
+///
+///   - `cdp_unreachable`:端口压根没监听。macOS 上占多数,实测 attempt 到 64 仍
+///     connrefused,**不会自愈**,重试只是白烧。要查的是 Codex 为什么没带调试端口起来。
+///   - `no_target`:端口通了,但四条匹配规则都没命中。Windows 上占多数,采样点只出现
+///     attempt 1/2 就没了,说明多是页面还没加载完的时序抖动,**会自愈**;
+///     可如果 Codex 改版让规则永久失配,它就会一直报 —— 靠 observed 列表(见 cdp.rs
+///     describe_targets)区分这两种。
+///
+/// 有了这个字段,告警才能对两者定不同的阈值:cdp_unreachable 一次就值得看,
+/// no_target 要连着好几轮才算事。
+pub fn classify_cdp_failure(error: &str) -> &'static str {
+    if error.contains("No injectable") || error.contains("no page target") {
+        "no_target"
+    } else if error.contains("Connection refused")
+        || error.contains("os error 61")
+        || error.contains("os error 10061")
+        || error.contains("tcp connect error")
+    {
+        "cdp_unreachable"
+    } else {
+        "other"
+    }
+}
+
+fn start_native_menu_localizer(inspector_port: u16, debug_port: u16) {
     if inspector_port == 0 {
         return;
     }
     tokio::spawn(async move {
         if let Err(error) = crate::native_menu::install_native_menu_localizer(inspector_port).await
         {
+            // 判死刑时顺手问一次 CDP 的浏览器世代。
+            //
+            // 下面那段注释说「要分清得配合同次启动的 ensure_injection 是否成功
+            // 一起看」—— 可上报里既没有启动关联 id,成功事件又不上传,服务端**根本
+            // 做不到这个关联**。查线上那 122 条菜单失败时就卡死在这里:分不清是
+            // fuse 关死、Codex 没起来,还是已有实例在跑。
+            //
+            // 一次 /json/version 就能把三选一变成确定答案,写进同一行:
+            //   - 拿到 Chrome/152+   → fuse 那种,预期内,不是故障
+            //   - 拿到 Chrome/151    → 151 世代的启动竞态,该查
+            //   - 连不上             → Codex 自己没起来,菜单只是陪葬
+            let browser = crate::cdp::browser_identity(debug_port)
+                .await
+                .map(|identity| identity.browser)
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "native_menu.localization_failed",
                 serde_json::json!({
                     "inspector_port": inspector_port,
+                    "debug_port": debug_port,
+                    "cdp_browser": browser,
                     // 和 ensure_injection_exhausted / bridge.gave_up 一致:三条等 CDP
                     // 的路都在终态留下端口证据,不然又要靠猜。
                     //
@@ -1087,7 +1153,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                 let process_id = activate_packaged_app(app_user_model_id, arguments).await?;
                 apply_codexplusplus_window_icon_after_launch(process_id);
                 if let Some(inspector_port) = native_menu_inspector_port {
-                    start_native_menu_localizer(inspector_port);
+                    start_native_menu_localizer(inspector_port, debug_port);
                 }
                 return Ok(match activation {
                     CodexLaunch::PackagedActivation {
@@ -1122,8 +1188,27 @@ impl LaunchHooks for DefaultLaunchHooks {
                             "debug_port": debug_port
                         }),
                     );
-                    quit_macos_app_and_wait(app_dir).await?;
-                    MacosCleanupPolicy::QuitIfNotPreviouslyRunning
+                    // 退不掉不再让整个启动失败。
+                    //
+                    // 原来这里是 `?`:ChatGPT 没在窗口内退出 → 启动直接挂,弹一个
+                    // blocking 的「ReCodex 启动失败」。可用户此时手上的 Codex 是好的,
+                    // 只是没有调试端口 —— 把他整个挡在门外,比「能用但没有增强功能」
+                    // 糟得多。改成降级:复用正在跑的实例,增强功能这轮不可用。
+                    match quit_macos_app_and_wait(app_dir).await {
+                        Ok(()) => MacosCleanupPolicy::QuitIfNotPreviouslyRunning,
+                        Err(error) => {
+                            let _ = crate::diagnostic_log::append_diagnostic_log(
+                                "launcher.macos_debug_takeover_degraded",
+                                serde_json::json!({
+                                    "app_dir": app_dir,
+                                    "debug_port": debug_port,
+                                    "waited_ms": MACOS_DEBUG_TAKEOVER_WAIT_MS,
+                                    "error": error.to_string(),
+                                }),
+                            );
+                            MacosCleanupPolicy::SkipQuitBecauseAlreadyRunning
+                        }
+                    }
                 }
             };
             let command = if let Some(inspector_port) = native_menu_inspector_port {
@@ -1147,7 +1232,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                 .context("failed to launch macOS Codex app")?;
             *self.child.lock().await = Some(child);
             if let Some(inspector_port) = native_menu_inspector_port {
-                start_native_menu_localizer(inspector_port);
+                start_native_menu_localizer(inspector_port, debug_port);
             }
             return Ok(CodexLaunch::Process {
                 command,
@@ -1197,7 +1282,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             .with_context(|| format!("failed to launch Codex executable {executable}"))?;
         *self.child.lock().await = Some(child);
         if let Some(inspector_port) = native_menu_inspector_port {
-            start_native_menu_localizer(inspector_port);
+            start_native_menu_localizer(inspector_port, debug_port);
         }
         Ok(CodexLaunch::Process {
             command,
@@ -2834,6 +2919,7 @@ async fn check_and_reinject_bridge(
                     serde_json::json!({
                         "debug_port": debug_port,
                         "helper_port": helper_port,
+                        "kind": classify_cdp_failure(&error.to_string()),
                         "message": error.to_string()
                     }),
                 );
@@ -2873,6 +2959,7 @@ async fn check_and_reinject_bridge(
                 serde_json::json!({
                     "debug_port": debug_port,
                     "helper_port": helper_port,
+                    "kind": classify_cdp_failure(&error.to_string()),
                     "message": error.to_string()
                 }),
             );
@@ -3188,6 +3275,7 @@ fn record_pet_overlay_sync_result(debug_port: u16, helper_port: u16, result: any
                     serde_json::json!({
                         "debug_port": debug_port,
                         "helper_port": helper_port,
+                        "kind": classify_cdp_failure(&format!("{error:#}")),
                         "message": format!("{error:#}")
                     }),
                 );
@@ -3275,13 +3363,26 @@ async fn run_macos_cleanup_command(
     let Some(executable) = command.first() else {
         return Ok(());
     };
-    let _ = Command::new(executable)
+    // 保留退出码,不能 `let _ =` 吞掉。
+    //
+    // `osascript ... to quit` 要 macOS 的自动化授权(TCC)。没授权时 osascript 会以
+    // 非零码退出,可这里丢了状态,于是「用户拒了授权」和「app 退得慢」在日志里长得
+    // 一模一样 —— 线上那条 "did not exit before debug relaunch" 就没法定性,
+    // 只能瞎猜是哪种。
+    let status = Command::new(executable)
         .args(&command[1..])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await
         .with_context(|| format!("failed to request macOS app quit for {}", app_dir.display()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "osascript quit request rejected (exit {}) for {} —— 通常是「系统设置 → 隐私与安全性 → 自动化」里没给 ReCodex 控制 Codex 的权限",
+            status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".to_string()),
+            app_dir.display()
+        );
+    }
     Ok(())
 }
 
