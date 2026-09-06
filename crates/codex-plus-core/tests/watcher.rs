@@ -298,3 +298,43 @@ fn find_codex_processes_ignores_unrelated_processes() {
 
     assert!(find_codex_processes_from_snapshot(&processes).is_empty());
 }
+
+/// macOS 上启动器有**两个**可执行名,只查一个就看不见还活着的旧实例。
+///
+/// 直接跑二进制时叫 SILENT_BINARY;从 .app 启动时是 Info.plist 里的
+/// CFBundleExecutable(见 install/macos.rs `build_app_bundle`,写死 "CodexPlusPlus")。
+/// `pgrep -x` 精确匹配可执行名 —— 而用户几乎都是点图标启动的,正好落在被漏掉的那个。
+///
+/// 漏掉的后果不是"少杀一个进程":旧实例还占着 helper 端口,新实例以为没人用,
+/// 绑不上就退化成 helper.port_fallback(线上 4 台设备见过 Address already in use)。
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_launcher_process_names_cover_both_binary_and_bundle() {
+    let names = codex_plus_core::watcher::macos_launcher_process_names();
+    assert!(
+        names.contains(&codex_plus_core::install::SILENT_BINARY),
+        "少了直接跑二进制那个名字"
+    );
+    assert!(
+        names.contains(&codex_plus_core::install::MACOS_SILENT_EXECUTABLE),
+        "少了 .app 启动那个名字 —— 用户点图标起的进程就是这个"
+    );
+    assert_ne!(
+        codex_plus_core::install::SILENT_BINARY,
+        codex_plus_core::install::MACOS_SILENT_EXECUTABLE,
+        "两个常量若变成同一个字符串,这条守卫就形同虚设"
+    );
+}
+
+/// bundle 可执行名必须与 install/macos.rs 实际写进 Info.plist 的一致。
+/// 那边写死了字符串,两处一旦走散,pgrep 又会回到"看不见旧实例"的状态,
+/// 而且不会有任何编译错误。
+#[test]
+fn macos_bundle_executable_name_matches_installer() {
+    let installer = include_str!("../src/install/macos.rs");
+    let expected = format!("\"{}\"", codex_plus_core::install::MACOS_SILENT_EXECUTABLE);
+    assert!(
+        installer.contains(&expected),
+        "install/macos.rs 里的 CFBundleExecutable 与 MACOS_SILENT_EXECUTABLE 不一致"
+    );
+}

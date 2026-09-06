@@ -552,19 +552,42 @@ fn terminate_macos_process(process_id: u32) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// macOS 上启动器可能以两个名字出现在进程表里。
+///
+/// 直接跑二进制时是 SILENT_BINARY;从 .app 启动时,`Contents/MacOS/` 下那个
+/// 启动脚本的名字来自 Info.plist 的 CFBundleExecutable,是另一个字符串。
+/// `pgrep -x` 精确匹配可执行名,只查前者就漏掉后者 —— 而用户几乎都是点图标启动的。
+#[cfg(target_os = "macos")]
+pub fn macos_launcher_process_names() -> [&'static str; 2] {
+    [
+        crate::install::SILENT_BINARY,
+        crate::install::MACOS_SILENT_EXECUTABLE,
+    ]
+}
+
 #[cfg(target_os = "macos")]
 fn find_launcher_processes() -> Vec<u32> {
-    std::process::Command::new("pgrep")
-        .args(["-x", crate::install::SILENT_BINARY])
-        .output()
-        .ok()
+    // 漏掉 .app 那个名字的后果是**看不见还活着的旧实例**:于是新实例以为端口没人用,
+    // 去绑已被占住的 helper 端口,退化成 helper.port_fallback(线上 4 台设备见过)。
+    // 排掉自己的 pid —— 否则当前进程会把自己当成"旧实例"。
+    let current_process_id = std::process::id();
+    macos_launcher_process_names()
         .into_iter()
-        .flat_map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|value| value.trim().parse::<u32>().ok())
+        .flat_map(|process_name| {
+            std::process::Command::new("pgrep")
+                .args(["-x", process_name])
+                .output()
+                .ok()
+                .into_iter()
+                .flat_map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .filter_map(|value| value.trim().parse::<u32>().ok())
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>()
         })
+        .filter(|pid| *pid != current_process_id)
         .collect()
 }
 
