@@ -267,7 +267,55 @@ pub fn pick_injectable_codex_page_target(targets: &[CdpTarget]) -> anyhow::Resul
             return Ok(target.clone());
         }
     }
-    bail!("No injectable Codex page target found")
+    // 带上当时到底看见了哪些 target。
+    //
+    // 四条优先级里三条依赖 is_primary_codex_page_target,Codex 界面一次改版就可能
+    // 让它们全部失配。而光一句 "No injectable Codex page target found" 分不清:
+    //   - 页面还没加载完(时序,重试就会好)
+    //   - CDP 里根本没有 page 类型的 target(Codex 没起到那一步)
+    //   - 有页面但四条规则全过期了(**要改代码**,重试一万次也没用)
+    // 线上这条报了 28 次,每次都只有这一句,三种情况一种都定不了。
+    bail!(
+        "No injectable Codex page target found; observed: {}",
+        describe_targets(targets)
+    )
+}
+
+/// 把 target 列表压成一行诊断文本。只取 type/url/title —— webSocketDebuggerUrl
+/// 带 target id,既长又没有诊断价值。截断是为了不把上报撑爆:超过 8 个只留计数。
+fn describe_targets(targets: &[CdpTarget]) -> String {
+    if targets.is_empty() {
+        return "(none)".to_string();
+    }
+    const MAX_LISTED: usize = 8;
+    let listed = targets
+        .iter()
+        .take(MAX_LISTED)
+        .map(|target| {
+            format!(
+                "[{} url={} title={}]",
+                target.target_type,
+                truncate_for_diagnostics(&target.url),
+                truncate_for_diagnostics(&target.title)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if targets.len() > MAX_LISTED {
+        format!("{listed} (+{} more)", targets.len() - MAX_LISTED)
+    } else {
+        listed
+    }
+}
+
+fn truncate_for_diagnostics(value: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    // 按**字符**截断,不按字节:页面标题常含中文,切在多字节中间会切出非法 UTF-8。
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(MAX_CHARS).collect();
+    format!("{head}…")
 }
 
 fn is_codex_app_page_target(target: &CdpTarget) -> bool {

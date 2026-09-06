@@ -1084,3 +1084,60 @@ fn injection_script_keeps_session_action_buttons_in_pr_style() {
     assert!(script.contains("background: #363839;"));
     assert!(script.contains("cursor: default;"));
 }
+
+/// 匹配不上时必须把**当时看见了什么**一并说出来。
+///
+/// 四条优先级里三条依赖 is_primary_codex_page_target,Codex 一次界面改版就可能让它们
+/// 全部失配。线上这条报了 28 次,每次都只有一句 "No injectable Codex page target found",
+/// 结果三种完全不同的情况分不开:页面还没加载完(重试会好)、CDP 里根本没有 page
+/// (Codex 没起到那一步)、有页面但规则全过期了(**必须改代码**,重试一万次也没用)。
+#[test]
+fn missing_codex_target_error_lists_what_was_observed() {
+    let targets = vec![
+        target("a", "page", "Some Other App", "https://example.com/", Some("ws://x/1")),
+        target("b", "service_worker", "sw", "https://example.com/sw.js", None),
+    ];
+
+    let error = pick_injectable_codex_page_target(&targets)
+        .expect_err("这些 target 都不该匹配上");
+    let message = format!("{error:#}");
+
+    assert!(
+        message.contains("example.com"),
+        "错误里要能看到当时的 target,否则分不清是时序还是匹配规则过期:{message}"
+    );
+    assert!(
+        message.contains("service_worker") && message.contains("page"),
+        "target 类型要留下来 —— 只有 service_worker 没有 page,说明 Codex 还没起到那一步:{message}"
+    );
+}
+
+/// 一个 target 都没有时也要说清「没有」,不能只留一句没上下文的报错。
+#[test]
+fn missing_codex_target_error_says_none_when_list_is_empty() {
+    let error = pick_injectable_codex_page_target(&[]).expect_err("空列表必然匹配不上");
+    assert!(
+        format!("{error:#}").contains("(none)"),
+        "空列表要显式说明,不能和「有页面但不匹配」长得一样"
+    );
+}
+
+/// 上报要能装下,但不能被一个开了几十个标签页的用户撑爆。
+#[test]
+fn observed_targets_are_capped_and_truncated() {
+    let long_title = "标".repeat(200);
+    let mut targets: Vec<CdpTarget> = (0..20)
+        .map(|i| target(&i.to_string(), "page", &long_title, "https://example.com/", Some("ws://x/1")))
+        .collect();
+    targets.push(target("z", "other", "z", "z", None));
+
+    let message = format!("{:#}", pick_injectable_codex_page_target(&targets).expect_err("不匹配"));
+
+    assert!(message.contains("more"), "超出上限要留计数,不能悄悄丢掉:{message}");
+    // 按字符截断而不是字节:标题常含中文,切在多字节中间会切出非法 UTF-8。
+    assert!(
+        message.chars().filter(|c| *c == '…').count() > 0,
+        "过长的标题要截断"
+    );
+    assert!(message.len() < 4000, "单条诊断不能无上限增长:{} 字节", message.len());
+}
