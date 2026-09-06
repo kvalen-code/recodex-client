@@ -217,6 +217,15 @@ const ALWAYS_REPORT: &[&str] = &[
     // 2026-09-06 查那 636 条上报时就卡在这:算不出菜单汉化、注入、桥的成功率,
     // 也就无法判断刚做的几个修复到底有没有用。每次启动最多一条,dedup 再兜一道。
     "launcher.ready",
+    // 「dispatcher 补丁这一层已经放弃了」的唯一信号。
+    //
+    // 名字里没有 fail/error(它按定义不是一次失败,是**停止重试**这个决定),
+    // detail 里也只有 misses —— 所以两条既有规则都放不过它,必须显式白名单。
+    //
+    // 没有它就只能看到 _failed 那一条(现在也只报首次),完全不知道这台机器
+    // 最终是恢复了还是彻底放弃了增强功能 —— 与 launcher.ready 同一个对照组道理。
+    // 每台机器每次启动最多一条,量可忽略。
+    "renderer.service_tier_dispatcher_patch_skipped",
 ];
 
 fn is_reportable(event: &str, detail: &Value) -> bool {
@@ -557,6 +566,14 @@ mod tests {
         assert!(is_reportable(
             "launcher.ready",
             &serde_json::json!({ "debug_port": 9229, "enhancements_enabled": true })
+        ));
+        // 「这一层放弃了」的唯一信号。名字里没有 fail/error(它是**停止重试**这个决定,
+        // 不是一次失败),detail 里也只有 misses —— 两条既有规则都放不过它。
+        // 前缀 renderer. 是写本地日志时就加上的(launcher.rs / routes.rs 里的
+        // format!("renderer.{event}")),所以白名单条目必须带前缀。
+        assert!(is_reportable(
+            "renderer.service_tier_dispatcher_patch_skipped",
+            &serde_json::json!({ "misses": 8 })
         ));
         assert!(is_reportable(
             "launcher.recodex_key_refreshed_from_user_scope",
