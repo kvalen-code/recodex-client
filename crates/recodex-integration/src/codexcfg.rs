@@ -92,7 +92,64 @@ fn home_dir() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "no home directory is available"))
 }
 
+/// Codex 用来改数据目录的环境变量名。
+pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
+
+/// codex_dir() 这次的取值来自哪里。给诊断和登录提示用 ——
+/// 不说清楚是哪一个 config.toml,用户和客服都会默认 ~/.codex。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexDirSource {
+    /// 回落到了 ~/.codex。
+    Default,
+    /// 取自当前进程可见的 CODEX_HOME。
+    Env,
+}
+
+/// CODEX_HOME 的取值是否可用。
+///
+/// **这三条规则必须与 Go 侧 internal/clientcfg/codexhome.go 的
+/// `usableCodexHome` / `resolveCodexHome` 逐字一致** —— 不一致的后果不是
+/// "少支持一个变量":CLI 和桌面端会把托管块写到不同目录,一份生效一份不生效,
+/// 比两边都写错更难查(同 base_url_is_safe 那次的教训)。
+///
+///   - 空值 → 回落。变量存在但为空是"没设置"的常见写法。
+///   - 相对路径 → **忽略并回落**。相对路径跟着进程的工作目录跑,
+///     写出去的配置连我们自己都找不回来。
+///   - 目录不存在 → 仍然采用。Codex 自己会创建它,我们跟随;
+///     悄悄退回 ~/.codex 会让用户以为写对了 —— 那正是 2026-09-07 那次事故的形状。
+fn usable_codex_home(raw: &std::ffi::OsStr) -> Option<PathBuf> {
+    let path = PathBuf::from(raw);
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return None;
+    }
+    Some(path)
+}
+
+/// Codex 的数据目录:CODEX_HOME(绝对路径时)优先,否则 ~/.codex。
+///
+/// 这是一次线上事故的根因(2026-09-07):我们全仓没有任何一处读过这个变量,
+/// 一律写死 ~/.codex。用户把数据目录设到 D:\CodexData 后,**我们写的托管块
+/// Codex 一眼都没看过** —— 他那份真正生效的配置里留着第三方中转,表现是
+/// "要求登录 ChatGPT"和"401 Invalid token"。远程排查两小时、改了六轮配置
+/// 全部无效,因为每一轮都改在错的文件上。
+///
+/// 桌面端是被 Codex/启动器拉起来的子进程,能拿到继承下来的 CODEX_HOME;
+/// 用户级持久变量的兜底在 CLI 侧做(Go 的 UserEnv 已经覆盖三个平台),
+/// 这里不重复实现 —— 两侧对**同一份进程环境**的判定一致即可。
 pub(crate) fn codex_dir() -> io::Result<PathBuf> {
+    Ok(codex_dir_with_source()?.0)
+}
+
+/// 与 codex_dir 相同,另外返回取值来源,供诊断展示。
+pub fn codex_dir_with_source() -> io::Result<(PathBuf, CodexDirSource)> {
+    if let Some(dir) = std::env::var_os(CODEX_HOME_ENV).and_then(|raw| usable_codex_home(&raw)) {
+        return Ok((dir, CodexDirSource::Env));
+    }
+    Ok((home_dir()?.join(".codex"), CodexDirSource::Default))
+}
+
+/// 不考虑 CODEX_HOME 时的目录,用来判断当前是不是非默认位置。
+pub fn default_codex_dir() -> io::Result<PathBuf> {
     Ok(home_dir()?.join(".codex"))
 }
 
