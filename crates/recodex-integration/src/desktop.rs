@@ -1291,33 +1291,116 @@ fn classify_key_probe(status: u16, body: &str) -> KeyProbe {
     }
 }
 
-/// 自动修复：把服务端当前应下发的托管块与凭据重新装回去。
+/// 「把服务端当前应下发的托管配置装回本机」的结果。
 ///
-/// 走的是**登录那一个写入口**（install_login_config），不是另开一条：
-/// 官方模式快照、顶层 model_provider 接管这些策略都写在那里，绕开就会漂移。
-pub fn recodex_doctor_fix(state: &ReCodexState) -> Value {
+/// 面板「修复」和启动期自动同步共用同一段逻辑(sync_managed_config),
+/// 这个枚举让两边各自决定怎么呈现:面板要原来那几种 JSON,启动器要写诊断日志。
+#[derive(Debug)]
+pub enum ManagedConfigSync {
+    /// 没登录。什么都不做 —— 自动同步不能替用户做登录决定。
+    SignedOut,
+    /// adapter 没建起来(init_error)。
+    Unconfigured,
+    /// 状态锁坏了。
+    StateUnavailable,
+    /// 服务端没下发配置。**绝不能**在这时写 config.toml —— 那会把它写空。
+    NoConfig,
+    /// 官方模式:记进快照,切回 ReCodex 时生效,活配置一个字没碰。
+    Staged,
+    /// 已写入活配置。
+    Applied,
+    /// 拉配置失败(网络 / 鉴权)。
+    Fetch(AdapterError),
+    /// 写入失败。
+    Write(String),
+}
+
+impl ManagedConfigSync {
+    /// 给诊断日志用的固定标签。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::SignedOut => "signed_out",
+            Self::Unconfigured => "unconfigured",
+            Self::StateUnavailable => "state_unavailable",
+            Self::NoConfig => "no_config",
+            Self::Staged => "staged",
+            Self::Applied => "applied",
+            Self::Fetch(_) => "fetch_failed",
+            Self::Write(_) => "write_failed",
+        }
+    }
+}
+
+/// 把服务端当前应下发的托管块与凭据装回本机。
+///
+/// 走的是**登录那一个写入口**(install_login_config),不是另开一条:
+/// 官方模式快照、顶层 model_provider 接管这些策略都写在那里,绕开就会漂移。
+///
+/// `respect_official_mode` 是两个调用方唯一的差别:
+///   - 面板「修复」传 `false`:用户手点就是表态"现在要用 ReCodex",和登录一样,
+///     官方模式快照被丢掉 —— 这是今天的行为,不动。
+///   - 启动期自动同步传 `true`:没有人表态。用户切到官方模式是有意的,自动同步
+///     要是每次启动都把他拽回 ReCodex,那就是把用户的选择当故障修。所以官方模式下
+///     只用 stage_config_for_return 记进快照(和「用最快网关」在官方模式下的做法一致),
+///     切回 ReCodex 时自动生效。
+///
+/// 为什么这条能在每次启动时跑:服务端 /api/cli/auth/config **不换发 Key**
+/// (RefreshResponse 没有 EnvKey/EnvValue 字段,到这里是空串),apply_login 里
+/// set_user_env 被 `!env_key.is_empty()` 挡住、apply_config_with_key 回落到环境里
+/// 现有的 Key 内联;托管块没变时 install_block 得到 next == cur,config.toml 原样不动。
+/// 稳态下的副作用只有一次 POST 和一次 auth.json 的同内容原子重写。
+/// ponytail: 要省掉那次重写就先比对 managed_body 再跳过;目前 ~20 个活跃桌面用户,不值。
+pub fn sync_managed_config(state: &ReCodexState, respect_official_mode: bool) -> ManagedConfigSync {
     let worker = match state.adapter.lock() {
         Ok(guard) => match guard.as_ref() {
             Some(adapter) if adapter.is_authenticated() => adapter.fork(),
-            Some(_) => return json!({"status":"signed_out"}),
-            None => return error("configuration", "ReCodex is not configured"),
+            Some(_) => return ManagedConfigSync::SignedOut,
+            None => return ManagedConfigSync::Unconfigured,
         },
-        Err(_) => return error("state_unavailable", "ReCodex state is unavailable"),
+        Err(_) => return ManagedConfigSync::StateUnavailable,
     };
     let managed = match worker.managed_config() {
         Ok(value) => value,
-        Err(adapter_error) => return adapter_failure("doctor", &adapter_error),
+        Err(adapter_error) => return ManagedConfigSync::Fetch(adapter_error),
     };
     if managed.config.trim().is_empty() {
-        return error("doctor", "服务端没有下发配置，无法重装");
+        return ManagedConfigSync::NoConfig;
     }
-    if let Err(io_error) = install_login_config(
+    if respect_official_mode {
+        // 必须排在 install_login_config **之前**:那一步会先丢掉快照,
+        // 到时候再判官方模式已经晚了。
+        match crate::officialmode::stage_config_for_return(&managed.config) {
+            Ok(true) => return ManagedConfigSync::Staged,
+            Ok(false) => {}
+            Err(io_error) => return ManagedConfigSync::Write(io_error.to_string()),
+        }
+    }
+    match install_login_config(
         &managed.config,
         &managed.auth_json,
         &managed.env_key,
         &managed.env_value,
     ) {
-        return error("doctor", io_error.to_string());
+        Ok(()) => ManagedConfigSync::Applied,
+        Err(io_error) => ManagedConfigSync::Write(io_error.to_string()),
+    }
+}
+
+/// 面板「修复」按钮:同步托管配置,然后立刻复检。
+///
+/// 返回的 JSON 形状与改造前逐条相同(面板照旧解析)。
+pub fn recodex_doctor_fix(state: &ReCodexState) -> Value {
+    match sync_managed_config(state, false) {
+        ManagedConfigSync::SignedOut => return json!({"status":"signed_out"}),
+        ManagedConfigSync::Unconfigured => return error("configuration", "ReCodex is not configured"),
+        ManagedConfigSync::StateUnavailable => {
+            return error("state_unavailable", "ReCodex state is unavailable")
+        }
+        ManagedConfigSync::NoConfig => return error("doctor", "服务端没有下发配置，无法重装"),
+        ManagedConfigSync::Fetch(adapter_error) => return adapter_failure("doctor", &adapter_error),
+        ManagedConfigSync::Write(message) => return error("doctor", message),
+        // respect_official_mode = false 时不会出现 Staged;真出现也按已修复处理。
+        ManagedConfigSync::Staged | ManagedConfigSync::Applied => {}
     }
     // 重装完立刻复检，让面板显示的是修完之后的真实状态，而不是「已修复」的一句空话。
     recodex_doctor(state)
@@ -1497,6 +1580,30 @@ pub fn ").unwrap_or(prepare.len())];
             sites, 3,
             "带凭据的入口不得自己拼错误信息,请改用 adapter_failure(code, &err);             当前直接拼装的地方有 {sites} 处(只允许 adapter_failure 自身 + 两个登录入口)"
         );
+    }
+
+    /// 启动期自动同步在官方模式下必须**先**判快照,再走登录写入口。
+    ///
+    /// install_login_config 第一步就是 discard_snapshot —— 顺序反了,官方模式的
+    /// 用户每次启动都会被静默拽回 ReCodex,而面板还显示「官方模式」。
+    /// 同时钉住:面板「修复」走的是同一个核心(sync_managed_config),不是另一份复制。
+    #[test]
+    fn startup_sync_stages_before_the_login_writer_and_fix_reuses_it() {
+        let body = body();
+        let start = body.find("pub fn sync_managed_config(").expect("没有 sync_managed_config");
+        let end = body[start..].find("\n}\n").map(|i| start + i).unwrap_or(body.len());
+        let sync = &body[start..end];
+        let stage = sync.find("stage_config_for_return(").expect("同步核心没有判官方模式快照");
+        let install = sync.find("install_login_config(").expect("同步核心没有走登录写入口");
+        assert!(stage < install, "官方模式判定必须在 install_login_config 之前(它第一步就丢快照)");
+
+        let fix_start = body.find("pub fn recodex_doctor_fix(").expect("没有 recodex_doctor_fix");
+        let fix_end = body[fix_start..].find("\n}\n").map(|i| fix_start + i).unwrap_or(body.len());
+        let fix = &body[fix_start..fix_end];
+        assert!(fix.contains("sync_managed_config(state, false)"),
+            "面板「修复」应复用 sync_managed_config(state, false),不要再复制一份写入流程");
+        assert!(!fix.contains("install_login_config("),
+            "recodex_doctor_fix 不该再直接调 install_login_config —— 那样就有两份流程要同步维护");
     }
 
     #[test]

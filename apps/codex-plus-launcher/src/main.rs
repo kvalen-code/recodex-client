@@ -152,6 +152,41 @@ async fn main() -> Result<()> {
 ///   - 用户自己写过 `model`(那一行没有我们的标记)→ 直接返回,连网络都不发;
 ///   - 拉不到 / 超时 / manifest 解析不了 → 保持现状,绝不动他的配置;
 ///   - 5 秒超时,不为这件事拖慢启动。
+/// recodex-overlay: 启动时把服务端当前应下发的托管配置同步到本机。
+///
+/// 背景(2026-09-08):Codex Desktop 用户登录后**永远不会再从服务端拿配置** ——
+/// refresh_token 只轮换 token,响应里连 config 字段都没有。20:00 全量开 WS 后,
+/// 17 个活跃用户只有 2 个走上 WS,恰好是之后重新登录过的两个;其余 13 人的
+/// config.toml 里没有 supports_websockets = true。缺口不止 WS:网关切换、任何
+/// 服务端配置变更都到不了桌面端(还有 3 个用户挂在已停用的 sg 网关上)。
+///
+/// 走的是面板「修复」按钮同一条路(desktop::sync_managed_config →
+/// install_login_config),不另写写入逻辑。与按钮唯一的差别是
+/// respect_official_mode = true:官方模式下只记快照,不把用户拽回 ReCodex。
+///
+/// 失败静默(不弹任何 UI),只写诊断日志;每次启动跑一次,没有轮询。
+/// 网络调用是阻塞的(ureq,transport 10s 超时),放到 spawn_blocking 里。
+async fn sync_managed_config_from_server() {
+    let outcome = tokio::task::spawn_blocking(|| {
+        let state = recodex_integration::desktop::ReCodexState::from_env();
+        recodex_integration::desktop::sync_managed_config(&state, true)
+    })
+    .await;
+    use recodex_integration::desktop::ManagedConfigSync as Sync;
+    let (label, error) = match &outcome {
+        Ok(Sync::Fetch(adapter_error)) => ("fetch_failed", Some(adapter_error.to_string())),
+        Ok(Sync::Write(message)) => ("write_failed", Some(message.clone())),
+        Ok(other) => (other.label(), None),
+        Err(join_error) => ("panicked", Some(join_error.to_string())),
+    };
+    // 带 error 字段的会被 diagnostics_flush 自动上报;其余靠 ALWAYS_REPORT 里的
+    // 这个事件名传回 —— 没有"applied"的分母,就永远说不清那 13 个人到底拿到没有。
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "launcher.managed_config_sync",
+        json!({ "outcome": label, "error": error }),
+    );
+}
+
 async fn follow_upstream_recommended_model() {
     let Ok(config_path) = recodex_integration::codexcfg::config_path() else {
         return;
@@ -239,6 +274,10 @@ async fn launcher_main(
     // 也必须在 helper_only 分支**之后** —— helper 进程根本不启动 Codex,
     // 让它白等一次网络请求只会拖慢每一次 helper 拉起,还会和主进程抢着写
     // 同一份 config.toml。
+    // recodex-overlay: 先同步服务端托管配置,再跟随推荐模型 —— 两者都写 config.toml,
+    // 顺序固定就不会互相冲掉;而且必须在拉起 Codex **之前**:Codex 是启动时读一次
+    // config.toml,后台线程写完时它已经拿着旧配置跑了,用户还得再重启一次。
+    sync_managed_config_from_server().await;
     follow_upstream_recommended_model().await;
     // recodex-overlay: 由「切换模式/更新后重启」拉起时带 --await-guard —— 旧 launcher
     // 还要 1 秒左右才退出,不等的话会误判成「已有实例」而直接退出,页面就失去后端。
@@ -1379,4 +1418,39 @@ fn builtin_user_scripts_dir() -> PathBuf {
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .map(|path| path.join("user_scripts"))
         .unwrap_or_else(|| PathBuf::from("user_scripts"))
+}
+
+#[cfg(test)]
+mod managed_config_sync_placement_tests {
+    /// 托管配置同步必须在 launcher_main 里、紧贴在跟随推荐模型之前,
+    /// 也就是在拉起 Codex 之前。挪到 launch_and_inject_with_hooks 之后
+    /// = Codex 已经拿着旧配置跑起来了,用户还得再重启一次,而表面上"同步做了"。
+    ///
+    /// 钉的是**真实锚点**(两个 await 的相邻关系),不是文件里的文本先后 ——
+    /// 后者在 config_health 那条守卫上被变异测试证明是假的。
+    #[test]
+    fn managed_config_sync_runs_right_before_model_follow_in_launcher_main() {
+        let source = include_str!("main.rs");
+        let main_start = source
+            .find("async fn launcher_main(")
+            .expect("找不到 launcher_main");
+        let body = &source[main_start..];
+        let sync = body
+            .find("sync_managed_config_from_server().await;")
+            .expect("launcher_main 里没有调用 sync_managed_config_from_server");
+        let follow = body
+            .find("follow_upstream_recommended_model().await;")
+            .expect("launcher_main 里没有调用 follow_upstream_recommended_model");
+        let launch = body
+            .find("launch_and_inject_with_hooks(")
+            .expect("launcher_main 里没有拉起 Codex");
+        assert!(sync < follow && follow < launch,
+            "同步(@{sync})必须先于跟随模型(@{follow})、再先于拉起 Codex(@{launch})");
+        // 两个 await 之间只允许注释和空白 —— 中间插别的步骤就可能把顺序约束绕开。
+        let between = &body[sync..follow];
+        assert!(
+            between.lines().skip(1).all(|l| { let t = l.trim(); t.is_empty() || t.starts_with("//") }),
+            "同步与跟随模型之间不该有别的语句:\n{between}"
+        );
+    }
 }

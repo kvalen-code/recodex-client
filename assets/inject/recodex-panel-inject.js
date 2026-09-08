@@ -105,7 +105,7 @@
       "对话居中宽度": "對話置中寬度", "切换对话保留位置": "切換對話保留位置",
       "强制中文界面": "強制中文介面", "服务模式控件": "服務模式控件",
       "系统集成": "系統整合", "原生菜单栏位置": "原生選單列位置",
-      "原生菜单本地化": "原生選單在地化", "Zed Remote 打开": "Zed Remote 開啟",
+      "原生菜单本地化": "原生選單在地化", "原生菜单本地化(仅 Codex 151 及更早)": "原生選單在地化(僅 Codex 151 及更早)", "Zed Remote 打开": "Zed Remote 開啟",
       "上游 worktree 创建": "上游 worktree 建立",
       "账号": "帳號", "增强": "增強", "微信": "微信", "高级": "進階",
       "界面语言": "介面語言", "UI 助手": "UI 助手",
@@ -161,7 +161,7 @@
       "白名单(微信 user id,逗号分隔)": "白名單(微信 user id,逗號分隔)",
       "留空=不响应任何人": "留空=不回應任何人",
       "模型(留空=Codex 默认)": "模型(留空=Codex 預設)",
-      "ReCodex 桥未就绪": "ReCodex 橋未就緒", "设置没有生效,请重试": "設定沒有生效,請重試", "数据可能不是最新的": "資料可能不是最新的", "数据截至": "資料截至", "配置没有保存成功,请重试": "設定沒有儲存成功,請重試", "ReCodex 桥未响应": "ReCodex 橋沒有回應",
+      "ReCodex 桥未就绪": "ReCodex 橋未就緒", "设置没有生效,请重试": "設定沒有生效,請重試", "数据可能不是最新的": "資料可能不是最新的", "数据截至": "資料截至", "重置": "重置", "约 {n} 分钟后": "約 {n} 分鐘後", "约 {h} 小时 {m} 分后": "約 {h} 小時 {m} 分後", "约 {h} 小时后": "約 {h} 小時後", "约 {d} 天后": "約 {d} 天後", "配置没有保存成功,请重试": "設定沒有儲存成功,請重試", "ReCodex 桥未响应": "ReCodex 橋沒有回應",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "未綁定微信。掃碼後可在微信裡直接指揮本機 Codex。",
       "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ 白名單為空:微信連線不會回應任何人。填入你的微信 ID,或填 * 放開所有人。",
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ 白名單為 *:任何人給該微信號發訊息都能在本機執行 Codex。",
@@ -212,7 +212,7 @@
       "对话居中宽度": "Ширина диалога по центру", "切换对话保留位置": "Сохранять позицию прокрутки",
       "强制中文界面": "Принудительный китайский интерфейс", "服务模式控件": "Переключатель режима сервиса",
       "系统集成": "Интеграция с системой", "原生菜单栏位置": "Положение системного меню",
-      "原生菜单本地化": "Локализация системного меню", "Zed Remote 打开": "Открывать в Zed Remote",
+      "原生菜单本地化": "Локализация системного меню", "原生菜单本地化(仅 Codex 151 及更早)": "Локализация системного меню (только Codex 151 и старше)", "Zed Remote 打开": "Открывать в Zed Remote",
       "上游 worktree 创建": "Создание upstream worktree",
       "账号": "Аккаунт", "增强": "Функции", "微信": "WeChat", "高级": "Ещё",
       "界面语言": "Язык интерфейса", "UI 助手": "UI-помощник",
@@ -263,7 +263,7 @@
       "白名单(微信 user id,逗号分隔)": "Белый список (user id WeChat, через запятую)",
       "留空=不响应任何人": "Пусто = никто не получит ответа",
       "模型(留空=Codex 默认)": "Модель (пусто = по умолчанию)",
-      "ReCodex 桥未就绪": "Мост ReCodex не готов", "设置没有生效,请重试": "Настройка не применилась, попробуйте ещё раз", "数据可能不是最新的": "Данные могут быть устаревшими", "数据截至": "данные на", "配置没有保存成功,请重试": "Настройки не сохранились, попробуйте ещё раз", "ReCodex 桥未响应": "Мост ReCodex не отвечает",
+      "ReCodex 桥未就绪": "Мост ReCodex не готов", "设置没有生效,请重试": "Настройка не применилась, попробуйте ещё раз", "数据可能不是最新的": "Данные могут быть устаревшими", "数据截至": "данные на", "重置": "сброс", "约 {n} 分钟后": "примерно через {n} мин", "约 {h} 小时 {m} 分后": "примерно через {h} ч {m} мин", "约 {h} 小时后": "примерно через {h} ч", "约 {d} 天后": "примерно через {d} дн", "配置没有保存成功,请重试": "Настройки не сохранились, попробуйте ещё раз", "ReCodex 桥未响应": "Мост ReCodex не отвечает",
       "未绑定微信。扫码后可在微信里直接指挥本机 Codex。": "WeChat не привязан. После сканирования можно управлять Codex прямо из WeChat.",
       "⚠ 白名单为空:微信连接不会响应任何人。填入你的微信 ID,或填 * 放开所有人。": "⚠ Белый список пуст: бот никому не ответит. Укажите свой WeChat ID или * , чтобы разрешить всем.",
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ Белый список = *: любой, кто напишет боту, сможет запускать Codex на этом компьютере.",
@@ -424,6 +424,29 @@
     if (!w || !w.limit) return 0;
     return Math.min(100, Math.max(0, Math.round((w.used / w.limit) * 100)));
   }
+  // 进度条下面那一行「什么时候重置」:绝对时间(本机时区)+ 相对时间。
+  // 值来自 /recodex/status 的 windows[].reset_at —— 服务端算的是我们网关滚动窗口的
+  // 重置点(窗口起点 + 窗口长度),适配器整结构透传,这里只负责画。
+  // 没值(窗口已过期 / 没用量)或已过点就**不画这一行**:别显示"—"或"未知",
+  // 那只会让用户以为坏了;已过点的下一次拉取就会变,显示"0 分钟后"是误导。
+  function resetLine(w) {
+    if (!w || !w.reset_at) return "";
+    const at = new Date(w.reset_at);
+    const ms = at.getTime() - Date.now();
+    if (isNaN(at.getTime()) || ms <= 0) return "";
+    const now = new Date();
+    const sameDay = at.getFullYear() === now.getFullYear() && at.getMonth() === now.getMonth() && at.getDate() === now.getDate();
+    const hh = String(at.getHours()).padStart(2, "0");
+    const mm = String(at.getMinutes()).padStart(2, "0");
+    const abs = (sameDay ? "" : `${at.getMonth() + 1}/${at.getDate()} `) + `${hh}:${mm}`;
+    const mins = Math.max(1, Math.round(ms / 60000));
+    let rel;
+    if (mins < 60) rel = t("约 {n} 分钟后").replace("{n}", mins);
+    else if (mins < 48 * 60 && mins % 60 === 0) rel = t("约 {h} 小时后").replace("{h}", mins / 60);
+    else if (mins < 48 * 60) rel = t("约 {h} 小时 {m} 分后").replace("{h}", Math.floor(mins / 60)).replace("{m}", mins % 60);
+    else rel = t("约 {d} 天后").replace("{d}", Math.round(mins / 1440));
+    return `${abs} ${t("重置")} · ${rel}`;
+  }
 
   // ── 渲染 ───────────────────────────────────────────────────
   // 状态读不出来时的逃生入口:只画组织切换。
@@ -536,8 +559,9 @@
     html += `<div class="rcx-row"><span class="rcx-k">${t("邮箱")}</span><span>${esc(acc.email ? maskEmail(acc.email) : "—")}</span></div>`;
     html += `<div class="rcx-row"><span class="rcx-k">${t("套餐")}</span><span>${esc(acc.plan || acc.account_type || "—")}</span></div>`;
     // 5h 窗口只在有实际用量时显示;无用量则只显示 7 天(对齐 mdash「隐藏空 5h」)
-    if (w5 && w5.used > 0) html += `<div style="padding:6px 0"><div class="rcx-row" style="border:0"><span class="rcx-k">${t("5 小时")}</span><span>${pct(w5)}%</span></div><div class="rcx-bar"><i style="width:${pct(w5)}%"></i></div></div>`;
-    if (w7) html += `<div style="padding:6px 0"><div class="rcx-row" style="border:0"><span class="rcx-k">${t("7 天")}</span><span>${pct(w7)}%</span></div><div class="rcx-bar"><i style="width:${pct(w7)}%"></i></div></div>`;
+    const resetHtml = (w) => { const line = resetLine(w); return line ? `<div class="rcx-muted" style="font-size:11px;margin-top:3px">${esc(line)}</div>` : ""; };
+    if (w5 && w5.used > 0) html += `<div style="padding:6px 0"><div class="rcx-row" style="border:0"><span class="rcx-k">${t("5 小时")}</span><span>${pct(w5)}%</span></div><div class="rcx-bar"><i style="width:${pct(w5)}%"></i></div>${resetHtml(w5)}</div>`;
+    if (w7) html += `<div style="padding:6px 0"><div class="rcx-row" style="border:0"><span class="rcx-k">${t("7 天")}</span><span>${pct(w7)}%</span></div><div class="rcx-bar"><i style="width:${pct(w7)}%"></i></div>${resetHtml(w7)}</div>`;
     // 重置按钮。共享账号上不出现 —— 按一次会把同号其他人的额度一起重置,
     // 而他们根本不知道发生了什么;这种情况服务端回 denied_reason=shared_account。
     //
