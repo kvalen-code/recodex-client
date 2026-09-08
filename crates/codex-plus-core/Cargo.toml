@@ -23,6 +23,9 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "sync"] }
 tokio-tungstenite.workspace = true
+# recodex-overlay: 启动时验 config.toml 能不能被 Codex 读进去(config_health)。
+# 方向是 core -> integration,反向没有依赖,不成环。
+recodex-integration = { path = "../recodex-integration" }
 toml.workspace = true
 toml_edit.workspace = true
 uuid.workspace = true

@@ -5,6 +5,7 @@ pub mod installer_tag; // recodex-overlay: 读安装包上的代理站点标签
 pub mod officialmode; // recodex-overlay: 官方模式切换(可逆)
 pub mod credential;
 pub mod gateway_probe; // recodex-overlay: 在本机测网关延迟(服务端那份与用户无关)
+pub mod config_health; // recodex-overlay: 启动时验 config.toml 能不能被读进去
 pub mod diagnostics_flush; // recodex-overlay: 本地诊断日志自动上报(启动失败/连不上也能看到)
 mod error;
 mod install_id;

@@ -14,6 +14,10 @@ url = "2"
 # regional root CAs and TLS-inspecting proxies where webpki-roots alone fails.
 ureq = { version = "2.12", default-features = true, features = ["json", "native-certs"] }
 getrandom = "0.2"
+# 只用来校验「我们要落盘的 config.toml 能不能被 Codex 读进去」。
+# 手写文本扫描在这上面栽过三次(死代码预检、精确匹配漏子表),
+# TOML 的坑(内联表不能被段头扩展、多行字符串、带引号的键)啃不完。
+toml = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

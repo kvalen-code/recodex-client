@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-core"
-version = "1.3.5"
+version = "1.3.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -211,6 +211,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "qrcode",
+ "recodex-integration",
  "reqwest",
  "rusqlite",
  "serde",
@@ -232,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-data"
-version = "1.3.5"
+version = "1.3.6"
 dependencies = [
  "anyhow",
  "base64",
@@ -250,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-launcher"
-version = "1.3.5"
+version = "1.3.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1328,12 +1329,13 @@ dependencies = [
 
 [[package]]
 name = "recodex-integration"
-version = "1.3.5"
+version = "1.3.6"
 dependencies = [
  "getrandom 0.2.17",
  "security-framework 3.7.0",
  "serde",
  "serde_json",
+ "toml 0.8.2",
  "ureq",
  "url",
  "windows-sys 0.59.0",

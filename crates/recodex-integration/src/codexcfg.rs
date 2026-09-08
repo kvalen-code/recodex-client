@@ -755,6 +755,7 @@ pub fn apply_managed_model(model: &str) -> io::Result<bool> {
     if next == current {
         return Ok(false);
     }
+    refuse_if_would_break(&current, &next)?;
     write_atomic(&path, next.as_bytes())?;
     Ok(true)
 }
@@ -1069,7 +1070,105 @@ pub fn apply_config_with_key(body: &str, key: &str) -> io::Result<()> {
     }
     // 不在这里判 secret:`write_atomic` 自己看内容。这条路以前是唯一判对的,
     // 也正因为「只有它判对」才掩住了另外两条路的问题。
-    write_atomic(&path, next.as_bytes())
+    //
+    // 落盘前用真解析器验一遍,三条分支的取舍见 apply_validated。
+    apply_validated(&path, &cur, &next, &body)
+}
+
+/// 备份文件名。两份用途完全不同,不要合并:
+///   - bak    是「我们第一次动这台机器之前,用户原本的样子」,只存一次,永不覆盖。
+///   - broken 是「这一次重建之前那份坏的」,每次覆盖,给排查用。
+const CONFIG_BACKUP_SUFFIX: &str = ".recodex-bak";
+const CONFIG_BROKEN_SUFFIX: &str = ".recodex-broken";
+
+/// 报告一段内容 Codex 能不能读进去。
+///
+/// 用真正的解析器,不再靠文本扫描 —— 文本扫描上栽过三次:三个扫描函数因为托管块
+/// 自己的 `{` 触发「说不清就放弃」而整体成了死代码;清残留的精确匹配漏掉
+/// `[model_providers.recodex.http_headers]` 子表,造出一份 `duplicate key` 的文件,
+/// 而官方 codex **硬失败不回落**,于是客户所有配置一起失效,表现是"客户端用不了"。
+pub fn validate_toml(content: &str) -> Result<(), toml::de::Error> {
+    content.parse::<toml::Value>().map(|_| ())
+}
+
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// 在我们第一次改这份文件之前,把用户原本的样子留下来。
+///
+/// **只存一次**:第二次再存就会把「用户原样」覆盖成「已经被我们改过的样子」,
+/// 那份备份也就失去了意义。存不下来不算失败,备份是额外的保险,不该挡住登录。
+fn backup_once(path: &Path, content: &str) {
+    let backup = suffixed(path, CONFIG_BACKUP_SUFFIX);
+    if backup.exists() {
+        return;
+    }
+    // 用户原本**没有** config.toml 时也要写 —— 写一个空文件当哨兵。
+    // 不写的话,第二次写入时 cur 已经是**我们的**内容,会被当成"用户原样"存进去:
+    // 备份从此指向一份我们自己的旧块,想还原的时候还原了个寂寞。
+    //
+    // 无条件 0600:这是我们的诊断产物,没有第二个人需要读它。不能走 write_atomic ——
+    // 它靠正则嗅探 bearer 那一行,用户自己的密钥可能是别的写法,嗅不到就摊成 0644。
+    let _ = write_atomic_mode(&backup, content.as_bytes(), true);
+}
+
+/// 进来是好的、出去会变坏 —— 拒绝。**所有** config.toml 写入方共用的最后一道闸。
+///
+/// 审计时发现 apply_managed_model(每次启动发现推荐模型变了就整篇重写)和
+/// demote_managed_provider(切回官方模式)都是直接 write_atomic,绕过了 apply_validated。
+/// 「不许留下读不进去的文件」这条承诺要对**每一个**写入方成立,所以抽出来共用;
+/// 以后新增的写入方也一样,落盘前调一下。
+fn refuse_if_would_break(cur: &str, next: &str) -> io::Result<()> {
+    if validate_toml(next).is_err() && validate_toml(cur).is_ok() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "refusing to write: the result would not parse as TOML",
+        ));
+    }
+    Ok(())
+}
+
+/// 把 next 落盘,但先确认它是能被读进去的。
+///
+/// 三条分支,区别在于**当前那份是不是好的**:
+///
+///   next 能解析              → 正常写入。绝大多数情况走这里。
+///   next 不能 / cur 能       → **是我们把它写坏的**。拒绝写入,保住用户手上那份。
+///   next 不能 / cur 也不能   → 用户那份本来就废了,重建。
+///
+/// 第三条就是「备份 + 完全新建」,但只用在**已经没有东西可保**的时候 ——
+/// cc-switch 的教训正在这里:他们无条件整份覆盖,把用户的 MCP servers、plugins、
+/// 项目信任全洗掉(issue #4254 / #1088 / #1863 / #4317)。同样的动作,
+/// 放在「文件已经读不进去」这个前提下才是救人,否则就是杀人。
+///
+/// 与 Go 侧 clientcfg.applyValidated 逐条对应,改一侧必须改另一侧。
+fn apply_validated(path: &Path, cur: &str, next: &str, fresh_block: &str) -> io::Result<()> {
+    backup_once(path, cur);
+
+    if validate_toml(next).is_ok() {
+        return write_atomic(path, next.as_bytes());
+    }
+    // 进来是好的、出去变坏了 —— 一定是我们的合并逻辑有问题。
+    // 宁可这次登录失败,也不能留下一份读不进去的文件。
+    refuse_if_would_break(cur, next)?;
+
+    // cur 本来就解析不了。保留证据,然后只写我们的块。
+    // 不保留用户的任何内容:那些内容正是解析失败的来源,原样搬过来等于把病带走。
+    // 无条件 0600:这份**按定义是坏的**,密钥那一行本身可能就是坏掉的地方
+    // (引号没闭合之类),嗅探正则匹配不上就会摊成 0644 明文。
+    let _ = write_atomic_mode(&suffixed(path, CONFIG_BROKEN_SUFFIX), cur.as_bytes(), true);
+    let rebuilt = install_block("", fresh_block);
+    if validate_toml(&rebuilt).is_err() {
+        // 我们自己渲染的块都解析不了,那是模板的问题,不是用户的。什么都别写。
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "refusing to write: rebuilt managed block is invalid TOML",
+        ));
+    }
+    write_atomic(path, rebuilt.as_bytes())
 }
 
 /// Removes our managed block from `~/.codex/config.toml`. Deletes the file if we
@@ -1106,6 +1205,7 @@ pub fn demote_managed_provider() -> io::Result<()> {
     if !changed {
         return Ok(());
     }
+    refuse_if_would_break(&cur, &out)?;
     write_atomic(&path, out.as_bytes())
 }
 
@@ -2299,6 +2399,199 @@ name = \"User Own\"
             "把用户自己叫 recodex.foo 的 provider 删掉了:
 {got}"
         );
+    }
+
+
+    /// 每次调用给一个新的空目录。照仓库现有写法(temp_dir + pid),不引测试依赖。
+    fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rcx-cfgvalidate-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 备份**只存一次**。
+    ///
+    /// 存第二次会把「用户原本的样子」覆盖成「已经被我们改过的样子」,
+    /// 想还原的时候就还原了个寂寞。换网关、换 key 都会再走一次写入路径,
+    /// 所以这条不是理论情况。
+    #[test]
+    fn apply_validated_backs_up_only_once() {
+        let dir = tempdir();
+        let path = dir.join("config.toml");
+        let original = "model = \"gpt-5.6-codex\"
+";
+        std::fs::write(&path, original).unwrap();
+
+        let first = render_sub2api_block("https://api.recodex.dev/backend-api/codex", false);
+        let next = install_block(original, &first);
+        apply_validated(&path, original, &next, &first).unwrap();
+
+        // 第二次写入时,cur 已经是「被我们改过的样子」了。
+        let cur2 = std::fs::read_to_string(&path).unwrap();
+        let second = render_sub2api_block("https://hk.recodex.dev/backend-api/codex", false);
+        let next2 = install_block(&cur2, &second);
+        apply_validated(&path, &cur2, &next2, &second).unwrap();
+
+        let backup = std::fs::read_to_string(suffixed(&path, CONFIG_BACKUP_SUFFIX)).unwrap();
+        assert_eq!(backup, original, "备份被第二次写入覆盖了,还原点丢失");
+    }
+
+    /// 分支一:正常情况 —— 写进去,用户自己的东西一个都不能少。
+    /// 三分支最容易犯的错是过度保守,把本来该写的也拒掉 ——
+    /// 那是把偶发故障换成必然故障。
+    #[test]
+    fn apply_validated_keeps_user_content() {
+        let dir = tempdir();
+        let path = dir.join("config.toml");
+        let cur = "model = \"gpt-5.6-codex\"
+
+[mcp_servers.mine]
+command = \"echo\"
+";
+        std::fs::write(&path, cur).unwrap();
+        let block = render_sub2api_block("https://api.recodex.dev/backend-api/codex", false);
+        let next = install_block(cur, &block);
+
+        apply_validated(&path, cur, &next, &block).unwrap();
+
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert!(validate_toml(&got).is_ok(), "写出去的解析不了:
+{got}");
+        assert!(got.contains("[mcp_servers.mine]"), "用户配置丢了:
+{got}");
+        assert!(got.contains("model_provider = \"recodex\""), "我们的块没进去:
+{got}");
+        assert!(
+            std::fs::read_to_string(suffixed(&path, CONFIG_BACKUP_SUFFIX)).unwrap() == cur,
+            "备份不是用户原样"
+        );
+    }
+
+    /// 分支二:进来是好的、出去会变坏 —— 必须拒绝,保住用户手上那份。
+    ///
+    /// 官方 codex 遇到解析失败是**硬失败不回落**(实测
+    /// `Error loading configuration: config.toml:16:26: duplicate key`),
+    /// 留下坏文件 = 用户所有配置一起消失,且没有任何指向我们的线索。
+    #[test]
+    fn apply_validated_refuses_to_break_a_good_config() {
+        let dir = tempdir();
+        let path = dir.join("config.toml");
+        let cur = "model = \"gpt-5.6-codex\"
+";
+        std::fs::write(&path, cur).unwrap();
+
+        let bad = "model_provider = \"recodex\"
+this is not toml =
+";
+        let err = apply_validated(&path, cur, bad, bad).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "应当拒绝写入");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            cur,
+            "用户那份好文件被动过了"
+        );
+    }
+
+    /// 分支三:用户那份本来就解析不了 —— 重建,并留证。
+    /// 只在这个前提下才做「完全新建」。
+    #[test]
+    fn apply_validated_rebuilds_when_current_is_already_broken() {
+        let dir = tempdir();
+        let path = dir.join("config.toml");
+        // 必须是我们修不好的坏法:孤儿子表那种清残留自己会治好,走不到这条分支。
+        let cur = "model = \"gpt-6-astra\"
+
+[mcp_servers.mine]
+command = \"echo\"
+this line is not valid toml =
+";
+        assert!(validate_toml(cur).is_err(), "样本前提不成立");
+        std::fs::write(&path, cur).unwrap();
+        let block = render_sub2api_block("https://api.recodex.dev/backend-api/codex", false);
+        let next = install_block(cur, &block);
+
+        apply_validated(&path, cur, &next, &block).unwrap();
+
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert!(validate_toml(&got).is_ok(), "重建出来的还是坏的:
+{got}");
+        assert!(got.contains("model_provider = \"recodex\""));
+        assert!(
+            suffixed(&path, CONFIG_BROKEN_SUFFIX).exists(),
+            "没保留坏掉的那份,用户丢了东西我们连查都没法查"
+        );
+        assert!(suffixed(&path, CONFIG_BACKUP_SUFFIX).exists(), "没留原样备份");
+    }
+
+
+    /// 用户原本**没有** config.toml 时,备份必须是一个空文件当哨兵。
+    /// 不写哨兵:第二次写入时 cur 已是我们的内容,会被当成"用户原样"存进去。审计抓出来的。
+    #[test]
+    fn apply_validated_backup_is_empty_sentinel_when_user_had_nothing() {
+        let dir = tempdir();
+        let path = dir.join("config.toml");
+        assert!(!path.exists());
+
+        let first = render_sub2api_block("https://api.recodex.dev/backend-api/codex", false);
+        apply_validated(&path, "", &install_block("", &first), &first).unwrap();
+        let cur2 = std::fs::read_to_string(&path).unwrap();
+        let second = render_sub2api_block("https://hk.recodex.dev/backend-api/codex", false);
+        apply_validated(&path, &cur2, &install_block(&cur2, &second), &second).unwrap();
+
+        let backup = std::fs::read(suffixed(&path, CONFIG_BACKUP_SUFFIX)).unwrap();
+        assert!(
+            backup.is_empty(),
+            "用户原本什么都没有,备份却有内容 —— 我们自己的旧块被当成了用户原样"
+        );
+    }
+
+    /// 共用闸门本身的三种情形。
+    #[test]
+    fn refuse_if_would_break_only_blocks_good_to_bad() {
+        let good = "model = \"x\"\n";
+        let bad = "model = \n";
+        assert!(refuse_if_would_break(good, good).is_ok(), "好→好 该放行");
+        assert!(refuse_if_would_break(bad, bad).is_ok(), "坏→坏 不归它管(交给重建分支)");
+        assert!(refuse_if_would_break(bad, good).is_ok(), "坏→好 是修复,该放行");
+        assert_eq!(
+            refuse_if_would_break(good, bad).unwrap_err().kind(),
+            ErrorKind::InvalidData,
+            "好→坏 必须拒绝"
+        );
+    }
+
+    /// **每一个** config.toml 写入方落盘前都要过闸。
+    ///
+    /// 审计时 apply_managed_model / demote_managed_provider 都是直接 write_atomic,
+    /// 而前者每次启动都可能跑 —— 安全网对它们不成立。用文本守卫钉住:
+    /// 这几个函数体里,write_atomic 之前必须出现 refuse_if_would_break。
+    #[test]
+    fn every_config_writer_passes_the_gate() {
+        let src = include_str!("codexcfg.rs");
+        for name in ["fn apply_managed_model", "fn demote_managed_provider", "fn apply_validated"] {
+            let start = src.find(name).unwrap_or_else(|| panic!("找不到 {name}"));
+            let body_end = src[start..].find("\n}\n").map(|i| start + i).unwrap_or(src.len());
+            let body = &src[start..body_end];
+            // apply_validated 的第一分支是 validate_toml(next) 直接验过再写,
+            // 不需要再过 refuse_if_would_break —— 所以认**任一**校验,
+            // 只要求它出现在第一处 write_atomic 之前。
+            let gate = [body.find("refuse_if_would_break("), body.find("validate_toml(")]
+                .into_iter()
+                .flatten()
+                .min();
+            let write = body.find("write_atomic(");
+            assert!(
+                matches!((gate, write), (Some(g), Some(w)) if g < w),
+                "{name} 落盘前既没过 refuse_if_would_break 也没 validate_toml —— 它写出去的坏文件没人拦"
+            );
+        }
     }
 
 }

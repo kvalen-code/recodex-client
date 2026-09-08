@@ -303,6 +303,41 @@ struct BridgeWatchdogRuntime {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// 启动时验一次 config.toml,读不进去就上报。
+///
+/// **必须在拉起 Codex 之前**:配置坏了 Codex 硬失败起不来(官方实测是
+/// `Error loading configuration: ...: duplicate key`,不回落),那样永远走不到
+/// `launcher.ready`,我们只会看到 `bridge.resolve_failed` 这种下游症状,
+/// 分不清是桥的问题还是配置废了。
+///
+/// 只报失败,不报成功:分母用现成的 `launcher.ready` 算就够了,
+/// 再加一条成功事件是白占匿名口的限流额度。
+///
+/// detail 里带 `error` 字段,所以会被 diagnostics_flush 自动判为要上报
+/// (见那边的 should_report),不用再进 ALWAYS_REPORT 白名单。
+///
+/// 内容脱敏在 recodex_integration::config_health 里做:只出行列号和一个固定分类,
+/// 原始报错一个字都不带 —— 那份报错会把出错行**原样**渲染出来,而那一行
+/// 很可能正是我们内联进去的网关 Key。
+fn report_config_health(home: &std::path::Path) {
+    let path = home.join("config.toml");
+    let Some(failure) = recodex_integration::config_health::check(&path) else {
+        return;
+    };
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        // 叫 launcher.* 不是随意的:diagnostics_flush::category 按事件名前缀分类,
+        // launcher/startup 才会落进 "startup",否则会被归成 runtime ——
+        // 而这是一个**启动期**问题,归错类会让它混在桥的噪声里找不出来。
+        "launcher.config_parse_failed",
+        serde_json::json!({
+            "error": failure.kind,
+            "line": failure.line,
+            "column": failure.column,
+            "has_managed_block": failure.has_managed_block,
+        }),
+    );
+}
+
 pub async fn launch_and_inject(options: LaunchOptions) -> anyhow::Result<LaunchHandle> {
     launch_and_inject_with_hooks(options, DefaultLaunchHooks::shared()).await
 }
@@ -326,6 +361,7 @@ where
 
     let result: anyhow::Result<LaunchHandle> = async {
         let home = crate::relay_config::default_codex_home_dir();
+        report_config_health(&home);
         if settings.provider_sync_enabled {
             crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
             hooks.run_provider_sync().await?;
@@ -4261,5 +4297,36 @@ mod tests {
         helper.await.unwrap();
         assert_eq!(upstream.await.unwrap(), expected_body);
         crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+}
+
+#[cfg(test)]
+mod config_health_placement_tests {
+    /// config.toml 的健康检查**必须是启动序列的第一件事**。
+    ///
+    /// 配置坏了 Codex 是硬失败起不来的(官方实测
+    /// `Error loading configuration: ...: duplicate key`,不回落),
+    /// 所以挪到启动之后 = 永远收不到数据,而表面上「埋点做了」。
+    /// 这正是 2026-09-08 那次的教训:观测层部署成功不等于在收数据。
+    ///
+    /// **第一版守卫是假的**:它比的是 `report_config_health` 与
+    /// `build_codex_command` 在**文件里的先后**,而 launcher.ready 那一段
+    /// 恰好排在 build_codex_command 的定义之前 —— 把调用挪到启动之后,
+    /// 文本顺序照旧成立,守卫照绿。文本位置 ≠ 执行顺序。
+    ///
+    /// 现在钉的是**真实锚点**:它必须紧跟在启动序列开头那个 `home` 绑定之后。
+    #[test]
+    fn health_check_is_first_in_the_launch_sequence() {
+        let source = include_str!("launcher.rs");
+        let seq = source
+            .find("let result: anyhow::Result<LaunchHandle> = async {")
+            .expect("找不到启动序列");
+        let window_end = (seq + 400).min(source.len());
+        let window = &source[seq..window_end];
+        assert!(
+            window.contains("report_config_health(&home);"),
+            "健康检查不在启动序列开头 —— 配置坏了就永远走不到，等于没埋：
+{window}"
+        );
     }
 }
