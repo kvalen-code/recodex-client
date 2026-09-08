@@ -846,28 +846,41 @@ pub(crate) fn write_atomic_mode(path: &Path, data: &[u8], secret: bool) -> io::R
 /// 换完就是 0600 —— 不需要在 rename 之后再补一次。
 #[cfg(unix)]
 fn write_tmp(tmp: &Path, data: &[u8], secret: bool) -> io::Result<()> {
-    if !secret {
-        return fs::write(tmp, data);
-    }
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(tmp)?;
-    // `.mode()` 只作用于**新建**。上一次崩溃留下的同名 tmp 会被复用,权限还是旧的,
-    // 所以再显式收一次。
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(data)
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    if secret {
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(tmp)?;
+    if secret {
+        // `.mode()` 只作用于**新建**。上一次崩溃留下的同名 tmp 会被复用,权限还是旧的,
+        // 所以再显式收一次。
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(data)?;
+    sync_tmp(&file)
 }
 
 /// Windows 上没有 0600 这一说,`~/.codex` 靠的是用户目录本身的 ACL。
 #[cfg(not(unix))]
 fn write_tmp(tmp: &Path, data: &[u8], _secret: bool) -> io::Result<()> {
-    fs::write(tmp, data)
+    use std::io::Write;
+    let mut file = fs::File::create(tmp)?;
+    file.write_all(data)?;
+    sync_tmp(&file)
+}
+
+/// rename 只保证**目录项**的替换是原子的,不保证内容已经落盘。
+///
+/// 少了这一步,断电或强杀之后可能留下一个长度为 0 的 config.toml ——
+/// 托管块连同内联的长期密钥一起消失,而文件本身看上去是完好的
+/// (不是损坏、不是缺失,就是空的),用户只会看到"忽然要重新登录"。
+/// 必须在 rename **之前** fsync:rename 之后再补就换不回已经丢掉的数据了。
+fn sync_tmp(file: &fs::File) -> io::Result<()> {
+    file.sync_all()
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
