@@ -27,6 +27,13 @@ static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
 const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 20_000;
 const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 
+// 协议代理端口被写死在 config.toml 的 `base_url` 里,换不了(见 helper_port_fallback_is_safe),
+// 所以它被占时我们只能失败。但有一类占用是**必然会自己消失**的:重启是先杀旧进程再拉新的,
+// 旧 helper 交还监听要一小会儿 —— 上游 #1933 的表现就是「重启必失败、直接双击 exe 反而正常」。
+// 给前任一个让位窗口,别把这种秒级的交接判成端口冲突。
+const HELPER_BIND_RETRY_TIMEOUT_MS: u64 = 6_000;
+const HELPER_BIND_RETRY_INTERVAL_MS: u64 = 200;
+
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
 /// Callers that install a custom [`crate::routes::BridgeContext`] should configure this callback
@@ -369,11 +376,41 @@ where
             || remote_control_provider_proxy_enabled(&settings);
         if protocol_proxy_enabled {
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
+            // 注意别改成「重试 start_helper」:那个实现绑不上会退到临时端口并**当场起服务**,
+            // 重试一次就多漏一个 helper。要等就得在 bind 之前等。
+            // 探的是 127.0.0.1(can_bind_loopback_port 写死),而 start_helper 绑的是
+            // helper_bind_host() —— 设了 CODEX_PLUS_HELPER_BIND 时两者可以不是一个地址。
+            // 不改成同一个是因为这里只是**best-effort 的让位等待**,而两个方向都不会更糟:
+            // 旧 helper 绑 0.0.0.0 时会连 127.0.0.1 一起占住,探测照样探得出来;反过来
+            // 探测过了但绑不上,落回下面 fallback + port_taken 那条既有路径。
+            let (freed, waited_ms) = wait_for_port_release(
+                helper_port,
+                HELPER_BIND_RETRY_TIMEOUT_MS,
+                HELPER_BIND_RETRY_INTERVAL_MS,
+                crate::ports::can_bind_loopback_port,
+            )
+            .await;
+            if waited_ms > 0 {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.protocol_proxy_port_wait",
+                    serde_json::json!({
+                        "port": helper_port,
+                        "waited_ms": waited_ms,
+                        "freed": freed,
+                    }),
+                );
+            }
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
             // 用实际绑定的端口覆盖:被占时实现会换端口,后面的桥/注入/看门狗都要用真实值。
             let bound_port = hooks.start_helper(helper_port).await?;
             // 先记上:下面万一 bail,错误路径要靠这个标志把已经绑上的 helper 收掉。
+            //
+            // 注意此刻 `helper_port` 还是**请求值**,真实绑定值要到下面几行才赋回去。
+            // 中间那次 bail 走的错误路径拿到的是请求值 —— 今天没事,因为
+            // `shutdown_helper` 的入参是 `_helper_port`(它按 `self.helper` 收进程,
+            // 不看端口)。哪天把它改成按端口关,这里就会漏掉一个绑在临时端口上的
+            // helper,而且不会有任何报错。改之前先把这行的赋值提上来。
             helper_started = true;
             if !helper_port_fallback_is_safe(protocol_proxy_enabled, helper_port, bound_port) {
                 // 走到这里启动已经必败了,多花 1 秒把「是谁占着」问清楚是值得的:
@@ -2926,6 +2963,31 @@ pub fn helper_port_fallback_is_safe(
     bound_port: u16,
 ) -> bool {
     bound_port == requested_port || !protocol_proxy_enabled
+}
+
+/// 等某个端口让出来,最多 `timeout_ms`。返回 (最后能不能绑, 一共等了多久)。
+///
+/// 只给换不了端口的协议代理用。`can_bind` 探测本身是 TOCTOU 的(绑一下就放开),
+/// 但这里不是拿它做准入判断 —— 真正的 bind 紧接着就发生,探到能绑之后再被抢走,
+/// 落回原来的 fallback + `launcher.protocol_proxy_port_taken` 路径,不会更糟。
+pub async fn wait_for_port_release(
+    port: u16,
+    timeout_ms: u64,
+    interval_ms: u64,
+    can_bind: impl Fn(u16) -> bool,
+) -> (bool, u64) {
+    let interval_ms = interval_ms.max(1); // 0 会让 waited_ms 永远涨不到 timeout
+    let mut waited_ms = 0;
+    loop {
+        if can_bind(port) {
+            return (true, waited_ms);
+        }
+        if waited_ms >= timeout_ms {
+            return (false, waited_ms);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+        waited_ms += interval_ms;
+    }
 }
 
 pub fn bridge_watchdog_delay(consecutive_failures: u32) -> std::time::Duration {

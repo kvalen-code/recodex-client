@@ -23,9 +23,17 @@ use serde_json::json;
 // 拉到 120 秒对后者毫无用处,只是每次启动多空转 110 秒。**保持 10 秒**:够覆盖
 // 151 的竞态,又不会在 152 上白等。
 //
-// 不下线功能:151 世代用户还能用,而这条路跑在 `tokio::spawn` 里不挡启动。
-// 等 151 彻底没人用了再摘。
-const MENU_LOCALIZATION_RETRIES: usize = 20;
+// 2026-09-08 下线:功能默认关(settings.rs 的 codex_app_native_menu_localization),
+// 重试也砍到 1 次。
+//
+// 上一版的判断是「151 世代还能用,跑在 tokio::spawn 里不挡启动,等 151 没人用了再摘」。
+// 生产数据推翻了它:1.3.4 上仍有 3 台 macOS 报终态 `localization_failed`(跑满 20 次
+// 才放弃)、5 台报 `retry_failed`。原因是那道 152+ 的闸要先 `browser_identity` 成功
+// 才判得出世代,而 macOS 上那一刻 CDP 常常还没起来 —— 闸落空,照样烧完 20 次。
+//
+// 留 1 次而不是 0 次:151 的启动竞态里确实有第 1 次就成的,而且保留这条路径
+// 意味着 fuse 万一放开,把开关打开就能用,不用再把代码写回来。
+const MENU_LOCALIZATION_RETRIES: usize = 1;
 const MENU_LOCALIZATION_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// `--inspect` 被 fuse 关死的第一个世代。>= 这个数就别试了。
@@ -171,8 +179,9 @@ pub async fn install_native_menu_localizer(
                     // 而"这台机器结构上不支持"不该占用故障额度。
                     return Ok(());
                 }
-                // 同 ensure_injection:CDP 不可达时 20 次全会失败且同因,
-                // 线上见过 attempt 18。采样留第 1、2、4、8、16 次。
+                // 同 ensure_injection:CDP 不可达时每次都失败且同因。采样留第
+                // 1、2、4、8、16 次 —— 现在只剩 1 次,但采样规则保持不变,
+                // 免得哪天把次数调回去又要重写一遍。
                 if crate::diagnostic_log::should_log_retry_attempt(attempt as u32) {
                     let _ = crate::diagnostic_log::append_diagnostic_log(
                         "native_menu.localization_retry_failed",
@@ -183,7 +192,11 @@ pub async fn install_native_menu_localizer(
                         }),
                     );
                 }
-                tokio::time::sleep(MENU_LOCALIZATION_RETRY_DELAY).await;
+                // 最后一次失败后不再睡:睡完就退出循环,那 500ms 纯属白等。
+                // 次数为 1 时这一条就是全部 —— 不加判断的话每次启动都平白多 500ms。
+                if attempt < MENU_LOCALIZATION_RETRIES {
+                    tokio::time::sleep(MENU_LOCALIZATION_RETRY_DELAY).await;
+                }
             }
         }
     }
@@ -194,11 +207,16 @@ pub async fn install_native_menu_localizer(
     // 用 as_millis 而不是 as_secs:延迟是 500ms,`as_secs()` 截断成 0,
     // 再乘多少次都还是 0 —— 上线后所有上报都写着「共等 0 秒」,读的人会以为
     // 重试压根没退避,照着这条去查一个不存在的问题(实测被带偏过一次)。
+    //
+    // 乘的是 RETRIES-1 不是 RETRIES:最后一次失败后不再睡(见上面那个 attempt 判断),
+    // n 次尝试之间只有 n-1 个间隔。次数砍到 1 之后这个差别就是「写 0.5 秒实际等 0 秒」,
+    // 又是上面那个坑的同一种踩法。
     Err(last_error
         .unwrap_or_else(|| anyhow::anyhow!("native menu localization failed"))
         .context(format!(
             "放弃于第 {MENU_LOCALIZATION_RETRIES} 次尝试(共等 {:.1} 秒)",
-            (MENU_LOCALIZATION_RETRY_DELAY.as_millis() * MENU_LOCALIZATION_RETRIES as u128) as f64
+            (MENU_LOCALIZATION_RETRY_DELAY.as_millis()
+                * MENU_LOCALIZATION_RETRIES.saturating_sub(1) as u128) as f64
                 / 1000.0
         )))
 }
@@ -324,12 +342,12 @@ mod fuse_gate_tests {
         for browser in ["Chrome/152.0.7977.83", "Chrome/153.0.1.1", "Chrome/200.0.0.0"] {
             assert!(
                 !menu_localization_worth_attempting(browser),
-                "{browser} 上 --inspect 被 fuse 关死,不该再空跑 20 次重试"
+                "{browser} 上 --inspect 被 fuse 关死,连试一次都是空跑"
             );
         }
     }
 
-    // 151 世代确实有启动竞态,重试能救回来 —— 不能一起关掉。
+    // 151 世代那个端口是真会监听的,试一次有意义 —— 不能跟 152 一起关掉。
     #[test]
     fn still_tries_on_the_generation_that_works() {
         for browser in ["Chrome/151.0.7519.0", "Chrome/120.0.0.0", "Chrome/99.9.9.9"] {

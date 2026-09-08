@@ -273,3 +273,58 @@ pub fn ").unwrap_or(router.len())];
         "route_codex_through_gateway 没在 stage_config_for_return 之前校验 ——          被注入的块会先进官方模式快照,切回来照样生效"
     );
 }
+
+/// 落盘权限必须由**内容**决定,不能交给每个调用方各自记得。
+///
+/// 这条守卫是补一次真实缺陷的:第一版 `write_atomic_mode(path, data, secret)` 让
+/// 调用方传 `secret`,全仓只有登录那条路传对了。另外两条整篇重写 config.toml 的路
+/// (`apply_managed_model` 每次启动比对推荐模型时、`demote_managed_provider` 在
+/// 用户点「切回官方模式」时 —— 后者还是**故意**把密钥留在文件里的)都原样保留了
+/// bearer 那一行却传 `false`,文件当场从 0600 退回 0644,里面躺着明文长期凭据,
+/// 没有任何征兆。
+///
+/// 判断挪进 `write_atomic` 之后,调用方想传错都没得传。守卫盯的就是别再挪回去。
+///
+/// 只能扫源码,不能跑真实断言:这台开发机是 Windows,`write_tmp` 的 unix 分支
+/// 在这里根本不编译,`Mode().Perm()` 也永远返回 0666。真实的权限断言在 Go 侧
+/// (`internal/clientcfg` 的 TestApplyConfigInlinedKeyIsNotWorldReadable),
+/// 两边写的是同一个文件、用的是同一条判据。
+#[test]
+fn config_write_permission_is_decided_by_content_not_by_the_caller() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("codexcfg.rs");
+    let source = fs::read_to_string(&path).expect("读 codexcfg.rs");
+    // 先切测试段再剥注释:上面那条 doc comment 里就写着函数名和 `false`,
+    // 不剥的话守卫会被自己的注释喂饱。
+    let code = executable_code(source.split("#[cfg(test)]").next().unwrap_or(&source));
+
+    // `fn write_atomic(` 带左括号,不会匹配到 `fn write_atomic_mode(`。
+    let body = code
+        .split_once("fn write_atomic(")
+        .expect("找不到 write_atomic")
+        .1;
+    let body = &body[..body.find("\n}").unwrap_or(body.len())];
+    // 不带左括号:它是当**函数引用**传给 `is_ok_and` 的,写法里没有那对括号。
+    // 第一版按 `managed_key_is_inlined(` 断言,守卫当场红了 —— 这一红反而证明
+    // 它扫的是真源码,不是自己的注释。
+    assert!(
+        body.contains("managed_key_is_inlined"),
+        "write_atomic 不再按内容判断是否含密钥 —— 每个整篇重写 config.toml 的\
+         调用方都会重新变成 0644 明文密钥"
+    );
+
+    // auth.json 装的是 OAuth token,`write_atomic` 的内容嗅探只认 TOML 的
+    // bearer 行、认不出 JSON,所以这两条路必须显式标 secret。
+    for func in ["pub fn write_auth", "pub fn restore_auth"] {
+        let f = code
+            .split_once(func)
+            .unwrap_or_else(|| panic!("找不到 {func}"))
+            .1;
+        let f = &f[..f.find("\npub ").unwrap_or(f.len())];
+        assert!(
+            f.contains("write_atomic_mode(") && f.contains("true)"),
+            "{func} 没显式按含密钥文件落盘 —— auth.json 会以 0644 写出 OAuth token"
+        );
+    }
+}

@@ -285,7 +285,13 @@ pub struct BackendSettings {
     pub codex_app_upstream_worktree_create: bool,
     #[serde(rename = "codexAppNativeMenuPlacement", default = "default_true")]
     pub codex_app_native_menu_placement: bool,
-    #[serde(rename = "codexAppNativeMenuLocalization", default = "default_true")]
+    // 默认关。`--inspect` 走的是 Electron 的 Node inspector,而 OpenAI 打包时烧了
+    // fuse `EnableNodeCliInspectArguments = 0` —— Codex 152 起这条路**永远不通**,
+    // 参数被静默忽略、端口永不监听(实证见 native_menu.rs 开头那段)。
+    //
+    // 开关留着是为了 fuse 万一放开,但默认必须是关的:开着的唯一效果,是给一个
+    // 处理用户凭据的应用多传一个 `--inspect`,而换不回任何功能。
+    #[serde(rename = "codexAppNativeMenuLocalization", default)]
     pub codex_app_native_menu_localization: bool,
     #[serde(rename = "codexAppServiceTierControls", default)]
     pub codex_app_service_tier_controls: bool,
@@ -386,7 +392,8 @@ impl Default for BackendSettings {
             zed_remote_sync_to_zed_settings: false,
             codex_app_upstream_worktree_create: true,
             codex_app_native_menu_placement: true,
-            codex_app_native_menu_localization: true,
+            // fuse 关死了这条路,默认不开(理由见字段上的注释)
+            codex_app_native_menu_localization: false,
             codex_app_service_tier_controls: false,
             codex_app_pet_real_mouse_look: false,
             codex_app_image_overlay_enabled: false,
@@ -1081,6 +1088,37 @@ fn normalize_text_config(contents: String) -> String {
     }
 }
 
+/// 这份内容里有没有明文长期凭据。
+///
+/// 认两种形态，因为这个 crate 的 atomic_write 同时写 config.toml 和 auth.json：
+///   - TOML：`experimental_bearer_token = …`（托管块内联密钥后的形态）
+///   - JSON：`"OPENAI_API_KEY"`（auth.json）
+///
+/// recodex-integration 那边的 write_atomic 只认 TOML 一种，auth.json 靠调用方
+/// 显式传 secret。这里两种都认，因为本函数的调用方（relay_config）两种文件都写，
+/// 而且它没有 secret 参数可传。
+fn contains_plaintext_credential(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let t = line.trim_start();
+        t.strip_prefix("experimental_bearer_token")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    }) || text.contains("\"OPENAI_API_KEY\"")
+}
+
+/// 原子写。内容里含明文长期凭据时落 0600，否则沿用默认权限。
+///
+/// ⚠️ 这条路**目前还没接进启动流程**（`apply_active_relay_profile` 是 LaunchHooks
+/// 的实现，但 run_launch 里没有调它）。修在这里是因为：
+///   - 它写的是 `~/.codex/{config.toml,auth.json}`，与 recodex-integration
+///     写的是**同一批文件**，而那边已经收到 0600；
+///   - 谁哪天把这个 hook 接进启动流程，0600 会被每次启动重置回 0644，
+///     而那时没人会想到是这里 —— 潜伏 bug 比现行 bug 更贵。
+///
+/// 与 recodex-integration 的 `write_atomic_mode`、Go 侧的
+/// `writeFileAtomicSecretAware` 同一策略：**按要落盘的内容判**，不靠调用方记得传参。
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -1090,6 +1128,18 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let temp_path = temp_path_for(path);
     fs::write(&temp_path, bytes)
         .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
+    // 收紧要在 rename 之前：rename 把 tmp 的 inode 连权限一起搬过去，
+    // 反过来做的话从 rename 到 chmod 之间那份明文凭据是 umask 默认权限。
+    #[cfg(unix)]
+    if contains_plaintext_credential(bytes) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error).with_context(|| {
+                format!("failed to restrict permissions on {}", temp_path.display())
+            });
+        }
+    }
     if let Err(error) = replace_file(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(error).with_context(|| {
@@ -1625,4 +1675,57 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(store.load().unwrap(), BackendSettings::default());
     }
 
+
+    /// 🔴 含明文长期凭据的内容必须落 0600。
+    ///
+    /// 这条路目前还没接进启动流程，但它写的是 ~/.codex/{config.toml,auth.json} ——
+    /// 与 recodex-integration 写的是同一批文件，那边已经收到 0600。
+    /// 谁哪天把 apply_active_relay_profile 接进启动流程，0600 会被每次启动重置回
+    /// 0644，而那时没人会想到是这里。
+    #[test]
+    fn atomic_write_locks_down_files_containing_credentials() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // TOML 形态（托管块内联密钥后）
+        let toml_path = dir.join("config.toml");
+        atomic_write(&toml_path, b"[p]
+experimental_bearer_token = \"sk-live-x\"
+").unwrap();
+        // JSON 形态（auth.json）
+        let json_path = dir.join("auth.json");
+        atomic_write(&json_path, b"{\"OPENAI_API_KEY\":\"sk-live-x\"}
+").unwrap();
+        // 不含凭据的内容不必收紧
+        let plain_path = dir.join("plain.toml");
+        atomic_write(&plain_path, b"model = \"gpt-5.6\"
+").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [&toml_path, &json_path] {
+                let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} 含明文凭据却是 {:o}", p.display(), mode);
+            }
+            let mode = std::fs::metadata(&plain_path).unwrap().permissions().mode() & 0o777;
+            assert_ne!(mode, 0o600, "不含凭据的文件不该被无谓收紧");
+        }
+
+        // 无论平台，内容都要写对。
+        assert!(std::fs::read_to_string(&toml_path).unwrap().contains("sk-live-x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 判据要认得出两种形态，也不能把普通内容误判成凭据。
+    #[test]
+    fn credential_sniffer_recognises_both_shapes() {
+        assert!(contains_plaintext_credential(b"experimental_bearer_token = \"sk-x\""));
+        assert!(contains_plaintext_credential(b"  experimental_bearer_token='sk-x'"));
+        assert!(contains_plaintext_credential(b"{\"OPENAI_API_KEY\":\"sk-x\"}"));
+        // 不是键而是值里提到，不算。
+        assert!(!contains_plaintext_credential(b"note = \"use experimental_bearer_token\""));
+        assert!(!contains_plaintext_credential(b"model = \"gpt-5.6\""));
+        assert!(!contains_plaintext_credential(b""));
+    }
 }

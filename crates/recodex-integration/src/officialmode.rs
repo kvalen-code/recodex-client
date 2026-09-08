@@ -98,7 +98,10 @@ fn save_snapshot(snapshot: &OfficialModeSnapshot) -> io::Result<()> {
     }
     let text = serde_json::to_string_pretty(snapshot)
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-    fs::write(&path, text)
+    // 这份快照里有明文长期凭据:`env_value` 一直都有,`config_body` 现在也带着
+    // 内联进去的 bearer 行。原子写 + 0600 —— 和 config.toml、LaunchAgent plist
+    // 同一档,不能因为它藏在 LOCALAPPDATA 就松一档。
+    codexcfg::write_atomic_mode(&path, text.as_bytes(), true)
 }
 
 fn clear_snapshot() -> io::Result<()> {

@@ -189,7 +189,7 @@ Provider switching saves the current profile before applying the target profile.
 
 - Session delete, bulk delete, Markdown export, and project move actions.
 - Plugin marketplace unlock, plugin auto-expand, and model whitelist handling.
-- Plain-text paste, forced Chinese locale, startup acceleration, and native menu localization.
+- Plain-text paste, forced Chinese locale, and startup acceleration.
 - Conversation width, scroll restoration, thread IDs, service-tier controls, and Goals.
 - Stepwise suggestions with a separate API, model, item count, and timeout.
 - Upstream worktrees, Zed Remote, custom image overlays, and user scripts.

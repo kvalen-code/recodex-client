@@ -871,7 +871,7 @@
   // 高级页签的开关:低频 + 偏系统集成,和日常增强分开放
   const ENH_ADV = [
     ["codexAppNativeMenuPlacement", "原生菜单栏位置"],
-    ["codexAppNativeMenuLocalization", "原生菜单本地化"],
+    ["codexAppNativeMenuLocalization", "原生菜单本地化(仅 Codex 151 及更早)"],
     ["codexAppZedRemoteOpen", "Zed Remote 打开"],
     ["codexAppUpstreamWorktreeCreate", "上游 worktree 创建"],
   ];

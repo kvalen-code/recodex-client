@@ -1062,8 +1062,9 @@ async fn launch_lifecycle_passes_native_menu_localization_switch_to_codex_launch
     std::fs::create_dir_all(&app_dir).unwrap();
     let status_store = StatusStore::new(temp.path().join("latest-status.json"));
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    // 显式**开启**:默认已经是关(fuse 关死了那条路),照着默认值断言等于什么都没验。
     let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
-        codex_app_native_menu_localization: false,
+        codex_app_native_menu_localization: true,
         ..BackendSettings::default()
     });
 
@@ -1084,7 +1085,7 @@ async fn launch_lifecycle_passes_native_menu_localization_switch_to_codex_launch
         events
             .lock()
             .unwrap()
-            .contains(&"launch:9229:native-menu-off".to_string())
+            .contains(&"launch:9229:native-menu-on".to_string())
     );
 }
 
@@ -1946,10 +1947,13 @@ impl LaunchHooks for FakeHooks {
         } else {
             format!("launch:{debug_port}:{}", extra_args.join(","))
         };
+        // 标记打在**开启**这一侧。菜单汉化 2026-09-08 起默认关(fuse 关死了那条路),
+        // 关闭已经是常态 —— 给常态打标记会让每一条生命周期用例都拖一截和自己无关的
+        // 后缀,而且以后新写用例的人还得先知道有这么个后缀。
         if settings.codex_app_native_menu_localization {
-            self.event(launch_detail);
+            self.event(format!("{launch_detail}:native-menu-on"));
         } else {
-            self.event(format!("{launch_detail}:native-menu-off"));
+            self.event(launch_detail);
         }
         if let Some(message) = &self.launch_error {
             anyhow::bail!(message.clone());
@@ -2160,6 +2164,36 @@ fn helper_port_fallback_is_only_safe_when_the_port_is_not_a_contract() {
     assert!(!helper_port_fallback_is_safe(true, 57321, 57322));
 }
 
+/// 协议代理端口被占时,先给前任一个让位窗口再判死。
+///
+/// 上游 #1933:「重启」是先杀旧 launcher 再拉新的,旧 helper 交还 57321 要几百毫秒,
+/// 而我们一次探测就 bail —— 用户侧的表现是重启必失败、直接双击 exe 反而正常。
+#[tokio::test]
+async fn protocol_proxy_port_wait_gives_the_previous_helper_time_to_let_go() {
+    use codex_plus_core::launcher::wait_for_port_release;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // 前 3 次探测端口还占着,第 4 次才让出来。
+    let probes = AtomicU32::new(0);
+    let (freed, waited_ms) = wait_for_port_release(57321, 6_000, 10, |port| {
+        assert_eq!(port, 57321);
+        probes.fetch_add(1, Ordering::SeqCst) >= 3
+    })
+    .await;
+    assert!(freed, "端口在窗口内让出来了,不该判死");
+    assert_eq!(waited_ms, 30, "只该等到它让出来那一刻,不是等满");
+
+    // 没让出来:必须在窗口内收手,不能一直等下去 —— 后面还有 fallback + 占用者诊断。
+    let (freed, waited_ms) = wait_for_port_release(57321, 50, 10, |_| false).await;
+    assert!(!freed);
+    assert_eq!(waited_ms, 50, "等满窗口就走,不多等");
+
+    // 常见情况:端口本来就空着,一次探测就走,waited_ms=0(调用方靠它决定不写日志)。
+    let (freed, waited_ms) = wait_for_port_release(57321, 6_000, 200, |_| true).await;
+    assert!(freed);
+    assert_eq!(waited_ms, 0);
+}
+
 #[test]
 fn bridge_watchdog_only_backs_off_when_the_bridge_stays_broken() {
     use codex_plus_core::launcher::BridgeWatchdogOutcome;
@@ -2241,38 +2275,32 @@ fn user_alert_is_off_unless_the_launcher_turns_it_on() {
     );
 }
 
-/// 菜单汉化的等待窗口**不该**跟注入看齐。
+/// 菜单汉化:默认关,且失败一次就收手。
 ///
-/// 这条原来断言的是「和 ensure_injection 同量级(≥60 秒)」,依据是「慢机器上
-/// inspector 就绪得比 10 秒晚」。那个判断已被证伪:菜单等的是 Electron 的
+/// 这条原来断言的是等待窗口「和 ensure_injection 同量级」,依据是「慢机器上
+/// inspector 就绪得比 10 秒晚」。那个依据已被证伪:菜单等的是 Electron 的
 /// **Node inspector**,而 Codex 152 起烧了 fuse `EnableNodeCliInspectArguments=0`,
-/// 那个端口**永远不会监听**,等多久都一样(实证见 native_menu.rs 开头)。
-/// 注入等的 CDP 端口则是真会起来的,两者没有可比性。
+/// 那个端口**永远不会监听**,等多久都一样(实证见 native_menu.rs 开头;1.3.4 上线后
+/// 仍有 macOS 设备卡在终态 localization_failed)。注入等的 CDP 端口则是真会起来的,
+/// 两者没有可比性 —— 别再拿它当参照把窗口调回去。
 ///
-/// 现在守的是另一个不变量:窗口要够覆盖 151 世代的启动竞态(实测 attempt 1/2/3
-/// 就成),又不能在 152 上每次启动空转成分钟级。
+/// 开关保留是为了将来 fuse 放开,但默认必须关。
 #[test]
-fn menu_localization_gives_up_before_wasting_minutes() {
+fn menu_localization_is_off_by_default_and_gives_up_after_one_try() {
+    assert!(
+        !BackendSettings::default().codex_app_native_menu_localization,
+        "菜单汉化默认开了:fuse 关死了这条路,默认开等于每次启动白搭一次必败"
+    );
+
     let source = include_str!("../src/native_menu.rs");
-    let retries: u64 = source
+    let retries: usize = source
         .split_once("const MENU_LOCALIZATION_RETRIES: usize = ")
         .and_then(|(_, rest)| rest.split_once(';'))
         .and_then(|(value, _)| value.trim().parse().ok())
         .expect("读不到 MENU_LOCALIZATION_RETRIES");
-    let delay_ms: u64 = source
-        .split_once("const MENU_LOCALIZATION_RETRY_DELAY: Duration = Duration::from_millis(")
-        .and_then(|(_, rest)| rest.split_once(')'))
-        .and_then(|(value, _)| value.trim().parse().ok())
-        .expect("读不到 MENU_LOCALIZATION_RETRY_DELAY(改成非毫秒了?)");
-
-    let budget_ms = retries * delay_ms;
-    assert!(
-        budget_ms >= 5_000,
-        "菜单汉化只等 {budget_ms}ms,盖不住 151 世代的启动竞态"
-    );
-    assert!(
-        budget_ms <= 30_000,
-        "等 {budget_ms}ms 太久:152 上那个端口永远不会监听,这是纯空转"
+    assert_eq!(
+        retries, 1,
+        "重试了 {retries} 次:端口永远不会监听,重试只是把必败拖长"
     );
 }
 
@@ -2430,6 +2458,17 @@ fn menu_failure_says_how_long_it_waited() {
     assert!(
         tail.contains("as_millis()"),
         "等待时长要按毫秒算再换算成秒,否则亚秒延迟会被整除没"
+    );
+    // n 次尝试之间只有 n-1 个间隔:最后一次失败后直接退出循环,不再睡。
+    // 乘 RETRIES 而不是 RETRIES-1 的话,次数=1 时会写「共等 0.5 秒」而实际等了 0 秒 ——
+    // 又是上面那类「数字对不上现实」的坑,只是方向反过来。
+    //
+    // 次数砍到 1 之后这个差别不再是舍入误差,而是**全部**:现在正确的输出就是
+    // 「共等 0.0 秒」。它和上面那个截断 bug 长得一模一样,所以更要把算式钉死,
+    // 否则下一个人看见 0.0 会"顺手修好"它。
+    assert!(
+        tail.contains("saturating_sub(1)"),
+        "间隔数必须是 RETRIES-1:最后一次失败后不睡,乘 RETRIES 会虚报一个间隔"
     );
 }
 

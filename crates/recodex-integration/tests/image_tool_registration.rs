@@ -21,22 +21,27 @@ use recodex_integration::codexcfg;
 
 #[test]
 fn managed_block_declares_the_actor_authorization_header() {
-    let rendered = codexcfg::render_sub2api_block("https://example.test/backend-api/codex");
+    let rendered = codexcfg::render_sub2api_block("https://example.test/backend-api/codex", false);
 
     assert!(
         rendered.contains("x-openai-actor-authorization"),
         "少了这一行,客户端不注册本地 image_gen,生成的图在界面上一张都看不到:\n{rendered}"
     );
-    // requires_openai_auth 必须**不出现**或为 false:置 true 会强制弹 OpenAI 登录页、
-    // 改读 auth.json —— 那会废掉 env_key 认证,比不显示图片严重得多。
+    // requires_openai_auth 必须**不出现**或为 false。2026-09-08 实测确认:置 true
+    // 之后 Codex 改读 auth.json,而且**本地 image_gen 工具直接不注册了** ——
+    // 即上面那个 OR 表达式在实机上并不成立,别照着源码注释推断。
     assert!(
         !rendered.contains("requires_openai_auth = true"),
-        "requires_openai_auth = true 会废掉 env_key 认证:\n{rendered}"
+        "requires_openai_auth = true 会让 image_gen 静默消失:\n{rendered}"
     );
-    // 密钥必须走环境变量。experimental_bearer_token 会把明文密钥写进 config.toml,
-    // 而这个文件用户会截图、会贴进工单。
+    // 模板必须保持 env_key 形状:服务端下发的就是这个形状,两边不一致的话
+    // `install_block` 每次都判定有变更、反复重写用户的 config.toml。
+    //
+    // 注意这**不是**禁止 bearer:真正落盘的那份会由 `inline_managed_key` 换成
+    // experimental_bearer_token(理由见该函数)。这条守的是「替换只发生在写盘
+    // 这一步」,别把它提前到模板里。
     assert!(
         !rendered.contains("experimental_bearer_token"),
-        "密钥不能明文写进 config.toml:\n{rendered}"
+        "模板要保持 env_key 形状,内联只在写盘时做:\n{rendered}"
     );
 }

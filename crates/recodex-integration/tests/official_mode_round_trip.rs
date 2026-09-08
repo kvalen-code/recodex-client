@@ -106,7 +106,8 @@ fn switching_to_official_and_back_keeps_the_user_logged_in() {
 
     // 6) 官方模式下换网关:只能改快照,不能碰活配置
     officialmode::switch_to_official().unwrap();
-    let new_block = codexcfg::render_sub2api_block("https://jp.gw.example.dev/backend-api/codex");
+    let new_block =
+        codexcfg::render_sub2api_block("https://jp.gw.example.dev/backend-api/codex", false);
     assert!(
         officialmode::stage_config_for_return(&new_block).unwrap(),
         "官方模式下应写进快照"

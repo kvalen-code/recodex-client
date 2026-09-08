@@ -2450,13 +2450,18 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
     {
         profile.config_contents = complete_relay_profile_config(profile)?;
     }
+    // PureApi 下 `complete_relay_profile_config` 会把 config.toml 里的
+    // `experimental_bearer_token` 删掉,auth.json 是 key 唯一的落点。
+    // 这里过去还要求 auth_contents 为空,于是「非空但没有 OPENAI_API_KEY」的 auth.json
+    // (比如退出 ChatGPT 登录后残留的 tokens/last_refresh)会把写入整个挡掉 ——
+    // key 两边都没有,Codex 只能回退到环境变量,上游返回 401(上游 issue #1965)。
     if profile.relay_mode == crate::settings::RelayMode::PureApi
-        && profile.auth_contents.trim().is_empty()
         && !source_api_key.trim().is_empty()
     {
-        profile.auth_contents = serde_json::to_string_pretty(&json!({
-            "OPENAI_API_KEY": source_api_key.trim()
-        }))?;
+        profile.auth_contents =
+            set_openai_api_key_in_auth_contents(&profile.auth_contents, &source_api_key)
+                // auth.json 本身已经坏了就保不住原内容,但 key 必须有落点,直接重建。
+                .or_else(|_| set_openai_api_key_in_auth_contents("", &source_api_key))?;
     }
     if profile.relay_mode == crate::settings::RelayMode::Official {
         profile.auth_contents = remove_openai_api_key_from_auth_contents(&profile.auth_contents)?;
@@ -2703,17 +2708,60 @@ fn create_live_backup(
         return Ok(None);
     }
 
-    let backup_dir = home
-        .join("backups")
-        .join(format!("codex-plus-live-{}", timestamp_millis()));
+    let backups_root = home.join("backups");
+    let backup_dir = backups_root.join(format!("codex-plus-live-{}", timestamp_millis()));
     std::fs::create_dir_all(&backup_dir)?;
+    // 备份目录本身也收紧：里面躺的是 config.toml 与 auth.json 的完整副本，
+    // 目录 0755 的话同机其他用户能列出来、能按名字直接读。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&backups_root, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&backup_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // 走 atomic_write 而不是裸 fs::write：它按内容判权限，明文凭据落 0600。
+    // 备份是**原封不动的副本**，原件收到了 0600 而副本还是 0644，等于从后门漏出去。
     if let Some(config) = config {
-        std::fs::write(backup_dir.join("config.toml"), config)?;
+        crate::settings::atomic_write(&backup_dir.join("config.toml"), config)?;
     }
     if let Some(auth) = auth {
-        std::fs::write(backup_dir.join("auth.json"), auth)?;
+        crate::settings::atomic_write(&backup_dir.join("auth.json"), auth)?;
     }
+    prune_live_backups(&backups_root);
     Ok(Some(backup_dir.to_string_lossy().to_string()))
+}
+
+/// 只保留最近 LIVE_BACKUP_KEEP 份实时备份，其余删掉。
+///
+/// 不加这个的话每次切换 relay profile 都按时间戳新建一个目录、**永不清理**，
+/// 而每一份里都是明文的 config.toml 与 auth.json。跑得越久，磁盘上散落的
+/// 长期凭据副本越多，其中任何一份的权限出问题都够呛 —— 少留一份就少一个面。
+///
+/// 清理失败一律忽略：备份是尽力而为的辅助，不该因为删不掉旧的就让本次切换失败。
+fn prune_live_backups(backups_root: &Path) {
+    const LIVE_BACKUP_KEEP: usize = 5;
+
+    let Ok(entries) = std::fs::read_dir(backups_root) else {
+        return;
+    };
+    let mut dirs: Vec<_> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("codex-plus-live-")
+                && e.path().is_dir()
+        })
+        .map(|e| e.path())
+        .collect();
+    if dirs.len() <= LIVE_BACKUP_KEEP {
+        return;
+    }
+    // 目录名里带毫秒时间戳，字典序即时间序（位数相同）。
+    dirs.sort();
+    for old in &dirs[..dirs.len() - LIVE_BACKUP_KEEP] {
+        let _ = std::fs::remove_dir_all(old);
+    }
 }
 
 fn timestamp_millis() -> u128 {
@@ -2834,6 +2882,53 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 实时备份必须有上限。
+    ///
+    /// 不加轮转的话，每次切换 relay profile 都按时间戳新建一个目录、**永不清理**，
+    /// 而每一份里都是明文的 config.toml 与 auth.json。跑得越久，磁盘上散落的
+    /// 长期凭据副本越多 —— 少留一份就少一个泄露面。
+    #[test]
+    fn live_backups_are_pruned_to_a_bounded_number() {
+        let home = std::env::temp_dir().join(format!(
+            "codexpp-backup-prune-{}-{}",
+            std::process::id(),
+            timestamp_millis()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+
+        // 连做 8 次备份，应当只剩最近 5 份。
+        for _ in 0..8 {
+            create_live_backup(
+                &home,
+                Some(b"experimental_bearer_token = \"sk-live-x\"\n"),
+                Some(b"{\"OPENAI_API_KEY\":\"sk-live-x\"}\n"),
+            )
+            .unwrap();
+            // 目录名按毫秒时间戳，同一毫秒内会撞名；睡一下保证各不相同。
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let mut names: Vec<String> = std::fs::read_dir(home.join("backups"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("codex-plus-live-"))
+            .collect();
+        assert_eq!(
+            names.len(),
+            5,
+            "备份没有被轮转，明文凭据副本会无限堆积（实际剩 {} 份）",
+            names.len()
+        );
+        names.sort();
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "目录名应当可按时间序比较，否则轮转会删错"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn merge_common_config_preserves_explicit_profile_goals_override() {
@@ -3055,3 +3150,4 @@ fn root_line_key(line: &str) -> Option<&str> {
     }
     trimmed.split_once('=').map(|(key, _)| key.trim())
 }
+

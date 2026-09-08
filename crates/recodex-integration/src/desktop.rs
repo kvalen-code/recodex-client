@@ -364,7 +364,17 @@ fn route_codex_through_gateway(endpoint: &str) -> Option<String> {
     // 官方模式下不能碰活配置 —— 否则「用最快网关」会把官方模式悄悄破坏掉:
     // 面板还显示官方模式,Codex 下次启动却已经走回 ReCodex 网关。
     // 记进快照,切回 ReCodex 时自动生效。
-    let block = crate::codexcfg::render_sub2api_block(&base);
+    // supports_websockets 要从**官方模式快照**里读回，不能读活配置：官方模式下
+    // 活配置里是官方 provider，我们的托管块根本不在，读活配置只会拿到 false，
+    // 于是切回 ReCodex 时 WS 被静默关掉。而且这个丢失是**延迟生效**的 ——
+    // 用户在官方模式下点「用最快网关」当场看不出问题，切回来才变慢，最难排查。
+    // 快照里存的正是进入官方模式时那份 ReCodex 托管块，它带着当时的开关值。
+    let staged_ws = crate::officialmode::load_snapshot()
+        .ok()
+        .flatten()
+        .map(|snapshot| crate::codexcfg::managed_supports_websockets(&snapshot.config_body))
+        .unwrap_or_else(crate::codexcfg::current_supports_websockets);
+    let block = crate::codexcfg::render_sub2api_block(&base, staged_ws);
     match crate::officialmode::stage_config_for_return(&block) {
         Ok(true) => {
             return Some("当前是官方模式,新网关已记下,切回 ReCodex 后生效".to_string());

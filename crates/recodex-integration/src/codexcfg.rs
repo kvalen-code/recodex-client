@@ -79,11 +79,11 @@ const AUTH_MANAGED_SUFFIX: &str = ".recodex-managed";
 // 本地执行器默认不注册,要靠这两行授权(上游把它叫 API Key Mode)。少了它们,
 // 客户端连工具都不声明,模型只能反过来劝用户「去设置 OPENAI_API_KEY」。
 //
-// 密钥仍走 env_key,不用 experimental_bearer_token —— 后者要把明文密钥写进
-// config.toml,而这个文件用户会截图、会贴进工单。
+// 模板保持 env_key —— 服务端下发的也是这个形状,两边必须一致。真正落盘的那份
+// 会被 `inline_managed_key` 就地换成 experimental_bearer_token,原因见那个函数。
 //
 // 改完必须**完全退出 Codex 并新建 task**:工具注册表是启动时建的,热重载看不到。
-const SUB2API_TEMPLATE: &str = "model_provider = \"recodex\"\n\n[model_providers.recodex]\nname = \"ReCodex\"\nbase_url = \"{{BASE_URL}}\"\nwire_api = \"responses\"\nenv_key = \"{{ENV_KEY}}\"\nhttp_headers = { \"x-openai-actor-authorization\" = \"recodex\" }";
+const SUB2API_TEMPLATE: &str = "model_provider = \"recodex\"\n\n[model_providers.recodex]\nname = \"ReCodex\"\nbase_url = \"{{BASE_URL}}\"\nwire_api = \"responses\"\nenv_key = \"{{ENV_KEY}}\"\nsupports_websockets = {{SUPPORTS_WEBSOCKETS}}\nhttp_headers = { \"x-openai-actor-authorization\" = \"recodex\" }";
 
 fn home_dir() -> io::Result<PathBuf> {
     std::env::var_os("USERPROFILE")
@@ -188,10 +188,91 @@ pub fn base_url_is_safe(base_url: &str) -> bool {
 
 /// Renders the sub2api managed block. `base_url` is the gateway root Codex talks
 /// to, e.g. `https://sg.gw.recodex.dev/backend-api/codex`.
-pub fn render_sub2api_block(base_url: &str) -> String {
+pub fn render_sub2api_block(base_url: &str, supports_websockets: bool) -> String {
     SUB2API_TEMPLATE
         .replace("{{BASE_URL}}", base_url)
         .replace("{{ENV_KEY}}", SUB2API_ENV_KEY)
+        .replace(
+            "{{SUPPORTS_WEBSOCKETS}}",
+            if supports_websockets { "true" } else { "false" },
+        )
+}
+
+/// 从托管块里读回 supports_websockets。与 Go 侧 clientcfg.ManagedSupportsWebsockets
+/// 同一语义：读不到就当 false，与 Codex 的 `#[serde(default)] bool` 默认值一致。
+///
+/// 必须有它：apply_config 会把整个 `[model_providers.recodex]` 表连表内所有键一起
+/// 重写，本地重渲染时不读回就会把服务端下发的 WS 开关冲掉 —— 用户切一次网关就被
+/// 静默打回 HTTP，他只会觉得"又变慢了"，排查不到这里。
+/// 入参是**已经取出的块正文**（不含标记行），与 Go 侧
+/// `clientcfg.ManagedSupportsWebsockets(body)` 的入参形状一致。
+///
+/// 之所以不接受整份 config.toml：官方模式的快照 `OfficialModeSnapshot.config_body`
+/// 存的就是不带标记的正文（`officialmode::current_managed_body`），要求带标记会让
+/// 它永远返回 false，把 WS 开关静默丢掉。
+pub fn managed_supports_websockets(body: &str) -> bool {
+    body.lines()
+        .find_map(|line| {
+            let value = line
+                .trim_start()
+                .strip_prefix("supports_websockets")?
+                .trim_start()
+                .strip_prefix('=')?;
+            Some(value.trim() == "true")
+        })
+        .unwrap_or(false)
+}
+
+/// 读当前 config.toml 的托管块，取回 supports_websockets。
+/// 文件不存在、没有托管块时返回 false，不凭空打开 WS。
+pub fn current_supports_websockets() -> bool {
+    let Ok(path) = config_path() else {
+        return false;
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    // 标记没了就回落到「扫我们那张 provider 表」，与 Go 侧 ManagedBody 同一策略。
+    //
+    // 标记丢失是**常态不是异常**：config.toml 有第三个写入方，Codex++ 重新序列化
+    // 整份文件时会丢掉注释标记（共享语料里专门有 markers-lost 用例）。
+    // 以标记为前提的后果不是「读不到」而是**静默读错**：这里退化成 false，
+    // 于是本地重渲染托管块时把 supports_websockets 写成 false ——
+    // 用户切一次网关就被静默打回 HTTP，只会觉得「忽然变慢了」。
+    match marked_block_span(&content) {
+        Some((start, end)) => managed_supports_websockets(&content[start..end]),
+        None => recodex_provider_table_body(&content)
+            .is_some_and(|body| managed_supports_websockets(&body)),
+    }
+}
+
+/// 在**没有标记**时，把 `[model_providers.recodex]` 那张表（含子表）的正文切出来，
+/// 供读回类兜底。与 Go 侧 `recodexProviderTableBody` 逐条同判。
+///
+/// 复用 `is_recodex_provider_table` 判表头，不另造一套 —— 那个谓词已经处理过子表、
+/// 引号名、前缀相同不误伤这些边界，再写一份就是等着两边分叉。
+fn recodex_provider_table_body(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut start: Option<usize> = None;
+    let mut end = lines.len();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+        if is_recodex_provider_table(trimmed) {
+            if start.is_none() {
+                start = Some(i);
+            }
+            continue;
+        }
+        // 撞到别人的表头：只有已经进过我们的表之后才算结束。
+        if start.is_some() {
+            end = i;
+            break;
+        }
+    }
+    start.map(|s| lines[s..end].join("\n"))
 }
 
 /// 托管配置的体检结果。全部只看文件内容,不联网。
@@ -397,6 +478,41 @@ fn collapse_blank_runs(s: &str) -> String {
 //
 // 返回值第二项是**用户的**默认 provider(不是我们的 "recodex"):来自块内保存行,
 // 或用户当前真的写在顶层的那一行 —— 后者优先,因为那代表用户此刻的选择。
+/// 认 `[model_providers.recodex]` **以及它的子表** `[model_providers.recodex.http_headers]` 之类。
+///
+/// 子表必须一起清:我们的块里 `http_headers` 是**内联表**,而 TOML 不许再用段头去
+/// 扩展一个内联表。残留的子表和新块撞在一起,Codex 连整份文件都读不进去 ——
+/// 官方 CLI 实测直接 `Error loading configuration: config.toml:16:26: duplicate key`
+/// 硬失败(不是软回落),于是所有配置全部不生效,表现是"客户端用不了"。
+///
+/// 原先这里是精确匹配 `== "[model_providers.recodex]"`,子表正好从底下溜过去。
+/// 而且标记还在时走的是第 1 段(整块切掉),孤儿子表留在块外 —— 也就是说
+/// **重装、重新登录都修不好**,每次安装都重新造一份坏文件。
+/// 2026-09-08 一个客户就是这么废掉的(那个子表不是我们写的,是第三方切换器留的)。
+///
+/// 只认**裸的** recodex 段:`[model_providers.'recodex.foo']` 是用户一个真叫
+/// recodex.foo 的 provider,它的名字以引号开头,下面的前缀匹配天然不成立 ——
+/// 不要再加"含引号就放弃"那种检查:它挡不住这个(已经不成立了),却会把
+/// `[model_providers.recodex.'x']` 这种**确实是我们子表**的形状漏掉。
+///
+/// 与 Go 侧 clientcfg.isRecodexProviderTable 逐字对应,改一侧必须改另一侧。
+fn is_recodex_provider_table(trimmed: &str) -> bool {
+    let Some(inner) = trimmed.strip_prefix('[') else {
+        return false;
+    };
+    let Some(inner) = inner.strip_suffix(']') else {
+        return false;
+    };
+    let Some(rest) = inner.trim().strip_prefix("model_providers") else {
+        return false;
+    };
+    let Some(rest) = rest.trim().strip_prefix('.') else {
+        return false; // 光杆 [model_providers]
+    };
+    let name = rest.trim();
+    name == "recodex" || name.starts_with("recodex.")
+}
+
 fn strip_recodex_config(
     content: &str,
     owned: Option<&BTreeSet<String>>,
@@ -420,7 +536,7 @@ fn strip_recodex_config(
         offset += line.len();
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_recodex_table = trimmed == "[model_providers.recodex]";
+            in_recodex_table = is_recodex_provider_table(trimmed);
             if in_recodex_table {
                 continue;
             }
@@ -428,7 +544,7 @@ fn strip_recodex_config(
             continue;
         }
         if in_recodex_table {
-            continue; // 属于 [model_providers.recodex] 的键
+            continue; // 属于 [model_providers.recodex] 或它子表的键
         }
         if trimmed == START_MARKER || trimmed == END_MARKER {
             continue; // 孤儿标记(另一半被别的写入方吃掉了)
@@ -682,17 +798,76 @@ fn read_or_empty(path: &Path) -> io::Result<String> {
 // ponytail: pid-only temp name; add a per-write counter only if concurrent
 // writes ever become possible here.
 fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    // 权限由**内容**定,不由调用方定。
+    //
+    // 第一版是让调用方传 `secret` 的,只有登录那条路传对了。结果:
+    //   - `apply_managed_model` 每次启动发现推荐模型变了就整篇重写 config.toml,
+    //   - `demote_managed_provider` 在用户点「切回官方模式」时整篇重写,
+    //     而这条路是**故意**把密钥留在文件里的。
+    // 两处都原样保留了 bearer 那一行却传 false,文件当场退回 0644 明文密钥,
+    // 而且没有任何征兆。判断挪进来之后,没有调用方需要记得这件事 ——
+    // 以后新增的写入方也一样。
+    //
+    // 非 UTF-8 只有 auth.json 那条路会遇到,它自己走 write_atomic_mode(.., true)。
+    let secret = std::str::from_utf8(data).is_ok_and(managed_key_is_inlined);
+    write_atomic_mode(path, data, secret)
+}
+
+/// `secret = true` 表示内容里有明文密钥,落盘要收到 0600。
+pub(crate) fn write_atomic_mode(path: &Path, data: &[u8], secret: bool) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "path has no parent directory"))?;
     fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".recodex-{}.tmp", std::process::id()));
-    fs::write(&tmp, data)?;
+    if let Err(err) = write_tmp(&tmp, data, secret) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(err);
     }
     Ok(())
+}
+
+/// 写临时文件。`secret` 时用 0600 **建**文件,而不是写完再 chmod。
+///
+/// 顺序有三档,只有第一档是对的:
+///   1. 建文件时就带 0600 —— 密钥任何一刻都没以宽权限存在过。
+///   2. 先 write 再 chmod 再 rename —— 从 write 到 chmod 之间那份明文长期凭据
+///      是 umask 默认权限(通常 0644),窗口虽短但确实存在。
+///   3. 先 rename 再 chmod —— 窗口更长,而且文件已经在最终路径上了。
+///
+/// 第一版写成了第 2 档,审计时改到第 1 档。mac_env::register_launchd 和 Go 侧的
+/// writeFileAtomic 写的是同一类文件,三个实现不能一边严一边松。
+///
+/// rename 会把 tmp 的 inode 连同权限一起搬到目标路径,所以目标原来是 0644 也没关系,
+/// 换完就是 0600 —— 不需要在 rename 之后再补一次。
+#[cfg(unix)]
+fn write_tmp(tmp: &Path, data: &[u8], secret: bool) -> io::Result<()> {
+    if !secret {
+        return fs::write(tmp, data);
+    }
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)?;
+    // `.mode()` 只作用于**新建**。上一次崩溃留下的同名 tmp 会被复用,权限还是旧的,
+    // 所以再显式收一次。
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(data)
+}
+
+/// Windows 上没有 0600 这一说,`~/.codex` 靠的是用户目录本身的 ACL。
+#[cfg(not(unix))]
+fn write_tmp(tmp: &Path, data: &[u8], _secret: bool) -> io::Result<()> {
+    fs::write(tmp, data)
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -709,15 +884,178 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
+/// 把托管块里的 `env_key = "RECODEX_KEY"` 就地换成
+/// `experimental_bearer_token = "<key>"`。换不了就返回 None(调用方原样用)。
+///
+/// 为什么要换:Codex 认钥匙只有三条互斥的路,实测(codex-cli 0.153.4,隔离
+/// CODEX_HOME)结论是:
+///
+/// | 配置 | Authorization | 本地 image_gen |
+/// |---|---|---|
+/// | `env_key`,变量存在 | `Bearer <env>` | ✅ |
+/// | `env_key`,变量缺失 | **本地硬失败,一个请求都不发** | — |
+/// | `requires_openai_auth` + auth.json | `Bearer <auth.json>` | ❌ **静默消失** |
+/// | `experimental_bearer_token` | `Bearer <config>` | ✅ |
+///
+/// `env_key` 那条把「Codex 能不能认证」绑在了**进程的环境变量**上,而这正是线上
+/// 最大一类 401 的成因:macOS 从 Dock / 访达点开 Codex.app,父进程是 launchd,
+/// 根本不继承 shell 环境(24h 内 5005 次,占 401 的 86%)。`requires_openai_auth`
+/// 能绕开环境变量,但会把本地 image_gen 工具注册干掉 —— 用户能生成图、界面一张
+/// 都看不到,且无任何报错,比 401 更难查。只剩 bearer 这一条既不依赖环境、又保住
+/// 工具注册。
+///
+/// 代价是明文密钥落进 config.toml,而这个文件用户会截图、会贴进工单 —— 这是
+/// 本文件此前拒绝这条路的理由。现在接受它,因为:同一把密钥早就以明文躺在
+/// `official-mode.json`、Windows 注册表和 macOS LaunchAgent plist 里了,
+/// config.toml 并没有新增一个泄露面;而落盘时收到 0600(见 write_atomic_mode)。
+///
+/// 模板本身**不动**:服务端下发的块仍是 env_key 形状,替换只发生在写盘这一步。
+/// 这样旧客户端完全不受影响,回滚是发一版客户端而不是改服务端。
+pub fn inline_managed_key(block: &str, key: &str) -> Option<String> {
+    let key = key.trim();
+    if !key_is_safe_for_toml(key) || managed_key_is_inlined(block) {
+        return None;
+    }
+    // 不止一行 env_key 就整个不换。两条理由:
+    //   - Go 侧原来是 ReplaceAllString(全换),块里有第二个 provider 时会把
+    //     **我们的网关 Key 写进第三方 provider 的槽位** —— 那一行的 base_url
+    //     指向别人的服务器,等于主动把长期凭据发出去;
+    //   - 这边原来只替第一行,于是同一份块从 CLI 和从桌面端写出来是两个文件。
+    // 两边统一成「拿不准就不换」。这类块只可能来自运维配的 RawBlock,
+    // 退回 env_key 正是它今天的行为。Go 侧同名函数注释里有同一段。
+    if block
+        .lines()
+        .filter(|line| is_env_key_line(line.trim_start()))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let mut out = String::with_capacity(block.len() + key.len());
+    let mut replaced = false;
+    // split_inclusive 保留原行尾:用 lines() 会把 CRLF 悄悄改成 LF,顺手改到
+    // 我们没打算碰的行。
+    for segment in block.split_inclusive('\n') {
+        let line = segment.trim_end_matches(['\n', '\r']);
+        let eol = &segment[line.len()..];
+        let indent = &line[..line.len() - line.trim_start().len()];
+        if !replaced && is_env_key_line(line.trim_start()) {
+            out.push_str(indent);
+            out.push_str("experimental_bearer_token = \"");
+            out.push_str(key);
+            out.push('"');
+            out.push_str(eol);
+            replaced = true;
+        } else {
+            out.push_str(segment);
+        }
+    }
+    replaced.then_some(out)
+}
+
+/// 这个块已经是 bearer 形态了吗。自诊断靠它分叉:答错了就会让用户去重开终端,
+/// 解决一个和终端无关的问题。
+pub fn managed_key_is_inlined(block: &str) -> bool {
+    block.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("experimental_bearer_token")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
+}
+
+/// 认一行 `env_key = "..."`。
+///
+/// **引号必须闭合**。这一条是跨语言对齐的硬要求，不是洁癖：Go 侧
+/// `managedEnvKeyLinePattern` 写的是 `env_key\s*=\s*"[^"]*"`，闭合引号是模式的一部分。
+/// 这边原来只检查「= 后面以引号开头」，于是一行
+/// `env_key = "RECODEX_KEY`（少了闭合引号）在两侧结论相反 ——
+/// Go 拒绝替换、Rust 照换，同一份托管块从 CLI 和从桌面端写出来又是两个文件。
+///
+/// 这正是 inline_managed_key 那段注释要根治的分叉，只是触发条件从「多个 env_key」
+/// 换成了「引号没闭合」。实测确认过（2026-09-08 合并前审计）。
+///
+/// 这种块只可能来自运维手配的 RawBlock（模板渲染的永远闭合），而且引号不闭合的
+/// TOML 本来就是坏的、Codex 自己也读不了 —— 但「谁都救不了」不等于「两边可以不一致」，
+/// 何况 Rust 那条路会把**真实密钥**拼进一份坏文件里。
+fn is_env_key_line(trimmed: &str) -> bool {
+    let Some(rest) = trimmed
+        .strip_prefix("env_key")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('='))
+        .map(str::trim_start)
+    else {
+        return false;
+    };
+    // 开引号之后必须还有一个闭引号，与 Go 的 `"[^"]*"` 同义。
+    rest.strip_prefix('"')
+        .is_some_and(|after| after.contains('"'))
+}
+
+/// 钥匙是**拼**进 TOML 字符串的,不是转义进去的。凡是能撑破那对引号、或让这一行
+/// 变成别的语义的字符,一律拒绝 —— 宁可退回今天的 env_key 行为,也不能写出半截
+/// 配置(TOML 一坏,Codex 连整份 config 都读不了)。
+fn key_is_safe_for_toml(key: &str) -> bool {
+    if key.is_empty() || key.len() > 512 {
+        return false;
+    }
+    key.chars().all(|c| {
+        c.is_ascii()
+            && !c.is_ascii_control()
+            && !matches!(c, '"' | '\\' | '\'' | '#' | ' ' | '\t')
+    })
+}
+
+/// 当前这台机器上持久化的网关密钥。进程环境优先,读不到再去用户作用域
+/// (Windows 注册表 / macOS 那个 0600 文件)捞。
+fn gateway_key() -> String {
+    if let Ok(value) = std::env::var(SUB2API_ENV_KEY) {
+        if !value.trim().is_empty() {
+            return value.trim().to_string();
+        }
+    }
+    stored_key().unwrap_or_default()
+}
+
+fn stored_key() -> Option<String> {
+    #[cfg(windows)]
+    {
+        return read_user_env_from_registry(SUB2API_ENV_KEY);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return mac_env::load(SUB2API_ENV_KEY);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// Splices the given block into `~/.codex/config.toml`, preserving all other
 /// content, and writes atomically.
 pub fn apply_config(body: &str) -> io::Result<()> {
+    apply_config_with_key(body, "")
+}
+
+/// 登录/换发必须走这个,并把**这一次**的钥匙传进来。
+///
+/// `apply_login` 是先写 config.toml 再写环境变量的,让这里自己去环境里捞会捞到
+/// **上一把** —— 写出一个当场 401 的配置,而且用户看不出哪里不对。
+pub fn apply_config_with_key(body: &str, key: &str) -> io::Result<()> {
     let path = config_path()?;
     let cur = read_or_empty(&path)?;
-    let next = install_block(&cur, body);
+    let key = if key.trim().is_empty() {
+        gateway_key()
+    } else {
+        key.trim().to_string()
+    };
+    let body = inline_managed_key(body, &key).unwrap_or_else(|| body.to_string());
+    let next = install_block(&cur, &body);
     if next == cur {
         return Ok(());
     }
+    // 不在这里判 secret:`write_atomic` 自己看内容。这条路以前是唯一判对的,
+    // 也正因为「只有它判对」才掩住了另外两条路的问题。
     write_atomic(&path, next.as_bytes())
 }
 
@@ -784,12 +1122,16 @@ pub fn write_auth(data: &[u8]) -> io::Result<()> {
     let backup = with_suffix(&path, AUTH_BACKUP_SUFFIX);
     if path.exists() && !backup.exists() {
         let orig = fs::read(&path)?;
-        write_atomic(&backup, &orig)?;
+        // auth.json 里是 OAuth token,备份件同样是。`write_atomic` 的内容嗅探
+        // 只认 TOML 的 bearer 行,认不出 JSON —— 所以这三处显式标 secret。
+        // Go 侧 internal/clientcfg 写这几个文件用的就是 0600,不能一边严一边松。
+        write_atomic_mode(&backup, &orig, true)?;
     }
     // Record ownership before replacing auth.json so logout can recover even if
     // the following write fails or the process exits.
+    // 这个标记文件内容只有 "recodex",没有秘密,按普通文件写。
     write_atomic(&with_suffix(&path, AUTH_MANAGED_SUFFIX), b"recodex\n")?;
-    write_atomic(&path, data)
+    write_atomic_mode(&path, data, true)
 }
 
 /// Reads back the `auth.json` **we** wrote, if we still own it.
@@ -826,7 +1168,7 @@ pub fn restore_auth() -> io::Result<()> {
         }
         Err(err) => Err(err),
         Ok(orig) => {
-            write_atomic(&path, &orig)?;
+            write_atomic_mode(&path, &orig, true)?;
             remove_if_exists(&managed)?;
             remove_if_exists(&backup)
         }
@@ -1099,14 +1441,11 @@ mod mac_env {
     }
 
     pub(super) fn save(name: &str, value: &str) -> io::Result<()> {
-        let path = env_path(name)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, value.as_bytes())?;
-        // 先写后改权限会有一瞬间是默认权限;这里内容是密钥,所以写完立刻收紧
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        Ok(())
+        // 内容是密钥明文。这里原来是 write 完再 set_permissions —— 中间那一瞬
+        // 文件是 umask 默认权限(通常 0644)。改走 write_atomic_mode:它**建文件
+        // 时**就带 0600,密钥没有任何一刻以宽权限存在过;顺带拿到原子替换,
+        // 换发 key 时不会被别的进程读到半截。
+        super::write_atomic_mode(&env_path(name)?, value.as_bytes(), true)
     }
 
     pub(super) fn clear(name: &str) -> io::Result<()> {
@@ -1158,20 +1497,21 @@ mod mac_env {
         //     Go 侧 internal/clientcfg 的 writeFileAtomic 正是先 chmod tmp 再 rename,
         //     两个实现写的是同一个文件,权限保证必须对齐,不能一边严一边松。
         //
-        // tmp 名带 pid:同一台机器上 CLI 和桌面端可能同时走到这里。
-        let tmp = path.with_file_name(format!(
-            "{}.{}.tmp",
-            super::macos_launch_agent_label(name),
-            std::process::id()
-        ));
-        debug_assert_eq!(tmp.parent(), path.parent(), "tmp 必须和目标同目录才能 rename");
-        fs::write(&tmp, super::macos_launch_agent_plist(name, value).as_bytes())?;
-        if let Err(error) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-            .and_then(|()| fs::rename(&tmp, &path))
-        {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
+        // 走 write_atomic_mode(secret=true):它建 tmp 时就带 0600
+        // （OpenOptions.mode），不存在「建档到 chmod 之间」那段窗口。
+        //
+        // 这里原来是 fs::write 再 set_permissions —— 也就是上面那段注释判定为
+        // 「错的」那个顺序，而它守护的正是**明文长期凭据**（plist 里就是 key）。
+        // 注释里说的「Go 侧 writeFileAtomic 正是先 chmod tmp 再 rename，两边必须
+        // 对齐」其实也没对上：Go 走 os.CreateTemp，建出来天生 0600，从来没有这段窗口。
+        //
+        // 这一批的第 4 条意图（消灭 write→chmod 的窗口）只落地了 mac_env::save，
+        // 同模块、同一把密钥的另一半漏了。2026-09-08 合并前审计查出。
+        super::write_atomic_mode(
+            &path,
+            super::macos_launch_agent_plist(name, value).as_bytes(),
+            true,
+        )?;
         // 不做 launchctl load:agent 会在下次登录被 launchd 自动扫到,
         // 本次会话已由下面这行 setenv 覆盖。
         run_launchctl(&["setenv", name, value])
@@ -1298,7 +1638,8 @@ pub fn apply_login(
     env_value: &str,
 ) -> io::Result<()> {
     if !config.is_empty() {
-        apply_config(config)?;
+        // 必须传 env_value:下面那行 set_user_env 还没跑,环境里是上一把钥匙。
+        apply_config_with_key(config, env_value)?;
     }
     if !auth_json.is_empty() {
         write_auth(auth_json.as_bytes())?;
@@ -1319,7 +1660,12 @@ pub fn route_through_gateway(codex_base_url: &str) -> io::Result<()> {
             "网关地址含有不能写进配置的字符",
         ));
     }
-    apply_config(&render_sub2api_block(codex_base_url))
+    // 保留当前的 supports_websockets：apply_config 会整表重写，不读回就会把
+    // 服务端下发的 WS 开关冲掉（与 Go 侧 currentSupportsWebsockets 同一处理）。
+    apply_config(&render_sub2api_block(
+        codex_base_url,
+        current_supports_websockets(),
+    ))
 }
 
 /// Reverts all ReCodex-owned Codex state (config block, auth.json, key env var).
@@ -1398,7 +1744,7 @@ mod tests {
 
     #[test]
     fn managed_base_url_reads_the_block_and_only_the_block() {
-        let block = render_sub2api_block("https://sg.gw.recodex.dev/backend-api/codex");
+        let block = render_sub2api_block("https://sg.gw.recodex.dev/backend-api/codex", false);
         let content = install_block(
             "base_url = \"https://user.example/v1\"\n[other]\nbase_url = \"https://other.example\"\n",
             &block,
@@ -1426,18 +1772,205 @@ mod tests {
         KEY_CHANGED_SINCE_START.store(false, Ordering::SeqCst);
     }
 
+    // 下面这组守的是同一条命脉:**托管块落盘后 Codex 到底拿不拿得到钥匙**。
+    // 与 Go 侧 internal/clientcfg/inline_key_test.go 一一对应 —— 两个实现写的是
+    // 同一个 config.toml,行为不一致的话用户在 CLI 和桌面端会看到两种结果。
+
+    #[test]
+    fn inline_replaces_the_env_key_line_and_touches_nothing_else() {
+        let block = render_sub2api_block("https://gw.example.dev/backend-api/codex", true);
+        let got = inline_managed_key(&block, "sk-live-abc123").expect("正常块应该能内联");
+        assert!(
+            !got.contains("env_key"),
+            "内联后不能再留 env_key —— 留着会让环境变量变成硬性要求\n{got}"
+        );
+        assert!(got.contains("experimental_bearer_token = \"sk-live-abc123\""));
+        // 换一行不能顺手动别的行:这些都是有人踩过坑才加上的。
+        assert!(
+            got.contains("http_headers = { \"x-openai-actor-authorization\" = \"recodex\" }"),
+            "actor 头丢了 —— image_gen / web_search 会静默消失\n{got}"
+        );
+        assert!(
+            got.contains("supports_websockets = true"),
+            "supports_websockets 被冲掉了 —— 用户被静默打回 HTTP\n{got}"
+        );
+        assert!(got.contains("base_url = \"https://gw.example.dev/backend-api/codex\""));
+        assert!(
+            !got.contains("requires_openai_auth"),
+            "不能引入 requires_openai_auth —— 实测它会让 image_gen 消失\n{got}"
+        );
+    }
+
+    /// 拿不到钥匙、或钥匙不能安全地拼进 TOML 时,必须原样退回 env_key 形态。
+    /// 写出一行空的或被撑破的 bearer 比不换更糟:TOML 一坏,整份 config 都读不了。
+    #[test]
+    fn inline_refuses_keys_that_cannot_be_pasted_into_toml() {
+        let block = render_sub2api_block("https://gw.example.dev/backend-api/codex", false);
+        for bad in [
+            "",
+            "   ",
+            "sk-with\"quote",
+            "sk-with\nnewline",
+            "sk-with\\backslash",
+            "sk-with space",
+            "sk-with#hash",
+            "sk-with\0nul",
+            "sk-带中文",
+            &format!("sk-{}", "a".repeat(600)),
+        ] {
+            assert!(
+                inline_managed_key(&block, bad).is_none(),
+                "钥匙 {bad:?} 不该被接受"
+            );
+        }
+    }
+
+    /// 幂等:切网关 / 重新登录会反复重写托管块,第二次不能再包一层。
+    #[test]
+    fn inline_is_idempotent() {
+        let block = render_sub2api_block("https://gw.example.dev/backend-api/codex", false);
+        let once = inline_managed_key(&block, "sk-live-abc123").expect("第一次应该能内联");
+        assert!(
+            inline_managed_key(&once, "sk-live-abc123").is_none(),
+            "已经是 bearer 形态时不该再报变更"
+        );
+        assert_eq!(once.matches("experimental_bearer_token").count(), 1);
+        assert!(!managed_key_is_inlined(&block));
+        assert!(managed_key_is_inlined(&once));
+    }
+
+    /// 服务端下发的块不一定长成我们模板的样子(运维配的 RawBlock)。
+    /// 没有 env_key 行时不猜、不硬塞。
+    #[test]
+    fn inline_skips_blocks_without_an_env_key_line() {
+        let raw = "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://x.dev\"\n";
+        assert!(inline_managed_key(raw, "sk-live-abc123").is_none());
+    }
+
+    /// 同一个块里有第二个 provider 时,一行都不许换。
+    ///
+    /// 这里防的是**把我们的网关 Key 发给第三方**:下面那个 `[model_providers.vendor]`
+    /// 的 base_url 指向别人的服务器,它那行 env_key 要是也被换成
+    /// `experimental_bearer_token = "<我们的key>"`,凭据就跟着请求出去了。
+    /// Go 侧原来正是 ReplaceAllString(全换),这边原来只换第一行 —— 两个都不对,
+    /// 而且不一致。现在两边都是「拿不准就不换」。
+    #[test]
+    fn inline_refuses_blocks_with_more_than_one_env_key_line() {
+        let two = concat!(
+            "[model_providers.recodex]\n",
+            "base_url = \"https://gw.recodex.dev/backend-api/codex\"\n",
+            "env_key = \"RECODEX_KEY\"\n",
+            "\n",
+            "[model_providers.vendor]\n",
+            "base_url = \"https://vendor.example.com/v1\"\n",
+            "env_key = \"VENDOR_KEY\"\n",
+        );
+        assert!(
+            inline_managed_key(two, "sk-live-abc123").is_none(),
+            "两行 env_key 时必须整个放弃内联"
+        );
+        // 单行的正常路径不能被这条新规则误伤。
+        let one = two.split("\n[model_providers.vendor]").next().unwrap();
+        assert!(inline_managed_key(one, "sk-live-abc123").is_some());
+    }
+
+    /// 内联后的块要经过 install_block 这条生产写入路径,再被那些扫 config.toml 的
+    /// 函数扫一遍 —— 线上写进磁盘的是**内联后**的形状,扫描器必须在这个形状上也活着。
+    #[test]
+    fn scanners_survive_the_inlined_block() {
+        let block = render_sub2api_block("https://api.recodex.dev/backend-api/codex", false);
+        let inlined = inline_managed_key(&block, "sk-live-abc123").expect("内联失败");
+        let content = install_block("model = \"grok-4.5\"\n", &inlined);
+
+        assert_eq!(
+            managed_base_url(&content).as_deref(),
+            Some("https://api.recodex.dev/backend-api/codex")
+        );
+        assert!(!managed_supports_websockets(&inlined));
+        assert!(has_managed_block(&content));
+        // CRLF 的块不能被顺手改成 LF:Windows 上用户的 config.toml 就是 CRLF。
+        let crlf = block.replace('\n', "\r\n");
+        let inlined_crlf = inline_managed_key(&crlf, "sk-live-abc123").expect("CRLF 块也要能内联");
+        assert!(!inlined_crlf.contains("\n\n"), "行尾被改写了\n{inlined_crlf:?}");
+        assert_eq!(inlined_crlf.matches("\r\n").count(), crlf.matches("\r\n").count());
+    }
+
     #[test]
     fn render_fills_base_url_and_env_key() {
-        let block = render_sub2api_block("https://sg.gw.recodex.dev/backend-api/codex");
+        let block = render_sub2api_block("https://sg.gw.recodex.dev/backend-api/codex", false);
         assert!(block.contains("base_url = \"https://sg.gw.recodex.dev/backend-api/codex\""));
         assert!(block.contains("env_key = \"RECODEX_KEY\""));
         assert!(block.contains("model_provider = \"recodex\""));
     }
 
+    // supports_websockets 必须两种取值都渲染出来，且恰好一次。
+    // 缺省与显式 false 在 Codex 的 `#[serde(default)] bool` 下语义相同，
+    // 但"这一行总是存在"才让读回逻辑无歧义。
+    #[test]
+    fn render_emits_supports_websockets_both_ways() {
+        let on = render_sub2api_block("https://gw/backend-api/codex", true);
+        let off = render_sub2api_block("https://gw/backend-api/codex", false);
+        assert!(on.contains("supports_websockets = true"), "开启时应渲染 true");
+        assert!(
+            off.contains("supports_websockets = false"),
+            "关闭时应渲染 false"
+        );
+        assert_eq!(on.matches("supports_websockets").count(), 1);
+        assert_eq!(off.matches("supports_websockets").count(), 1);
+    }
+
+    // 读回的入参是**已经取出的块正文**（不带标记行）—— 官方模式快照
+    // OfficialModeSnapshot.config_body 存的就是这个形状，要求带标记会让它
+    // 永远返回 false，把 WS 开关静默丢掉。
+    #[test]
+    fn managed_supports_websockets_reads_body_without_markers() {
+        assert!(managed_supports_websockets(&render_sub2api_block(
+            "https://gw/backend-api/codex",
+            true
+        )));
+        assert!(!managed_supports_websockets(&render_sub2api_block(
+            "https://gw/backend-api/codex",
+            false
+        )));
+        // 老版本写的块里没有这一行 → false，与 Codex 的 serde 默认值一致。
+        assert!(!managed_supports_websockets(
+            "base_url = \"https://gw\"\nwire_api = \"responses\""
+        ));
+        assert!(!managed_supports_websockets(""));
+        // 空白容忍度要与 Go 侧一致。
+        assert!(managed_supports_websockets("  supports_websockets  =  true  "));
+        // 认不出的值保守当关闭，不凭空替用户打开 WS。
+        assert!(!managed_supports_websockets("supports_websockets = yes"));
+    }
+
+    // 🔴 与 Go 侧 clientcfg.ManagedSupportsWebsockets 必须同判。
+    // 两边写的是**同一份 config.toml**，只有一侧对等于没对。
+    #[test]
+    fn websockets_flag_survives_local_rerender() {
+        let base = "model_provider = \"other\"\n";
+        let installed = install_block(base, &render_sub2api_block("https://old/backend-api/codex", true));
+        let (start, end) = marked_block_span(&installed).expect("装完应当有托管块");
+        let body = &installed[start..end];
+        assert!(managed_supports_websockets(body));
+
+        // 切网关：只换 base_url，开关从旧块读回。
+        let rerendered = install_block(
+            &installed,
+            &render_sub2api_block("https://new/backend-api/codex", managed_supports_websockets(body)),
+        );
+        let (s2, e2) = marked_block_span(&rerendered).expect("重渲染后仍应有托管块");
+        assert!(
+            managed_supports_websockets(&rerendered[s2..e2]),
+            "切网关之后 supports_websockets 被冲掉了"
+        );
+        assert!(rerendered.contains("https://new/backend-api/codex"));
+        assert!(!rerendered.contains("https://old/"));
+    }
+
     #[test]
     fn install_preserves_existing_config_and_puts_model_provider_before_tables() {
         let base = "model = \"x\"\n[mcp_servers.foo]\ncmd = \"bar\"\n";
-        let with = install_block(base, &render_sub2api_block("https://gw/backend-api/codex"));
+        let with = install_block(base, &render_sub2api_block("https://gw/backend-api/codex", false));
         assert!(has_managed_block(&with));
         // The user's top-level key stays first and their table survives intact.
         assert!(with.starts_with("model = \"x\"\n"));
@@ -1454,7 +1987,7 @@ mod tests {
     #[test]
     fn install_before_table_then_remove_clears_recodex_keeps_user() {
         let base = "model = \"x\"\n[t]\nk = 1\n";
-        let with = install_block(base, &render_sub2api_block("https://gw/backend-api/codex"));
+        let with = install_block(base, &render_sub2api_block("https://gw/backend-api/codex", false));
         assert!(with.find("model_provider").unwrap() < with.find("[t]").unwrap());
         let back = remove_block(&with);
         assert!(!back.contains("recodex"));
@@ -1469,7 +2002,7 @@ mod tests {
         let mangled = "model = \"x\"\nmodel_provider = \"recodex\"\n[t]\nk = 1\n[model_providers.recodex]\nbase_url = \"https://old/backend-api/codex\"\n";
         let with = install_block(
             mangled,
-            &render_sub2api_block("https://new/backend-api/codex"),
+            &render_sub2api_block("https://new/backend-api/codex", false),
         );
         assert_eq!(with.matches("[model_providers.recodex]").count(), 1);
         assert_eq!(with.matches("model_provider = \"recodex\"").count(), 1);
@@ -1481,15 +2014,15 @@ mod tests {
     #[test]
     fn install_then_remove_roundtrips_for_newline_terminated_config() {
         let base = "model = \"x\"\n";
-        let with = install_block(base, &render_sub2api_block("https://gw/backend-api/codex"));
+        let with = install_block(base, &render_sub2api_block("https://gw/backend-api/codex", false));
         assert_eq!(remove_block(&with), base);
     }
 
     #[test]
     fn second_install_replaces_rather_than_duplicates() {
         let base = "model = \"x\"\n";
-        let first = install_block(base, &render_sub2api_block("https://a/backend-api/codex"));
-        let second = install_block(&first, &render_sub2api_block("https://b/backend-api/codex"));
+        let first = install_block(base, &render_sub2api_block("https://a/backend-api/codex", false));
+        let second = install_block(&first, &render_sub2api_block("https://b/backend-api/codex", false));
         assert_eq!(second.matches(START_MARKER).count(), 1);
         assert!(second.contains("https://b/backend-api/codex"));
         assert!(!second.contains("https://a/backend-api/codex"));
@@ -1686,4 +2219,73 @@ model = \"gpt-5.5\"
 "));
         assert!(out.contains("# model = \"gpt-5.5\""));
     }
+
+    /// 2026-09-08 工单:客户端"用不了",真因是整份 config.toml 解析不了 ——
+    /// 官方 codex CLI 实测 `Error loading configuration: config.toml:16:26: duplicate key`,
+    /// 硬失败不回落,所以读这份文件的一切都起不来。
+    ///
+    /// 托管块里 http_headers 是内联表,块外还留着 [model_providers.recodex.http_headers]
+    /// 段头。TOML 不许用段头扩展内联表 → 重复键。那个孤儿不是我们写的,
+    /// 但清残留的精确匹配认不出子表,于是**重装、重新登录都修不好**。
+    #[test]
+    fn install_clears_orphan_provider_sub_table() {
+        let cfg = concat!(
+            "model = \"gpt-6-astra\"
+
+",
+            ">>>BLOCK<<<
+
+",
+            "[model_providers.recodex.http_headers]
+",
+            "x-openai-actor-authorization = \"recodex\"
+
+",
+            "[desktop]
+",
+            "followUpQueueMode = \"steer\"
+",
+        );
+        let block = render_sub2api_block("https://api.recodex.dev/backend-api/codex", false);
+        let cfg = cfg.replace(">>>BLOCK<<<", &format!("{START_MARKER}
+{block}
+{END_MARKER}"));
+
+        let got = install_block(&cfg, &block);
+
+        assert!(
+            !got.contains("[model_providers.recodex."),
+            "孤儿子表还在,和块里的内联 http_headers 撞车,整份文件解析不了:
+{got}"
+        );
+        assert_eq!(
+            got.matches("x-openai-actor-authorization").count(),
+            1,
+            "该只剩块里内联的那一处:
+{got}"
+        );
+        for keep in ["model = \"gpt-6-astra\"", "[desktop]", "followUpQueueMode = \"steer\""] {
+            assert!(got.contains(keep), "把用户自己的配置删了,丢了 {keep}:
+{got}");
+        }
+    }
+
+    /// 带引号的表名是用户一个**真叫** recodex.foo 的 provider,不是我们的子表。
+    /// 前缀匹配写松了就会把它连表内所有键一起删掉 —— 那是毁用户配置,比不清更糟。
+    #[test]
+    fn install_keeps_user_provider_named_like_our_sub_table() {
+        let cfg = "model_provider = \"recodex.foo\"
+
+[model_providers.'recodex.foo']
+name = \"User Own\"
+";
+        let block = render_sub2api_block("https://api.recodex.dev/backend-api/codex", false);
+        let got = install_block(cfg, &block);
+        assert!(
+            got.contains("[model_providers.'recodex.foo']") && got.contains("name = \"User Own\""),
+            "把用户自己叫 recodex.foo 的 provider 删掉了:
+{got}"
+        );
+    }
+
 }
