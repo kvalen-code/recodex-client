@@ -263,6 +263,7 @@ dependencies = [
  "directories",
  "recodex-integration",
  "serde_json",
+ "tempfile",
  "tokio",
  "url",
  "winresource",

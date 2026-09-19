@@ -93,31 +93,56 @@ pub fn build_watcher_install_plan(launcher_path: PathBuf, debug_port: u16) -> Wa
 }
 
 pub fn codex_process_ids<'a>(processes: impl IntoIterator<Item = (u32, &'a str)>) -> Vec<u32> {
+    codex_process_ids_with(processes, crate::app_paths::app_entry_hosts_codex_runtime)
+}
+
+/// `has_codex_runtime(包的 app 目录)`:OpenAI.ChatGPT-Desktop 这个包名**也是老的纯聊天版
+/// ChatGPT**。不带 Codex 运行时的那种不是 Codex —— 把它算进来,「有 Codex 进程但没 CDP」
+/// 那段逻辑就会把用户正在用的聊天窗口杀掉。OpenAI.Codex / CodexBeta 不需要这一步。
+pub fn codex_process_ids_with<'a>(
+    processes: impl IntoIterator<Item = (u32, &'a str)>,
+    has_codex_runtime: impl Fn(&Path) -> bool,
+) -> Vec<u32> {
     processes
         .into_iter()
         .filter_map(|(process_id, executable)| {
-            is_windowsapps_codex_app_process(executable).then_some(process_id)
+            is_windowsapps_codex_app_process(executable, &has_codex_runtime).then_some(process_id)
         })
         .collect()
 }
 
-fn is_windowsapps_codex_app_process(executable: &str) -> bool {
-    let executable = executable.replace('/', "\\").to_ascii_lowercase();
-    let Some((_, after_windows_apps)) = executable.split_once("\\windowsapps\\") else {
+fn is_windowsapps_codex_app_process(
+    executable: &str,
+    has_codex_runtime: &dyn Fn(&Path) -> bool,
+) -> bool {
+    let original = executable.replace('/', "\\");
+    // to_ascii_lowercase 不改字节长度,下标可以回到原串上取真实大小写的路径。
+    let executable = original.to_ascii_lowercase();
+    let marker = "\\windowsapps\\";
+    let Some(marker_at) = executable.find(marker) else {
         return false;
     };
+    let package_start = marker_at + marker.len();
+    let after_windows_apps = &executable[package_start..];
     let Some((package_name, after_package)) = after_windows_apps.split_once('\\') else {
         return false;
     };
-    let supported_package = crate::app_paths::is_supported_windows_app_package_name(package_name)
-        || package_name.starts_with("openai.chatgpt-desktop_");
-    supported_package
+    let supported_package = crate::app_paths::is_supported_windows_app_package_name(package_name);
+    let is_main_executable = supported_package
         && after_package.starts_with("app\\")
         && !after_package.starts_with("app\\resources\\")
         && after_package
             .rsplit('\\')
             .next()
-            .is_some_and(crate::app_paths::is_supported_app_executable_name)
+            .is_some_and(crate::app_paths::is_supported_app_executable_name);
+    if !is_main_executable {
+        return false;
+    }
+    if !crate::app_paths::package_needs_codex_runtime_check(package_name) {
+        return true;
+    }
+    let app_entry = format!("{}\\app", &original[..package_start + package_name.len()]);
+    has_codex_runtime(Path::new(&app_entry))
 }
 
 /// 这个 exe 文件名是不是我们自己的启动器。

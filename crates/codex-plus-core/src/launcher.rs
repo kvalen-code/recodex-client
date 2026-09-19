@@ -3193,6 +3193,7 @@ fn sanitize_legacy_upstream_settings_nonfatal(store: &SettingsStore) {
                     "dropped_relay_profiles": report.dropped_relay_profiles.len(),
                     "dropped_aggregate_profiles": report.dropped_aggregate_profiles,
                     "active_relay_reset": report.active_relay_reset,
+                    "legacy_relay_fields_cleared": report.legacy_relay_fields_cleared,
                 }),
             );
         }
@@ -4066,6 +4067,17 @@ pub async fn activate_packaged_app(
     })
     .await
     .context("packaged app activation task failed")?
+}
+
+/// 同步版本,给已经在阻塞线程里的调用方(第二实例的窗口激活,见 existing_instance)。
+#[cfg(windows)]
+pub fn activate_packaged_app_sync(app_user_model_id: &str, arguments: &str) -> anyhow::Result<u32> {
+    activate_packaged_app_blocking(app_user_model_id, arguments)
+}
+
+#[cfg(not(windows))]
+pub fn activate_packaged_app_sync(_app_user_model_id: &str, _arguments: &str) -> anyhow::Result<u32> {
+    anyhow::bail!("Packaged app activation is only supported on Windows")
 }
 
 #[cfg(windows)]

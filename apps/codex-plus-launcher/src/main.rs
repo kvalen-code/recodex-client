@@ -143,30 +143,68 @@ async fn main() -> Result<()> {
     // 的东西(尤其是集成测试里故意触发错误路径的用例)往用户桌面上弹框。
     codex_plus_core::user_alert::enable();
     let options = parse_launch_options(args.iter());
-    if let Err(error) = launcher_main(args, helper_only, options.clone()).await {
+    if let Err(failure) = launcher_main(args, helper_only, options.clone()).await {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "launcher.failed",
             json!({
-                "message": error.to_string()
+                "message": failure.error.to_string(),
+                "role": if failure.owns_status { "primary" } else { "secondary" },
             }),
         );
         if !helper_only {
-            let _ = options.status_store.save_latest(&LaunchStatus {
-                status: "failed".to_string(),
-                message: error.to_string(),
-                started_at_ms: current_timestamp_ms(),
-                debug_port: Some(options.debug_port),
-                helper_port: Some(options.helper_port),
-                codex_app: options
-                    .app_dir
-                    .map(|path| path.to_string_lossy().to_string()),
-                // AUMID 与错误码已写进 message(见 PackagedActivationFailure::into_error)。
-                aumid: None,
-            });
+            record_launch_failure(&options, &failure);
         }
-        return Err(error);
+        return Err(failure.error);
     }
     Ok(())
+}
+
+/// launcher_main 的失败,带上「这个进程有没有资格写 latest-status.json」。
+///
+/// latest-status.json 归**主实例**(单实例锁的持有者)所有:它记着主实例实际在用的
+/// 调试/helper 端口,第二个 launcher 靠它找到主实例。第二个 launcher 自己失败
+/// (比如激活窗口失败)时拿**请求端口**写一条 failed 进去,就把主实例的真实端口
+/// 冲掉了 —— 下一次双击读到的是错的端口。
+struct LauncherFailure {
+    error: anyhow::Error,
+    owns_status: bool,
+}
+
+impl From<anyhow::Error> for LauncherFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            owns_status: true,
+        }
+    }
+}
+
+impl LauncherFailure {
+    fn secondary(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            owns_status: false,
+        }
+    }
+}
+
+fn record_launch_failure(options: &LaunchOptions, failure: &LauncherFailure) {
+    if !failure.owns_status {
+        return;
+    }
+    let _ = options.status_store.save_latest(&LaunchStatus {
+        status: "failed".to_string(),
+        message: failure.error.to_string(),
+        started_at_ms: current_timestamp_ms(),
+        debug_port: Some(options.debug_port),
+        helper_port: Some(options.helper_port),
+        codex_app: options
+            .app_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+        // AUMID 与错误码已写进 message(见 PackagedActivationFailure::into_error)。
+        aumid: None,
+    });
 }
 
 /// recodex-overlay: 把顶层 `model` 跟到上游 manifest 的推荐值。
@@ -267,7 +305,7 @@ async fn launcher_main(
     args: Vec<String>,
     helper_only: bool,
     options: LaunchOptions,
-) -> Result<()> {
+) -> std::result::Result<(), LauncherFailure> {
     // recodex-overlay: 必须早于任何子进程(Codex / 微信 app-server)——它们继承本进程
     // 环境块,而环境块是父进程的旧快照;上次登录后 setx 写的新 key 只在注册表里。
     // 拿旧 key 请求网关会被拒(SUBSCRIPTION_NOT_FOUND)。
@@ -293,10 +331,11 @@ async fn launcher_main(
         // 与其静默跑一个找不到的 helper,不如当场失败。
         if helper_port != options.helper_port {
             hooks.shutdown_helper(helper_port).await;
-            anyhow::bail!(
+            return Err(anyhow::anyhow!(
                 "helper 端口 {} 被占用(只能绑到 {helper_port})。请关掉占用该端口的程序后重试。",
                 options.helper_port
-            );
+            )
+            .into());
         }
         std::future::pending::<()>().await;
         hooks.shutdown_helper(helper_port).await;
@@ -318,7 +357,14 @@ async fn launcher_main(
     let Some(_guard) = acquire_guard_maybe_waiting(options.debug_port, await_guard)? else {
         // latest-status.json 归主实例所有,这里不写:它记着主实例**实际**的调试/helper
         // 端口,拿本进程的请求值覆盖掉,下一个 launcher 就读不到真实端口了。
-        activate_existing_codex_app(&options).await?;
+        let hooks = LauncherHooks::default();
+        activate_existing_codex_app(
+            &hooks,
+            Arc::new(codex_plus_core::existing_instance::SystemExistingInstanceEnv),
+            &options,
+        )
+        .await
+        .map_err(LauncherFailure::secondary)?;
         return Ok(());
     };
     // recodex-overlay: 旧 exe / 旧引用 / 卸载项版本号 / 旧数据残留的清理,后台线程做,不拖慢启动。
@@ -339,6 +385,10 @@ async fn launcher_main(
     codex_plus_core::phone_remote::start_from_saved_settings();
     // recodex: 扫掉「会话删除」留在索引/侧边栏里的残骸。放在单实例锁之后(只由持锁者做)、
     // 拉起 Codex 之前(Codex 运行中会把内存里的全局状态整份写回);Codex 已在跑则顺延。
+    // 同步但**限时**(STARTUP_SWEEP_BUDGET,1.5 秒):备份可能有几百 MB,首次启动不能为它
+    // 拖住 Codex。每份备份只轻量分类一次并缓存,没做完的顺延到下次启动。不放后台线程与
+    // Codex 并行:Codex 启动时读进内存的全局状态之后会整份写回,清了也白清,而标记已记成
+    // 「已清理」,再也不会重试。
     codex_plus_data::sweep_deleted_thread_leftovers_at_startup(
         &codex_plus_core::codex_sqlite::default_codex_home_dir(),
         &codex_plus_core::paths::default_app_state_dir().join("backups"),
@@ -383,23 +433,64 @@ fn acquire_single_instance_guard_with_retry(
     debug_port: u16,
     allow_stale_recovery: bool,
 ) -> anyhow::Result<Option<codex_plus_core::ports::LoopbackPortGuard>> {
-    match try_acquire_single_instance_guard() {
-        Ok(guard) => {
-            if let Some(fallback_lock_path) = guard.fallback_path() {
-                log_launcher_guard_fallback(fallback_lock_path);
-            }
-            Ok(Some(guard))
-        }
+    let guard = acquire_guard_with(
+        debug_port,
+        allow_stale_recovery,
+        &mut try_acquire_single_instance_guard,
+        &SystemStaleLauncherRecovery,
+    )?;
+    if let Some(fallback_lock_path) = guard.as_ref().and_then(|guard| guard.fallback_path()) {
+        log_launcher_guard_fallback(fallback_lock_path);
+    }
+    Ok(guard)
+}
+
+/// 「锁被占了,要不要把占着的 launcher 当残留杀掉」这一步能碰到的外部副作用。
+trait StaleLauncherRecovery {
+    fn should_recover(&self, debug_port: u16) -> bool;
+    fn stop_launcher_processes(&self);
+    fn pause(&self);
+}
+
+struct SystemStaleLauncherRecovery;
+
+impl StaleLauncherRecovery for SystemStaleLauncherRecovery {
+    fn should_recover(&self, debug_port: u16) -> bool {
+        should_recover_stale_launcher(debug_port)
+    }
+    fn stop_launcher_processes(&self) {
+        codex_plus_core::watcher::stop_launcher_processes();
+    }
+    fn pause(&self) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// 两种「被占」必须分开对待:
+///   - `WouldBlock`:锁文件被持有 —— 一个**活着的**当前版本 launcher 就是主实例。
+///     它此刻可能还没有 Codex 进程、也没有 CDP(商店激活带退避重试,最长约 20 秒),
+///     「无进程无 CDP」在这里**不代表**它是残留。绝不杀,交给第二实例路径去等/激活。
+///   - `AddrInUse`:锁文件拿到了(没有当前版本的 launcher 活着),端口却被占着 ——
+///     只可能是不认锁文件的旧版 launcher 或别的程序。这时才按「无 Codex 无 CDP」
+///     判定残留并清理,且只试一次。
+fn acquire_guard_with<G>(
+    debug_port: u16,
+    allow_stale_recovery: bool,
+    try_acquire: &mut dyn FnMut() -> std::io::Result<G>,
+    recovery: &dyn StaleLauncherRecovery,
+) -> anyhow::Result<Option<G>> {
+    match try_acquire() {
+        Ok(guard) => Ok(Some(guard)),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             log_launcher_already_running(debug_port);
             Ok(None)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
             log_launcher_already_running(debug_port);
-            if allow_stale_recovery && should_recover_stale_launcher(debug_port) {
-                codex_plus_core::watcher::stop_launcher_processes();
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                return acquire_single_instance_guard_with_retry(debug_port, false);
+            if allow_stale_recovery && recovery.should_recover(debug_port) {
+                recovery.stop_launcher_processes();
+                recovery.pause();
+                return acquire_guard_with(debug_port, false, try_acquire, recovery);
             }
             Ok(None)
         }
@@ -448,8 +539,22 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
     recover
 }
 
-async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
-    let hooks = LauncherHooks::default();
+/// 第二个 launcher(单实例锁在主实例手里)只做一件事:把正在跑的 Codex 叫到前台。
+///
+/// **不**调用 `hooks.launch_codex`:那是主实例的拉起逻辑,里面有「Codex 在跑但
+/// CDP 探不通 → 先杀掉再拉起」,第二实例探 CDP 的条件并不可靠(主实例刚拉起、
+/// CDP 还没监听;Codex 忙;页面刷新中;状态文件坏了退回请求端口),会把用户正在
+/// 用的 Codex 杀掉。这里只经 `ExistingInstanceEnv` 激活窗口,不探 CDP、不杀进程、
+/// 不拉起新的 Codex(见 codex_plus_core::existing_instance)。
+///
+/// 也**不**起自己的 helper、不注入、不起看门狗:本进程马上就退出,旧做法会把页面
+/// 的 helperBase 改指到本进程的临时端口,进程一退面板就对着死端口(线上实测一次挂
+/// 了约 9 小时)。主实例的 helper 与看门狗一直在,只确认它还活着。
+async fn activate_existing_codex_app<H: LaunchHooks>(
+    hooks: &H,
+    env: Arc<dyn codex_plus_core::existing_instance::ExistingInstanceEnv>,
+    options: &LaunchOptions,
+) -> anyhow::Result<()> {
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
@@ -468,31 +573,28 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         );
     }
     // 主实例在用的端口以它写的 latest-status.json 为准(见 existing_instance_ports)。
+    // 这里只拿 helper 端口确认增强功能活着;调试端口仅作诊断,不据此做任何动作。
     let primary = codex_plus_core::launcher::resolve_existing_instance_ports(
         &options.status_store,
         options.debug_port,
         options.helper_port,
     );
-    let launch_result = hooks
-        .launch_codex(
-            &app_dir,
-            primary.debug_port,
-            &settings,
-            &settings.codex_extra_args,
-        )
-        .await;
-    // 这里**不**起自己的 helper、不注入、不起看门狗:本进程马上就退出,旧做法会把
-    // 页面的 helperBase 改指到本进程的临时端口,进程一退面板就对着死端口(线上
-    // 实测一次挂了约 9 小时)。主实例的 helper 与看门狗一直在,只确认它还活着。
-    let process_ids = codex_plus_core::watcher::find_codex_processes();
-    #[cfg(windows)]
-    let activated = process_ids
-        .iter()
-        .copied()
-        .any(codex_plus_core::windows_activate_process_window);
-    #[cfg(not(windows))]
-    let activated = false;
-    let primary_helper_port = if settings.enhancements_enabled {
+    let activation = {
+        let app_dir = app_dir.clone();
+        let policy = codex_plus_core::existing_instance::ExistingActivationPolicy::default();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_core::existing_instance::activate_existing_codex(
+                env.as_ref(),
+                &app_dir,
+                &policy,
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("existing Codex activation task failed: {error}"))?
+    };
+    use codex_plus_core::existing_instance::ExistingActivation;
+    let no_codex = activation == ExistingActivation::NoCodexProcess;
+    let primary_helper_port = if settings.enhancements_enabled && !no_codex {
         codex_plus_core::launcher::wait_for_existing_helper(
             &primary.helper_ports,
             std::time::Duration::from_secs(10),
@@ -502,7 +604,15 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         None
     };
     let helper_available = !settings.enhancements_enabled || primary_helper_port.is_some();
-    if !helper_available {
+    if no_codex {
+        // 主实例还拿着锁却迟迟没有 Codex:多半卡在拉起(商店正在更新 Codex 之类)。
+        // 不替它拉 —— 我们拉起的那个没有调试端口,会被主实例当成「无 CDP」杀掉。
+        codex_plus_core::user_alert::alert_once_blocking(
+            "Codex 正在启动",
+            "ReCodex 已经在启动 Codex,但还没有出现窗口。请稍等片刻;
+如果一分钟后仍然没有窗口,请在任务管理器里结束 recodex.exe 后重新打开。",
+        );
+    } else if !helper_available {
         // 用**阻塞**版:这条路返回之后进程随即退出,非阻塞弹窗会一闪而过。
         codex_plus_core::user_alert::alert_once_blocking(
             "ReCodex 增强功能未启动",
@@ -510,6 +620,14 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
 请先完全退出 Codex,再用 ReCodex 重新启动;若仍然不行请联系客服。",
         );
     }
+    let (process_ids, activation_error) = match &activation {
+        ExistingActivation::WindowActivated { process_ids }
+        | ExistingActivation::AppActivated { process_ids } => (process_ids.clone(), None),
+        ExistingActivation::AppActivationFailed { process_ids, error } => {
+            (process_ids.clone(), Some(error.clone()))
+        }
+        ExistingActivation::NoCodexProcess => (Vec::new(), None),
+    };
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "launcher.activate_existing_codex",
         json!({
@@ -520,13 +638,16 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             "helper_candidates": primary.helper_ports,
             "requested_helper_port": options.helper_port,
             "process_ids": process_ids,
-            "activated": activated,
+            "outcome": activation.label(),
+            "activated": matches!(activation, ExistingActivation::WindowActivated { .. } | ExistingActivation::AppActivated { .. }),
             "helper_available": helper_available,
-            "launch_ok": launch_result.is_ok(),
-            "launch_error": launch_result.as_ref().err().map(|error| format!("{error:#}"))
+            "activation_error": activation_error,
         }),
     );
-    launch_result.map(|_| ())
+    match activation_error {
+        Some(error) => Err(anyhow::anyhow!("激活已在运行的 Codex 失败:{error}")),
+        None => Ok(()),
+    }
 }
 
 fn should_finalize_pending_remote_control_recovery(
@@ -1381,7 +1502,7 @@ mod tests {
             )
             .expect("pending recovery guard");
         let launch = body
-            .find("let launch_result = hooks")
+            .find("existing_instance::activate_existing_codex(")
             .expect("Codex activation");
 
         assert!(recovery < launch);
@@ -1392,38 +1513,339 @@ mod tests {
         );
     }
 
-    /// 上游 acdf0ec 同款守卫:第二个 launcher 只激活窗口、确认主实例 helper 活着,
-    /// 不起自己的 helper / 注入 / 看门狗(否则页面 helperBase 被改指到本进程的临时
-    /// 端口,本进程一退面板就对着死端口),也不覆盖主实例的 latest-status.json。
+    // ---- 第二实例路径的行为测试(替换原先只做源码字符串断言的守卫) ----
+
+    use codex_plus_core::existing_instance::ExistingInstanceEnv;
+    use codex_plus_core::launcher::CodexLaunch;
+    use codex_plus_core::settings::BackendSettings;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 主实例拉起逻辑的替身:第二实例路径下这些方法一次都不该被调到。
+    #[derive(Default)]
+    struct RecordingHooks {
+        launch_codex_calls: AtomicUsize,
+        terminate_codex_calls: AtomicUsize,
+        start_helper_calls: AtomicUsize,
+        inject_calls: AtomicUsize,
+        write_status_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl LaunchHooks for RecordingHooks {
+        fn resolve_app_dir(
+            &self,
+            _app_dir: Option<&Path>,
+            _settings: &BackendSettings,
+        ) -> anyhow::Result<PathBuf> {
+            Ok(PathBuf::from(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.915.3509.0_x64__2p2nqsd0c76g0\app",
+            ))
+        }
+        fn select_debug_port(&self, requested: u16) -> u16 {
+            requested
+        }
+        fn select_helper_port(&self, requested: u16) -> u16 {
+            requested
+        }
+        async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
+            // 关掉增强功能:否则会去真实端口上等 helper 10 秒。
+            Ok(BackendSettings {
+                enhancements_enabled: false,
+                ..BackendSettings::default()
+            })
+        }
+        async fn run_provider_sync(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
+            self.start_helper_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(helper_port)
+        }
+        async fn launch_codex(
+            &self,
+            _app_dir: &Path,
+            _debug_port: u16,
+            _settings: &BackendSettings,
+            _extra_args: &[String],
+        ) -> anyhow::Result<CodexLaunch> {
+            // 真实实现在「有进程但 CDP 不通」时会 stop_codex_processes_and_wait()。
+            self.launch_codex_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("second instance must never launch (or restart) Codex")
+        }
+        async fn inject(&self, _debug_port: u16, _helper_port: u16) -> anyhow::Result<()> {
+            self.inject_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn write_status(&self, _status: &str) {
+            self.write_status_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn wait_for_codex_exit(
+            &self,
+            _launch: &CodexLaunch,
+            _debug_port: u16,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn shutdown_helper(&self, _helper_port: u16) {}
+        async fn terminate_codex(&self, _launch: &CodexLaunch) {
+            self.terminate_codex_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 假的进程/窗口状态。场景里 CDP 一律「探不通」—— 第二实例路径根本不该去探它,
+    /// env 上也就没有探 CDP 的入口。
+    struct FakeProcessEnv {
+        process_ids: Vec<u32>,
+        window_activates: bool,
+        window_calls: AtomicUsize,
+        app_calls: AtomicUsize,
+    }
+
+    impl FakeProcessEnv {
+        fn new(process_ids: Vec<u32>, window_activates: bool) -> Arc<Self> {
+            Arc::new(Self {
+                process_ids,
+                window_activates,
+                window_calls: AtomicUsize::new(0),
+                app_calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl ExistingInstanceEnv for FakeProcessEnv {
+        fn codex_process_ids(&self) -> Vec<u32> {
+            self.process_ids.clone()
+        }
+        fn activate_process_window(&self, _process_id: u32) -> bool {
+            self.window_calls.fetch_add(1, Ordering::SeqCst);
+            self.window_activates
+        }
+        fn activate_app(&self, _app_dir: &Path) -> anyhow::Result<()> {
+            self.app_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn sleep(&self, _duration: std::time::Duration) {}
+    }
+
+    fn secondary_options(dir: &Path) -> LaunchOptions {
+        LaunchOptions {
+            status_store: codex_plus_core::status::StatusStore::new(
+                dir.join("latest-status.json"),
+            ),
+            ..LaunchOptions::default()
+        }
+    }
+
+    fn primary_status(options: &LaunchOptions) -> LaunchStatus {
+        LaunchStatus {
+            status: "running".to_string(),
+            message: "ReCodex launcher ready".to_string(),
+            started_at_ms: 1,
+            debug_port: Some(options.debug_port),
+            helper_port: Some(options.helper_port),
+            codex_app: None,
+            aumid: None,
+        }
+    }
+
+    fn assert_primary_runtime_untouched(hooks: &RecordingHooks) {
+        assert_eq!(
+            hooks.launch_codex_calls.load(Ordering::SeqCst),
+            0,
+            "不能走拉起/重启 Codex 的逻辑(里面会杀无 CDP 的 Codex)"
+        );
+        assert_eq!(hooks.terminate_codex_calls.load(Ordering::SeqCst), 0, "不能结束 Codex");
+        assert_eq!(hooks.start_helper_calls.load(Ordering::SeqCst), 0, "不能起自己的 helper");
+        assert_eq!(hooks.inject_calls.load(Ordering::SeqCst), 0, "不能注入");
+        assert_eq!(hooks.write_status_calls.load(Ordering::SeqCst), 0, "不能写状态");
+    }
+
+    /// B1:Codex 在跑、CDP 探不通(刚拉起/忙/刷新中/状态文件坏)—— 第二实例只激活窗口。
+    #[tokio::test]
+    async fn second_instance_with_running_codex_and_no_cdp_only_activates_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = secondary_options(dir.path());
+        options
+            .status_store
+            .save_latest(&primary_status(&options))
+            .unwrap();
+        let before = std::fs::read(dir.path().join("latest-status.json")).unwrap();
+        let hooks = RecordingHooks::default();
+        let env = FakeProcessEnv::new(vec![4242], true);
+
+        activate_existing_codex_app(&hooks, env.clone(), &options)
+            .await
+            .unwrap();
+
+        assert_primary_runtime_untouched(&hooks);
+        assert_eq!(env.window_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(env.app_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read(dir.path().join("latest-status.json")).unwrap(),
+            before
+        );
+    }
+
+    /// B1:状态文件写坏了(读不出端口,退回请求端口)也一样只激活。
+    #[tokio::test]
+    async fn second_instance_with_corrupt_status_file_still_only_activates() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = secondary_options(dir.path());
+        std::fs::write(dir.path().join("latest-status.json"), b"{not json").unwrap();
+        let hooks = RecordingHooks::default();
+        let env = FakeProcessEnv::new(vec![11], true);
+
+        activate_existing_codex_app(&hooks, env.clone(), &options)
+            .await
+            .unwrap();
+
+        assert_primary_runtime_untouched(&hooks);
+        assert_eq!(
+            std::fs::read(dir.path().join("latest-status.json")).unwrap(),
+            b"{not json"
+        );
+    }
+
+    /// 窗口前置不了(还在建/在托盘):退到系统激活,仍然不碰进程。
+    #[tokio::test]
+    async fn second_instance_falls_back_to_system_activation_without_killing() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = secondary_options(dir.path());
+        let hooks = RecordingHooks::default();
+        let env = FakeProcessEnv::new(vec![7, 8], false);
+
+        activate_existing_codex_app(&hooks, env.clone(), &options)
+            .await
+            .unwrap();
+
+        assert_primary_runtime_untouched(&hooks);
+        assert_eq!(env.app_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// S2 场景:主实例还在激活重试,一个 Codex 进程都没有 —— 第二实例既不拉起
+    /// (拉起的那个没有调试端口),也不做系统激活,只等待/提示。
+    #[tokio::test]
+    async fn second_instance_without_codex_waits_instead_of_launching() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = secondary_options(dir.path());
+        let hooks = RecordingHooks::default();
+        let env = FakeProcessEnv::new(Vec::new(), true);
+
+        activate_existing_codex_app(&hooks, env.clone(), &options)
+            .await
+            .unwrap();
+
+        assert_primary_runtime_untouched(&hooks);
+        assert_eq!(env.window_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(env.app_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !dir.path().join("latest-status.json").exists(),
+            "第二实例不能写状态文件"
+        );
+    }
+
+    struct CountingRecovery {
+        recover: bool,
+        stops: AtomicUsize,
+    }
+
+    impl StaleLauncherRecovery for CountingRecovery {
+        fn should_recover(&self, _debug_port: u16) -> bool {
+            self.recover
+        }
+        fn stop_launcher_processes(&self) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+        }
+        fn pause(&self) {}
+    }
+
+    /// S2:锁文件被持有 = 主 launcher 活着。即便此刻「无 Codex 进程、无 CDP」
+    /// (它正在重试激活),也绝不能把它当残留杀掉。
     #[test]
-    fn existing_launcher_path_reuses_the_primary_launcher_runtime() {
-        let source = include_str!("main.rs");
-        let start = source
-            .find("async fn activate_existing_codex_app")
-            .expect("existing launcher activation function");
-        let end = source[start..]
-            .find("fn should_finalize_pending_remote_control_recovery")
-            .map(|offset| start + offset)
-            .expect("next function after existing launcher activation");
-        let body = &source[start..end];
+    fn held_instance_lock_never_kills_the_primary_launcher() {
+        let recovery = CountingRecovery {
+            recover: true,
+            stops: AtomicUsize::new(0),
+        };
+        let mut attempts = 0;
+        let guard = acquire_guard_with::<()>(
+            9229,
+            true,
+            &mut || {
+                attempts += 1;
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "held"))
+            },
+            &recovery,
+        )
+        .unwrap();
+        assert!(guard.is_none());
+        assert_eq!(attempts, 1);
+        assert_eq!(recovery.stops.load(Ordering::SeqCst), 0);
+    }
 
-        assert!(!body.contains("hooks.start_helper"));
-        assert!(!body.contains("hooks.ensure_injection"));
-        assert!(!body.contains("hooks.start_bridge_watchdog"));
-        assert!(!body.contains("select_helper_port"));
-        assert!(body.contains("resolve_existing_instance_ports("));
-        assert!(body.contains("wait_for_existing_helper("));
-        assert!(body.contains("primary.debug_port"));
+    /// 锁文件空闲、端口却被占(不认锁文件的旧版 launcher):保留原有的残留清理,只试一次。
+    #[test]
+    fn port_held_without_lock_still_recovers_a_stale_legacy_launcher_once() {
+        let recovery = CountingRecovery {
+            recover: true,
+            stops: AtomicUsize::new(0),
+        };
+        let mut attempts = 0;
+        let guard = acquire_guard_with::<()>(
+            9229,
+            true,
+            &mut || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "port"))
+                } else {
+                    Ok(())
+                }
+            },
+            &recovery,
+        )
+        .unwrap();
+        assert!(guard.is_some());
+        assert_eq!(recovery.stops.load(Ordering::SeqCst), 1);
+    }
 
+    /// R4:第二实例失败不写 latest-status.json;主实例失败照写。
+    #[test]
+    fn only_the_primary_records_a_failed_launch_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = secondary_options(dir.path());
+        options
+            .status_store
+            .save_latest(&primary_status(&options))
+            .unwrap();
+        let before = std::fs::read(dir.path().join("latest-status.json")).unwrap();
+
+        record_launch_failure(&options, &LauncherFailure::secondary(anyhow::anyhow!("boom")));
+        assert_eq!(
+            std::fs::read(dir.path().join("latest-status.json")).unwrap(),
+            before
+        );
+
+        record_launch_failure(&options, &LauncherFailure::from(anyhow::anyhow!("boom")));
+        let saved = options.status_store.load_latest().unwrap().unwrap();
+        assert_eq!(saved.status, "failed");
+        assert_eq!(saved.message, "boom");
+    }
+
+    /// R4 的接线:已有实例分支的错误必须标成 secondary(否则 main 会照写状态)。
+    #[test]
+    fn existing_instance_branch_marks_its_failures_as_secondary() {
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let launcher_main = &source[source.find("async fn launcher_main(").unwrap()..];
         let guard_else = &launcher_main[launcher_main
             .find("acquire_guard_maybe_waiting(options.debug_port, await_guard)?")
             .unwrap()..];
         let branch = &guard_else[..guard_else.find("return Ok(());").unwrap()];
-        assert!(
-            !branch.contains("save_latest"),
-            "已有实例分支不能覆盖主实例的 latest-status.json"
-        );
+        assert!(branch.contains(".map_err(LauncherFailure::secondary)?"));
+        assert!(!branch.contains("save_latest"));
     }
 
     #[test]

@@ -375,3 +375,166 @@ fn new_delete_path_leaves_nothing_for_the_sweep() {
     assert_eq!(report.threads_cleaned, 0);
     assert_eq!(report.backups_scanned, 1);
 }
+
+// ---- R2:撤销过的自动化任务会话 / 纯 API 会话不能被再清一次 ----
+
+/// 往 fixture 里加:自动化任务会话 auto1(在 sqlite/automations.db 里)与纯 API
+/// 会话 api1(哪个库里都没有),两者都在索引与侧边栏里。
+fn add_automation_and_api_threads(fx: &Fixture) -> PathBuf {
+    let automation_db = fx.home.join("sqlite").join("automations.db");
+    Connection::open(&automation_db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE automation_runs (thread_id TEXT, thread_title TEXT, source_cwd TEXT, \
+             status TEXT, updated_at INTEGER, created_at INTEGER);
+             INSERT INTO automation_runs VALUES ('auto1', 'Nightly', '/p', 'done', 1, 1);
+             CREATE TABLE inbox_items (thread_id TEXT, body TEXT);
+             INSERT INTO inbox_items VALUES ('auto1', 'report');",
+        )
+        .unwrap();
+    let mut index = fs::read_to_string(fx.home.join("session_index.jsonl")).unwrap();
+    for id in ["auto1", "api1"] {
+        index.push_str(&format!(
+            "{{\"id\":\"{id}\",\"thread_name\":\"{id}\",\"updated_at\":\"2026-09-20T00:00:00Z\"}}\n"
+        ));
+    }
+    fs::write(fx.home.join("session_index.jsonl"), index).unwrap();
+    let mut state = global_state(&fx.home);
+    for id in ["auto1", "api1"] {
+        state["projectless-thread-ids"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(id));
+        state["thread-project-assignments"][id] = json!({"projectKind": "local"});
+    }
+    fs::write(
+        fx.home.join(".codex-global-state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    automation_db
+}
+
+fn projectless_ids(home: &Path) -> Vec<Value> {
+    global_state(home)["projectless-thread-ids"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn delete_everywhere(fx: &Fixture, automation_db: &Path, id: &str) -> String {
+    let result = codex_plus_data::delete_local_from_paths(
+        vec![fx.state_db.clone(), automation_db.to_path_buf()],
+        BackupStore::new(&fx.backups),
+        &SessionRef::new(format!("local:{id}"), id).unwrap(),
+        Some(fx.home.as_path()),
+    );
+    assert_eq!(result.status, DeleteStatus::LocalDeleted, "{}", result.message);
+    result.undo_token.unwrap()
+}
+
+fn undo(fx: &Fixture, automation_db: &Path, token: &str) {
+    let undone = SQLiteStorageAdapter::new(&fx.state_db, BackupStore::new(&fx.backups))
+        .with_allowed_db_paths([automation_db.to_path_buf()])
+        .with_codex_home(&fx.home)
+        .undo(token);
+    assert_eq!(undone.status, DeleteStatus::Undone, "{}", undone.message);
+}
+
+#[test]
+fn sweep_leaves_undone_automation_and_api_threads_alone() {
+    let fx = fixture();
+    let automation_db = add_automation_and_api_threads(&fx);
+    let auto_token = delete_everywhere(&fx, &automation_db, "auto1");
+    let api_token = delete_everywhere(&fx, &automation_db, "api1");
+    assert!(!index_ids(&fx.home).contains(&"auto1".to_string()));
+    assert!(!index_ids(&fx.home).contains(&"api1".to_string()));
+    undo(&fx, &automation_db, &auto_token);
+    undo(&fx, &automation_db, &api_token);
+    for id in ["auto1", "api1"] {
+        assert!(index_ids(&fx.home).contains(&id.to_string()));
+        assert!(projectless_ids(&fx.home).contains(&json!(id)));
+    }
+    // 两道保险分开验:先拿掉撤销时写下的「undone」标记(模拟旧版撤销过的备份),
+    // 只靠存在性判断也不能清。
+    fs::remove_file(fx.backups.join(".leftover-sweep.json")).unwrap();
+
+    let report = sweep_deleted_thread_leftovers(&fx.home, &fx.backups).unwrap();
+
+    assert_eq!(report.threads_cleaned, 0, "{report:?}");
+    assert_eq!(report.threads_still_present, 2, "{report:?}");
+    for id in ["auto1", "api1"] {
+        assert!(index_ids(&fx.home).contains(&id.to_string()), "{id} 被再清了一次");
+        assert!(projectless_ids(&fx.home).contains(&json!(id)), "{id} 侧边栏被清");
+    }
+}
+
+#[test]
+fn undo_marks_backups_so_the_sweep_skips_them() {
+    let fx = fixture();
+    let automation_db = add_automation_and_api_threads(&fx);
+    let api_token = delete_everywhere(&fx, &automation_db, "api1");
+    undo(&fx, &automation_db, &api_token);
+
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fx.backups.join(".leftover-sweep.json")).unwrap())
+            .unwrap();
+    assert_eq!(marker["processed"][&api_token], "undone");
+    let report = sweep_deleted_thread_leftovers(&fx.home, &fx.backups).unwrap();
+    assert_eq!(report.backups_scanned, 0);
+    assert!(index_ids(&fx.home).contains(&"api1".to_string()));
+}
+
+/// 纯 API 会话删掉后没撤销,但 Codex 运行时把内存里的全局状态写回了 —— 这才是
+/// 残骸,照样清(索引里已经没有它,说明不是撤销)。
+#[test]
+fn sweep_still_cleans_api_thread_sidebar_written_back_by_codex() {
+    let fx = fixture();
+    let automation_db = add_automation_and_api_threads(&fx);
+    delete_everywhere(&fx, &automation_db, "api1");
+    let mut state = global_state(&fx.home);
+    state["projectless-thread-ids"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("api1"));
+    fs::write(
+        fx.home.join(".codex-global-state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+
+    let report = sweep_deleted_thread_leftovers(&fx.home, &fx.backups).unwrap();
+
+    assert_eq!(report.threads_cleaned, 1, "{report:?}");
+    assert!(!projectless_ids(&fx.home).contains(&json!("api1")));
+    assert!(projectless_ids(&fx.home).contains(&json!("auto1")));
+}
+
+// ---- S1:限时 ----
+
+#[test]
+fn sweep_out_of_budget_defers_without_touching_anything() {
+    let fx = fixture();
+    legacy_delete(&fx, "t1");
+    let index_before = fs::read(fx.home.join("session_index.jsonl")).unwrap();
+
+    let report = codex_plus_data::sweep_deleted_thread_leftovers_within(
+        &fx.home,
+        &fx.backups,
+        std::time::Duration::ZERO,
+    )
+    .unwrap();
+
+    assert_eq!(report.status, LeftoverSweepStatus::DeferredBudget);
+    assert_eq!(report.threads_cleaned, 0);
+    assert_eq!(
+        fs::read(fx.home.join("session_index.jsonl")).unwrap(),
+        index_before
+    );
+
+    // 下次(不限时)接着做完。
+    let report = sweep_deleted_thread_leftovers(&fx.home, &fx.backups).unwrap();
+    assert_eq!(report.status, LeftoverSweepStatus::Completed);
+    assert_eq!(report.threads_cleaned, 1);
+    assert!(!index_ids(&fx.home).contains(&"t1".to_string()));
+}

@@ -561,9 +561,12 @@ fn packaged_manifest_app_id(app_dir: &Path) -> Option<String> {
 ///
 /// 一个包可以声明多个 Application —— 实测 OpenAI.Codex 26.915 就有两个:
 /// `App`(app/ChatGPT.exe)和 `CodexCoreCommandRunner`(命令执行器)。所以先找
-/// Executable 指向主程序(ChatGPT.exe / Codex.exe)的那个,找不到才取第一个。
+/// Executable 指向主程序(精确大小写的 ChatGPT.exe / Codex.exe、不在 resources 下)
+/// 的那个;找不到时取第一个**不是**辅助程序(命令执行器、小写 CLI codex.exe)的,
+/// 全是辅助程序才退回第一个。
 pub fn manifest_application_id(manifest: &str) -> Option<String> {
     let mut first = None;
+    let mut first_plausible = None;
     let mut rest = manifest;
     while let Some(pos) = rest.find("<Application") {
         rest = &rest[pos + "<Application".len()..];
@@ -577,17 +580,47 @@ pub fn manifest_application_id(manifest: &str) -> Option<String> {
         let Some(id) = xml_attribute_value(tag, "Id").filter(|id| !id.is_empty()) else {
             continue;
         };
-        let is_main_executable = xml_attribute_value(tag, "Executable").is_some_and(|exe| {
-            exe.rsplit(['/', '\\'])
-                .next()
-                .is_some_and(is_supported_app_executable_name)
-        });
-        if is_main_executable {
-            return Some(id);
+        let executable = xml_attribute_value(tag, "Executable").unwrap_or_default();
+        match manifest_application_role(&id, &executable) {
+            ManifestApplicationRole::Main => return Some(id),
+            ManifestApplicationRole::Other => {
+                first_plausible.get_or_insert_with(|| id.clone());
+            }
+            ManifestApplicationRole::Helper => {}
         }
         first.get_or_insert(id);
     }
-    first
+    first_plausible.or(first)
+}
+
+enum ManifestApplicationRole {
+    /// 桌面主程序:`ChatGPT.exe` / `Codex.exe`,**精确大小写**,不在 resources 下。
+    Main,
+    /// 命令执行器、CLI 之类的辅助程序:宁可退到第一个也不选它们。
+    Helper,
+    Other,
+}
+
+/// 大小写要精确:包里的 `app/resources/codex.exe`(小写)是 CLI,不能被
+/// `eq_ignore_ascii_case("Codex.exe")` 当成主程序;命令执行器
+/// (CodexCoreCommandRunner / *command-runner*)同理。
+fn manifest_application_role(id: &str, executable: &str) -> ManifestApplicationRole {
+    let normalized = executable.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or_default();
+    let lower_path = normalized.to_ascii_lowercase();
+    let under_resources = lower_path.split('/').any(|segment| segment == "resources");
+    let lower_id = id.to_ascii_lowercase();
+    let helper = under_resources
+        || lower_id.contains("commandrunner")
+        || lower_path.contains("command-runner")
+        || file_name == "codex.exe";
+    if helper {
+        ManifestApplicationRole::Helper
+    } else if file_name == "ChatGPT.exe" || file_name == "Codex.exe" {
+        ManifestApplicationRole::Main
+    } else {
+        ManifestApplicationRole::Other
+    }
 }
 
 fn xml_attribute_value(tag: &str, name: &str) -> Option<String> {
@@ -786,12 +819,24 @@ fn package_priority(spec: AppPackageSpec, app_dir: &Path) -> u8 {
     } else {
         app_dir.join("app")
     };
-    let resources = entry.join("resources");
-    if resources.join("codex.exe").is_file() || resources.join("codex").is_file() {
+    if app_entry_hosts_codex_runtime(&entry) {
         spec.priority
     } else {
         NON_CODEX_HOST_PRIORITY
     }
+}
+
+/// 包的 `app` 目录下有没有 Codex 运行时(`resources/codex.exe`)。
+pub(crate) fn app_entry_hosts_codex_runtime(app_entry: &Path) -> bool {
+    let resources = app_entry.join("resources");
+    resources.join("codex.exe").is_file() || resources.join("codex").is_file()
+}
+
+/// 这个包名是不是「可能只是纯聊天版」的 OpenAI.ChatGPT-Desktop:它的进程只有在包里
+/// 真带着 Codex 运行时才算 Codex(见 `CHATGPT_DESKTOP_CODEX_HOST_PRIORITY`)。
+pub(crate) fn package_needs_codex_runtime_check(package_name: &str) -> bool {
+    codex_package_parts(package_name)
+        .is_some_and(|(spec, _, _)| spec.priority == CHATGPT_DESKTOP_CODEX_HOST_PRIORITY)
 }
 
 fn package_entry_dir(package_dir: &Path, spec: AppPackageSpec) -> Option<PathBuf> {

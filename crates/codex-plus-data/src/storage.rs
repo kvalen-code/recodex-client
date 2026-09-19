@@ -16,45 +16,86 @@ pub fn delete_local_from_paths(
     session: &SessionRef,
     codex_home: Option<&Path>,
 ) -> DeleteResult {
-    let mut result = failed(
-        &session.session_id,
-        "Thread not found in local storage".to_string(),
-    );
-    let mut deleted_count = 0usize;
-    let mut backup_tokens = Vec::new();
     let db_paths = db_paths.into_iter().collect::<Vec<_>>();
+    // 每个候选库的结果按「删到了什么程度」分开收:兜底只能在**所有**库都明确
+    // 「查无此会话」时才走,见下。
+    let mut committed = Vec::new();
+    let mut failures = Vec::new();
+    let mut not_found = None;
     for db_path in db_paths.iter().cloned() {
         let adapter = match codex_home {
             Some(home) => SQLiteStorageAdapter::new(db_path, backup_store.clone())
                 .with_codex_home(home),
             None => SQLiteStorageAdapter::new(db_path, backup_store.clone()),
         };
-        let candidate_result = adapter.delete_local(session);
-        if matches!(candidate_result.status, DeleteStatus::LocalDeleted) {
-            deleted_count += 1;
-            if let Some(token) = candidate_result.undo_token.as_ref() {
-                backup_tokens.push(token.clone());
+        let (candidate_result, outcome) = adapter.delete_local_classified(session);
+        match outcome {
+            DeleteOutcome::Deleted | DeleteOutcome::DbDeletedFilesFailed => {
+                committed.push((candidate_result, outcome));
             }
-            result = candidate_result;
-        } else if deleted_count == 0 {
-            result = candidate_result;
+            DeleteOutcome::Failed => failures.push(candidate_result),
+            DeleteOutcome::NotFound => {
+                not_found.get_or_insert(candidate_result);
+            }
         }
     }
-    if deleted_count > 1 {
-        result.message = format!("已从 {deleted_count} 个本地存储删除");
-        result.undo_token = Some(json!(backup_tokens).to_string());
-        result.backup_path = None;
+
+    if !committed.is_empty() {
+        let fully_deleted = committed
+            .iter()
+            .all(|(_, outcome)| *outcome == DeleteOutcome::Deleted);
+        let tokens = committed
+            .iter()
+            .filter_map(|(result, _)| result.undo_token.clone())
+            .collect::<Vec<_>>();
+        let count = committed.len();
+        // 已删掉的库各自带着能完整撤销的 token;它们原样交给界面,绝不被别的备份替换。
+        let mut result = if fully_deleted {
+            committed.into_iter().next_back().map(|(result, _)| result).unwrap()
+        } else {
+            committed
+                .into_iter()
+                .find(|(_, outcome)| *outcome == DeleteOutcome::DbDeletedFilesFailed)
+                .map(|(result, _)| result)
+                .unwrap()
+        };
+        if count > 1 {
+            if fully_deleted {
+                result.message = format!("已从 {count} 个本地存储删除");
+            }
+            result.undo_token = Some(json!(tokens).to_string());
+            result.backup_path = None;
+        }
+        return result;
     }
+
+    // 有库删到一半/查不了(锁住、损坏、事务失败):会话可能还在,**不能**走下面的
+    // 「只清索引」兜底 —— 那会把侧边栏清掉并报成功,重启后会话又回来;也不能
+    // 拿只含索引的备份去顶替已有的撤销 token。原样报失败。
+    if let Some(result) = failures
+        .iter()
+        .find(|result| result.undo_token.is_some())
+        .or_else(|| failures.first())
+        .cloned()
+    {
+        return result;
+    }
+
+    let mut result = not_found.unwrap_or_else(|| {
+        failed(
+            &session.session_id,
+            "Thread not found in local storage".to_string(),
+        )
+    });
     // 纯 API 模式（model_provider = "custom"）下 threads 表是空的，上面每个库都查不到
     // 记录，于是直接返回「Thread not found in local storage」而会话行仍留在列表里
     // ——因为 UI 读的是 session_index.jsonl，那条记录没人清（#1998）。
     //
     // 数据库里没有不代表索引里没有，这里退一步清索引：真清掉了就算删除成功，
-    // 索引里也没有才是真的找不到。
-    if deleted_count == 0
-        && matches!(result.status, DeleteStatus::Failed)
-        && let Some(home) = codex_home
-    {
+    // 索引里也没有才是真的找不到。走到这里时每个候选库都明确查无此会话，且没有任何
+    // 撤销 token(见上),兜底写的备份不会覆盖别人的。
+    if let Some(home) = codex_home {
+        debug_assert!(result.undo_token.is_none());
         let thread_id = normalize_codex_thread_id(&session.session_id);
         // ReCodex：这条退路原先删了索引/侧边栏却不留备份，撤销时无从恢复。
         // 先把要删的东西写进一份只含 `__session_index`/`__sidebar` 的备份，
@@ -104,6 +145,23 @@ pub fn delete_local_from_paths(
     }
     result
 }
+
+/// 单个候选库的删除走到了哪一步。`delete_local_from_paths` 据此决定能不能兜底。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteOutcome {
+    /// 数据库行和文件都删了。
+    Deleted,
+    /// 数据库行已删(事务已提交),但 rollout 等文件没删掉。token 可完整撤销。
+    DbDeletedFilesFailed,
+    /// 这个库**明确**没有这条会话(库文件不存在、不是会话库、查询结果为空)。
+    NotFound,
+    /// 没下结论:打不开/锁住/事务失败。会话可能还在。
+    Failed,
+}
+
+/// 删除连接等锁的上限。Codex 运行中频繁写 state_5.sqlite,不等的话一撞上写事务
+/// 就立刻 SQLITE_BUSY;太长又会让删除按钮卡住。
+const DELETE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 为「数据库里没有这条会话、只剩索引/侧边栏条目」的删除写备份。
 /// 什么都没有时返回 `None`（不写空备份）。
@@ -234,39 +292,71 @@ impl SQLiteStorageAdapter {
     }
 
     pub fn delete_local(&self, session: &SessionRef) -> DeleteResult {
+        self.delete_local_classified(session).0
+    }
+
+    pub(crate) fn delete_local_classified(
+        &self,
+        session: &SessionRef,
+    ) -> (DeleteResult, DeleteOutcome) {
         if !self.db_path.exists() {
-            return failed(
-                &session.session_id,
-                format!("Database not found: {}", self.db_path.to_string_lossy()),
+            return (
+                failed(
+                    &session.session_id,
+                    format!("Database not found: {}", self.db_path.to_string_lossy()),
+                ),
+                DeleteOutcome::NotFound,
             );
         }
-        let result = (|| -> anyhow::Result<DeleteResult> {
+        let result = (|| -> anyhow::Result<(DeleteResult, DeleteOutcome)> {
             let mut db = Connection::open(&self.db_path)?;
-            match schema_kind(&db)? {
-                Some(SchemaKind::GenericSessions) => self.delete_generic_session(&mut db, session),
-                Some(SchemaKind::CodexThreads) => self.delete_codex_thread(&mut db, session),
+            db.busy_timeout(DELETE_BUSY_TIMEOUT)?;
+            let deleted = match schema_kind(&db)? {
+                Some(SchemaKind::GenericSessions) => self.delete_generic_session(&mut db, session)?,
+                Some(SchemaKind::CodexThreads) => self.delete_codex_thread(&mut db, session)?,
                 Some(SchemaKind::CodexAutomationRuns) => {
-                    self.delete_codex_automation_run(&mut db, session)
+                    self.delete_codex_automation_run(&mut db, session)?
                 }
-                None => Ok(failed(
-                    &session.session_id,
-                    "Unsupported local storage schema".to_string(),
-                )),
-            }
+                None => {
+                    return Ok((
+                        failed(
+                            &session.session_id,
+                            "Unsupported local storage schema".to_string(),
+                        ),
+                        DeleteOutcome::NotFound,
+                    ));
+                }
+            };
+            Ok(deleted.unwrap_or_else(|| {
+                (
+                    failed(
+                        &session.session_id,
+                        "Thread not found in local storage".to_string(),
+                    ),
+                    DeleteOutcome::NotFound,
+                )
+            }))
         })();
-        let mut result = result.unwrap_or_else(|err| failed(&session.session_id, err.to_string()));
-        // 删成功就一并清 session_index.jsonl。
+        let (mut result, outcome) = result.unwrap_or_else(|err| {
+            (failed(&session.session_id, err.to_string()), DeleteOutcome::Failed)
+        });
+        // 数据库行删掉了就一并清 session_index.jsonl 和侧边栏缓存。
         //
         // 放在这个统一出口而不是各个 delete_* 里：三种 schema 里原先只有
         // delete_codex_thread 清了索引，另外两种删掉数据库行却把索引条目留着，
         // 于是重启后 UI 从索引读，会话又冒出来，再删再冒（#1979）。放在出口
         // 处理，将来加新 schema 也不会漏。
         //
+        // 「行已删、rollout 文件没删掉」也要清:行没了,侧边栏条目点开就是
+        // 「no rollout found」;备份里已有这些条目,撤销能原样放回。
+        //
         // delete_codex_thread 里那次调用保留：它需要把清理失败并进自己那条
         // 「数据库已删但文件删除失败」的消息里；这里对已清理过的再调一次是幂等的
         // （条目已不在，返回 0）。
-        if matches!(result.status, DeleteStatus::LocalDeleted)
-            && let Some(home) = self.codex_home.as_deref()
+        if matches!(
+            outcome,
+            DeleteOutcome::Deleted | DeleteOutcome::DbDeletedFilesFailed
+        ) && let Some(home) = self.codex_home.as_deref()
         {
             let thread_id = normalize_codex_thread_id(&session.session_id);
             if let Err(error) = crate::provider_sync::remove_session_index_entry(home, &thread_id) {
@@ -279,7 +369,7 @@ impl SQLiteStorageAdapter {
                 result.message = format!("{}；侧边栏索引清理失败：{error}", result.message);
             }
         }
-        result
+        (result, outcome)
     }
 
     pub fn list_local_sessions(&self) -> anyhow::Result<Vec<LocalSession>> {
@@ -419,6 +509,11 @@ impl SQLiteStorageAdapter {
                 &self.allowed_db_paths,
                 self.codex_home.as_deref(),
             )?;
+            // 撤销过的备份不再是「已删除的证据」:告诉启动清扫别再按它清一遍(R2)。
+            crate::deleted_leftovers::record_undone_backups(
+                self.backup_store.root(),
+                &undo_tokens(token),
+            );
             Ok(DeleteResult {
                 status: DeleteStatus::Undone,
                 session_id,
@@ -519,17 +614,14 @@ impl SQLiteStorageAdapter {
         &self,
         db: &mut Connection,
         session: &SessionRef,
-    ) -> anyhow::Result<DeleteResult> {
+    ) -> anyhow::Result<Option<(DeleteResult, DeleteOutcome)>> {
         let sessions = select_dicts(
             db,
             "SELECT * FROM sessions WHERE id = ?1",
             &[&session.session_id],
         )?;
         if sessions.is_empty() {
-            return Ok(failed(
-                &session.session_id,
-                "Session not found in local storage".to_string(),
-            ));
+            return Ok(None);
         }
         let messages = if has_table(db, "messages")? {
             select_dicts(
@@ -563,28 +655,26 @@ impl SQLiteStorageAdapter {
             Ok(())
         })();
         if let Err(err) = delete_result {
-            return Ok(failed_with_undo(
-                &session.session_id,
-                err.to_string(),
-                &token,
-                Some(&backup_path),
-            ));
+            return Ok(Some((
+                failed_with_undo(&session.session_id, err.to_string(), &token, Some(&backup_path)),
+                DeleteOutcome::Failed,
+            )));
         }
-        Ok(local_deleted(&session.session_id, &token, &backup_path))
+        Ok(Some((
+            local_deleted(&session.session_id, &token, &backup_path),
+            DeleteOutcome::Deleted,
+        )))
     }
 
     fn delete_codex_thread(
         &self,
         db: &mut Connection,
         session: &SessionRef,
-    ) -> anyhow::Result<DeleteResult> {
+    ) -> anyhow::Result<Option<(DeleteResult, DeleteOutcome)>> {
         let thread_id = normalize_codex_thread_id(&session.session_id);
         let thread_rows = select_dicts(db, "SELECT * FROM threads WHERE id = ?1", &[&thread_id])?;
         if thread_rows.is_empty() {
-            return Ok(failed(
-                &session.session_id,
-                "Thread not found in local storage".to_string(),
-            ));
+            return Ok(None);
         }
         let mut tables = Map::new();
         tables.insert("threads".to_string(), Value::Array(thread_rows));
@@ -656,12 +746,10 @@ impl SQLiteStorageAdapter {
             Ok(())
         })();
         if let Err(err) = delete_result {
-            return Ok(failed_with_undo(
-                &thread_id,
-                err.to_string(),
-                &token,
-                Some(&backup_path),
-            ));
+            return Ok(Some((
+                failed_with_undo(&thread_id, err.to_string(), &token, Some(&backup_path)),
+                DeleteOutcome::Failed,
+            )));
         }
         let mut file_errors = Vec::new();
         for file in file_backups {
@@ -686,19 +774,24 @@ impl SQLiteStorageAdapter {
             if let Some(note) = session_index_note.as_deref() {
                 message = format!("{message}；{note}");
             }
-            return Ok(DeleteResult {
-                status: DeleteStatus::Failed,
-                session_id: thread_id,
-                message,
-                undo_token: Some(token.clone()),
-                backup_path: Some(backup_path.to_string_lossy().to_string()),
-            });
+            // 数据库行已经删了:这把 token(整行 + rollout + 索引 + 侧边栏)是唯一
+            // 能完整撤销的凭据,调用方不能拿别的备份把它换掉。
+            return Ok(Some((
+                DeleteResult {
+                    status: DeleteStatus::Failed,
+                    session_id: thread_id,
+                    message,
+                    undo_token: Some(token.clone()),
+                    backup_path: Some(backup_path.to_string_lossy().to_string()),
+                },
+                DeleteOutcome::DbDeletedFilesFailed,
+            )));
         }
         let mut result = local_deleted(&thread_id, &token, &backup_path);
         if let Some(note) = session_index_note.as_deref() {
             result.message = format!("{}；{}", result.message, note);
         }
-        Ok(result)
+        Ok(Some((result, DeleteOutcome::Deleted)))
     }
 
     fn add_thread_sidebar_backups(
@@ -716,7 +809,7 @@ impl SQLiteStorageAdapter {
         &self,
         db: &mut Connection,
         session: &SessionRef,
-    ) -> anyhow::Result<DeleteResult> {
+    ) -> anyhow::Result<Option<(DeleteResult, DeleteOutcome)>> {
         let thread_id = normalize_codex_thread_id(&session.session_id);
         let mut tables = Map::new();
         backup_related_rows(
@@ -733,17 +826,16 @@ impl SQLiteStorageAdapter {
             "thread_id = ?1",
             &[&thread_id],
         )?;
-        self.add_thread_sidebar_backups(&mut tables, &thread_id)?;
+        // 先看库里有没有这条会话,再决定要不要连带索引/侧边栏:原先把侧边栏快照
+        // 也算进「有东西」,库里查无此会话时却照样删库(删 0 行)并报成功。
         if tables.values().all(|rows| {
             rows.as_array()
                 .map(|items| items.is_empty())
                 .unwrap_or(true)
         }) {
-            return Ok(failed(
-                &session.session_id,
-                "Thread not found in local storage".to_string(),
-            ));
+            return Ok(None);
         }
+        self.add_thread_sidebar_backups(&mut tables, &thread_id)?;
         let token =
             self.backup_store
                 .write_backup(&thread_id, &self.db_path, Value::Object(tables))?;
@@ -756,14 +848,15 @@ impl SQLiteStorageAdapter {
             Ok(())
         })();
         if let Err(err) = delete_result {
-            return Ok(failed_with_undo(
-                &thread_id,
-                err.to_string(),
-                &token,
-                Some(&backup_path),
-            ));
+            return Ok(Some((
+                failed_with_undo(&thread_id, err.to_string(), &token, Some(&backup_path)),
+                DeleteOutcome::Failed,
+            )));
         }
-        Ok(local_deleted(&thread_id, &token, &backup_path))
+        Ok(Some((
+            local_deleted(&thread_id, &token, &backup_path),
+            DeleteOutcome::Deleted,
+        )))
     }
 }
 
@@ -922,9 +1015,12 @@ fn normalize_codex_thread_id(session_id: &str) -> String {
         .to_string()
 }
 
+fn undo_tokens(token: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(token).unwrap_or_else(|_| vec![token.to_string()])
+}
+
 fn undo_backups(backup_store: &BackupStore, token: &str) -> anyhow::Result<Vec<Value>> {
-    let tokens =
-        serde_json::from_str::<Vec<String>>(token).unwrap_or_else(|_| vec![token.to_string()]);
+    let tokens = undo_tokens(token);
     if tokens.is_empty() {
         anyhow::bail!("empty undo token");
     }
@@ -948,6 +1044,7 @@ fn restore_backups(
         if backup_has_db_rows(tables) {
             let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
             let db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            db.busy_timeout(DELETE_BUSY_TIMEOUT)?;
             detect_restore_conflicts(&db, tables)?;
             preflight_restore_rows(&db, tables)?;
         }
@@ -967,6 +1064,7 @@ fn restore_backups(
             let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
             let mut db =
                 Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            db.busy_timeout(DELETE_BUSY_TIMEOUT)?;
             let tx = db.transaction()?;
             restore_rows(&tx, tables)?;
             tx.commit()?;
@@ -981,6 +1079,10 @@ fn restore_backups(
                 };
                 let bytes =
                     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)?;
+                if fs::read(path).is_ok_and(|existing| existing == bytes) {
+                    // 上一次撤销已经写回来了(之后某步失败、这是重试)。
+                    continue;
+                }
                 if let Some(parent) = Path::new(path).parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -999,9 +1101,13 @@ fn restore_backups(
                 }
             }
         }
+        // 侧边栏/目录缓存与 __session_index 一样是**尽力而为**:走到这里数据库行和
+        // rollout 已经提交回去了,这一步失败(目录缓存库被 Codex 锁住、全局状态
+        // 正被改写)时若把错误往上抛,界面显示「撤销失败」,而重试又会撞上刚恢复的
+        // 行 —— 半成功、再也撤不回。缓存缺一条,Codex 重建目录时会从会话库补回。
         if let Some(sidebar) = tables.get("__sidebar") {
             if let Some(home) = codex_home {
-                let _ = crate::provider_sync::restore_thread_sidebar_references(home, sidebar)?;
+                let _ = crate::provider_sync::restore_thread_sidebar_references(home, sidebar);
             }
         }
     }
@@ -1036,6 +1142,9 @@ fn restore_rows(db: &Connection, tables: &Map<String, Value>) -> anyhow::Result<
         for row in rows {
             if let Some(row) = row.as_object() {
                 if table == "agent_job_items" && update_existing_agent_job_item(db, row)? {
+                    continue;
+                }
+                if restore_row_state(db, table, row)? == RestoreRowState::Identical {
                     continue;
                 }
                 insert_row(db, table, row)?;
@@ -1169,7 +1278,7 @@ fn detect_restore_conflicts(db: &Connection, tables: &Map<String, Value>) -> any
             let Some(row) = row.as_object() else {
                 continue;
             };
-            if restore_row_conflicts(db, table, row)? {
+            if restore_row_state(db, table, row)? == RestoreRowState::Conflict {
                 anyhow::bail!("restore conflict: {table} row already exists");
             }
         }
@@ -1177,14 +1286,25 @@ fn detect_restore_conflicts(db: &Connection, tables: &Map<String, Value>) -> any
     Ok(())
 }
 
-fn restore_row_conflicts(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreRowState {
+    /// 库里没有这一行,照常插回。
+    Absent,
+    /// 库里已有一模一样的行 —— 上一次撤销已经把它插回来了(之后某步失败、这是
+    /// 重试)。视为已恢复,不算冲突,也不再插。
+    Identical,
+    /// 同键的行已存在且内容不同:删除之后又被别的途径写了,不能覆盖。
+    Conflict,
+}
+
+fn restore_row_state(
     db: &Connection,
     table: &str,
     row: &Map<String, Value>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<RestoreRowState> {
     let key_columns = restore_conflict_key_columns(table, row);
     if key_columns.is_empty() || !has_table(db, table)? {
-        return Ok(false);
+        return Ok(RestoreRowState::Absent);
     }
     let where_clause = key_columns
         .iter()
@@ -1200,13 +1320,32 @@ fn restore_row_conflicts(
         .iter()
         .map(|value| value as &dyn ToSql)
         .collect::<Vec<_>>();
-    Ok(db
-        .query_row(
-            &format!("SELECT 1 FROM \"{table}\" WHERE {where_clause} LIMIT 1"),
-            refs.as_slice(),
-            |_| Ok(()),
-        )
-        .is_ok())
+    let existing = select_dicts(
+        db,
+        &format!("SELECT * FROM \"{table}\" WHERE {where_clause}"),
+        refs.as_slice(),
+    )?;
+    if existing.is_empty() {
+        return Ok(RestoreRowState::Absent);
+    }
+    let identical = existing.iter().any(|current| {
+        row.iter().all(|(column, value)| {
+            current
+                .get(column)
+                .is_some_and(|current| same_restored_value(current, value))
+        })
+    });
+    Ok(if identical {
+        RestoreRowState::Identical
+    } else {
+        RestoreRowState::Conflict
+    })
+}
+
+/// 备份值与库里读回的值是否相同。备份写的是 sql_value_to_json 的结果,插回时经
+/// json_to_sql_value(布尔变整数),所以按插回后的 SQL 值比较。
+fn same_restored_value(current: &Value, backup: &Value) -> bool {
+    current == backup || sql_value_to_json(ValueRef::from(&json_to_sql_value(backup))) == *current
 }
 
 fn restore_conflict_key_columns<'a>(table: &str, row: &'a Map<String, Value>) -> Vec<&'a String> {
@@ -1243,11 +1382,21 @@ fn detect_file_restore_conflicts(tables: &Map<String, Value>) -> anyhow::Result<
             if !allowed_paths.contains(path) {
                 anyhow::bail!("unexpected backup file path: {path}");
             }
+            let content = file
+                .get("content_b64")
+                .and_then(Value::as_str)
+                .map(|content| {
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)
+                })
+                .transpose()?;
             if Path::new(path).exists() {
-                anyhow::bail!("restore conflict: file already exists: {path}");
-            }
-            if let Some(content) = file.get("content_b64").and_then(Value::as_str) {
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)?;
+                // 内容与备份一致 = 上一次撤销已经写回来了(重试),不算冲突。
+                let same = content.as_ref().is_some_and(|content| {
+                    fs::read(path).is_ok_and(|existing| &existing == content)
+                });
+                if !same {
+                    anyhow::bail!("restore conflict: file already exists: {path}");
+                }
             }
         }
     }
@@ -1316,7 +1465,11 @@ fn update_existing_agent_job_item(
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
         Err(err) => return Err(err.into()),
     };
-    if current_assignment.is_some() {
+    if let Some(current) = current_assignment {
+        // 上一次撤销已经把分配改回来了(重试):算已恢复。
+        if row["assigned_thread_id"].as_str() == Some(current.as_str()) {
+            return Ok(true);
+        }
         anyhow::bail!("restore conflict: agent_job_items row already assigned");
     }
     let assigned = OwnedSqlValue(json_to_sql_value(&row["assigned_thread_id"]));

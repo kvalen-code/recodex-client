@@ -52,6 +52,10 @@ impl BackupStore {
         Ok(serde_json::from_str(&text)?)
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn path_for(&self, token: &str) -> PathBuf {
         let safe: String = token
             .chars()

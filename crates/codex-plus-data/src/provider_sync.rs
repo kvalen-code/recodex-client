@@ -1832,6 +1832,10 @@ const SIDEBAR_ATOM_KEY_PREFIXES: [&str; 3] = [
     "thread-tab-routes-v1",
 ];
 
+/// electron-persisted-atom-state 里「以 thread id 为键」的对象。thread-descriptions-v1
+/// 存侧边栏里每条会话的一行摘要:会话删了它还留着,对象只会越积越大。
+const SIDEBAR_ATOM_THREAD_MAPS: [&str; 1] = ["thread-descriptions-v1"];
+
 const SIDEBAR_CATALOG_TABLES: [&str; 3] = [
     "local_thread_catalog",
     "thread_timeline_ledger",
@@ -1890,6 +1894,22 @@ fn snapshot_thread_from_global_state(
             .collect::<Map<_, _>>();
         if !entries.is_empty() {
             snapshot.insert("atom_entries".to_string(), Value::Object(entries));
+        }
+        let mut atom_maps = Map::new();
+        for key in SIDEBAR_ATOM_THREAD_MAPS {
+            if let Some(map) = atom.get(key).and_then(Value::as_object) {
+                let entries = map
+                    .iter()
+                    .filter(|(key, _)| thread_key_matches(key, thread_id))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Map<_, _>>();
+                if !entries.is_empty() {
+                    atom_maps.insert(key.to_string(), Value::Object(entries));
+                }
+            }
+        }
+        if !atom_maps.is_empty() {
+            snapshot.insert("atom_maps".to_string(), Value::Object(atom_maps));
         }
     }
     Ok(Value::Object(snapshot))
@@ -1984,6 +2004,14 @@ fn restore_thread_to_global_state(
             }
         }
     }
+    if let Some(maps) = global.get("atom_maps").and_then(Value::as_object) {
+        let atom = root
+            .entry("electron-persisted-atom-state")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(atom) = atom.as_object_mut() {
+            restored += restore_missing_map_entries(atom, maps);
+        }
+    }
     if restored == 0 {
         return Ok(0);
     }
@@ -2031,6 +2059,9 @@ fn restore_thread_to_catalog_dbs(
         let table = entry["table"].as_str().unwrap_or_default();
         let rows = entry["rows"].as_array().cloned().unwrap_or_default();
         let mut db = Connection::open(&path)?;
+        // 目录缓存库是 Codex 运行中频繁写的库;不等锁的话撤销一撞上它的写事务
+        // 就失败。与删除那边(remove_thread_from_catalog_dbs)对齐。
+        db.busy_timeout(std::time::Duration::from_secs(2))?;
         let tx = db.transaction()?;
         if !has_table(&tx, table)? {
             tx.commit()?;
@@ -2177,6 +2208,15 @@ fn remove_thread_from_global_state(codex_home: &Path, thread_id: &str) -> anyhow
         for key in keys {
             atom.remove(&key);
             removed += 1;
+        }
+        for key in SIDEBAR_ATOM_THREAD_MAPS {
+            if let Some(map) = atom.get_mut(key).and_then(Value::as_object_mut) {
+                for candidate in [thread_id, &format!("local:{thread_id}")] {
+                    if map.remove(candidate).is_some() {
+                        removed += 1;
+                    }
+                }
+            }
         }
     }
     if removed == 0 {

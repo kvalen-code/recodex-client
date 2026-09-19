@@ -7545,6 +7545,7 @@
       "找不到要复制的会话": "找不到要複製的對話",
       "会话加载超时，请稍后重试": "對話載入逾時，請稍後再試",
       "当前会话没有可复制的回答": "目前對話沒有可複製的回答",
+      "无法确认已切换到要复制的会话，已取消": "無法確認已切換到要複製的對話，已取消",
       "回答大纲": "回答大綱",
     },
     ru: {
@@ -7552,6 +7553,7 @@
       "找不到要复制的会话": "Не найден чат для копирования",
       "会话加载超时，请稍后重试": "Чат загружается слишком долго, попробуйте ещё раз",
       "当前会话没有可复制的回答": "В этом чате нет ответа, от которого можно сделать копию",
+      "无法确认已切换到要复制的会话，已取消": "Не удалось убедиться, что открыт нужный чат; копирование отменено",
       "回答大纲": "План ответа",
     },
   };
@@ -7621,12 +7623,37 @@
     }, sessionCopyMenuActivationTimeoutMs);
   }
 
-  function sessionCopyForkButton() {
+  function sessionCopyForkButtons() {
     const selector = sessionCopyForkAriaLabels.map((label) => `button[aria-label="${label}"]`).join(",");
     return [...document.querySelectorAll(selector)]
       .filter(visibleElement)
-      .filter((button) => !isExtensionUiNode(button))
-      .at(-1) || null;
+      .filter((button) => !isExtensionUiNode(button));
+  }
+
+  function sessionCopyThreadKey(value) {
+    const text = String(value || "").trim();
+    return normalizedCodexThreadUuid(text) || text.replace(/^local:/i, "");
+  }
+
+  // 该点哪个分叉按钮。纯函数,方便测试:
+  //   - 侧边栏选中只说明「点过了」,对话区可能还是上一个会话(异步加载、切换中);
+  //     「全文档最后一个分叉按钮」此时属于**旧会话**,点下去就分叉错了会话。
+  //   - 路由里读得到会话 id(currentThreadId 非空)就以它为准:不是目标 → 不点。
+  //   - 这次发生了切换(wasSelected=false)时,只认切换**之后**才出现的按钮
+  //     (before 里记着切换前的那一批);路由读不到 id 时,还要求旧按钮已经全部下线。
+  //   - 本来就在这个会话(wasSelected=true):没有切换,当前按钮就是它的。
+  //   无法确认 → 返回 null,由调用方提示失败,绝不乱点。
+  function sessionCopyPickForkButton({ targetId, wasSelected, before, buttons, currentThreadId }) {
+    const target = sessionCopyThreadKey(targetId);
+    // 路由里只认得出 UUID 形态的会话 id;别的片段(设置页之类)当作「读不到」。
+    const current = normalizedCodexThreadUuid(currentThreadId);
+    if (!target) return null;
+    if (current && current !== target) return null;
+    const list = Array.isArray(buttons) ? buttons : [];
+    if (wasSelected) return list.at(-1) || null;
+    const previous = before instanceof Set ? before : new Set(before || []);
+    if (!current && [...previous].some((button) => button?.isConnected)) return null;
+    return list.filter((button) => !previous.has(button)).at(-1) || null;
   }
 
   async function activateSessionCopyMenuItem(event) {
@@ -7641,14 +7668,33 @@
       showToast(codexPlusUiText("找不到要复制的会话"), null);
       return;
     }
+    const targetId = row.getAttribute("data-app-action-sidebar-thread-id") || "";
+    const wasSelected = row.getAttribute("data-app-action-sidebar-thread-selected") === "true";
+    // 切换前先记下对话区里已有的分叉按钮:切换后只认新出现的那些。
+    const before = new Set(sessionCopyForkButtons());
     if (!await selectSessionRowForAction(row)) {
       showToast(codexPlusUiText("会话加载超时，请稍后重试"), null);
       return;
     }
-    // 切过去后回答列表是异步挂上来的,等官方按钮出现再点。
-    const forkButton = await waitForSessionElement(sessionCopyForkButton, sessionCopyForkButtonWaitMs);
+    const pick = () => sessionCopyPickForkButton({
+      targetId,
+      wasSelected,
+      before,
+      buttons: sessionCopyForkButtons(),
+      currentThreadId: locationThreadId(),
+    });
+    // 切过去后回答列表是异步挂上来的,等目标会话自己的按钮出现再点。
+    const forkButton = await waitForSessionElement(pick, sessionCopyForkButtonWaitMs);
     if (!forkButton) {
-      showToast(codexPlusUiText("当前会话没有可复制的回答"), null);
+      const routeThread = normalizedCodexThreadUuid(locationThreadId());
+      const onTarget = routeThread ? routeThread === sessionCopyThreadKey(targetId) : wasSelected;
+      showToast(codexPlusUiText(onTarget ? "当前会话没有可复制的回答" : "无法确认已切换到要复制的会话，已取消"), null);
+      sendCodexPlusDiagnostic("session_copy_fork_unconfirmed", { onTarget, hadRoute: !!routeThread });
+      return;
+    }
+    // 等待期间用户可能又点了别的会话:点之前再核一次。
+    if (pick() !== forkButton) {
+      showToast(codexPlusUiText("无法确认已切换到要复制的会话，已取消"), null);
       return;
     }
     sendCodexPlusDiagnostic("session_copy_fork_clicked", {});
@@ -7956,6 +8002,10 @@
 
   window.__codexAnswerOutlineDisconnect?.();
   window.__codexAnswerOutlineDisconnect = answerOutlineDisconnect;
+  // 重注入时,上一份脚本留下的大纲节点身上的点击监听还攥着**旧的** state:
+  // 用它打开的列表,新的「点外部关闭」看的是新 state(open=false),永远关不掉;
+  // 下次刷新签名相同时还会复用这个旧节点。直接拆掉,由新 state 重建。
+  document.getElementById(answerOutlineRootId)?.remove();
   if (window.__codexAnswerOutlineDocHandler) {
     document.removeEventListener("pointerdown", window.__codexAnswerOutlineDocHandler, true);
   }
@@ -7972,6 +8022,13 @@
       latestAnswer: answerOutlineLatestAnswer,
       looksLikeHeading: answerOutlineLooksLikeHeading,
       uiText: codexPlusUiText,
+      state: () => answerOutlineState,
+    };
+  }
+
+  if (window.__CODEX_PLUS_TEST_SESSION_COPY__) {
+    window.__codexPlusSessionCopyTest = {
+      pickForkButton: sessionCopyPickForkButton,
     };
   }
 

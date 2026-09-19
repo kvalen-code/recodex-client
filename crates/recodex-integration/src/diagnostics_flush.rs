@@ -168,9 +168,12 @@ impl<T: Transport> Adapter<T> {
 fn report_from_line(line: &[u8], device_id: &str, client_version: &str, os: &str) -> Option<DiagnosticReport> {
     let record: Value = serde_json::from_slice(line).ok()?;
     let event = record.get("event")?.as_str()?;
-    let detail = record.get("detail").cloned().unwrap_or(Value::Null);
+    let mut detail = record.get("detail").cloned().unwrap_or(Value::Null);
     if !is_reportable(event, &detail) {
         return None;
+    }
+    if ALWAYS_REPORT.contains(&event) {
+        strip_path_fields(&mut detail);
     }
     let occurred_at = record
         .get("timestamp_ms")
@@ -184,7 +187,9 @@ fn report_from_line(line: &[u8], device_id: &str, client_version: &str, os: &str
         device_id: Some(truncate(device_id, MAX_SHORT).to_owned()),
         category: Some(category(event).to_owned()),
         gateway: pick_str(&detail, &["gateway", "gateway_id", "selected_gateway"]).map(|s| truncate(s, MAX_SHORT).to_owned()),
-        message: Some(truncate(&redact(&detail.to_string()), MAX_MESSAGE).to_owned()),
+        message: Some(
+            truncate(&redact_user_paths(&redact(&detail.to_string())), MAX_MESSAGE).to_owned(),
+        ),
         occurred_at,
     };
     validate_diagnostic_report(&report).ok()?;
@@ -241,7 +246,89 @@ const ALWAYS_REPORT: &[&str] = &[
     // 我们照样看不见它到底有没有在跑、跑了多少次:和当初让它悄悄死掉半年的
     // 盲区一模一样。这次要能看见。
     "launcher.windows_existing_app_without_cdp_restart_requested",
+    // ---- 1.3.8 新增的几个「决定/结果」事件,都不是错误,名字里也没有 fail ----
+    // 一次性清掉上游遗留设置(provider_sync / 中转配置 / 顶层 relayBaseUrl·relayApiKey)。
+    // 只有计数与布尔,没有它就说不清「有多少老用户被清过」。
+    "launcher.legacy_settings_sanitized",
+    // 启动期清扫删除残骸的结果(已改为只带计数)。限时后会出现 deferred_budget,
+    // 要靠它确认首启没有被清扫拖慢、也确认顺延的最终能做完。
+    "launcher.deleted_thread_leftover_sweep",
+    // 商店激活重试之后成功了 —— 与 windows_activation_failed 是一对,没有它算不出
+    // 退避重试到底救回了多少次。detail 里的 app_dir 由 strip_path_fields 去掉。
+    "launcher.windows_activation_recovered",
+    // 清掉了以前写进 config.toml 的保留 marketplace 条目。backup 路径同样去掉。
+    "launcher.reserved_marketplace_config_cleaned",
+    // 渲染层 app-server 请求补丁放弃重试(同 service_tier_dispatcher_patch_skipped)。
+    "renderer.app_server_request_patch_skipped",
 ];
+
+/// 这些键的值是本机路径(带用户名),白名单事件上报前整键去掉。
+fn is_path_field(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "backup"
+        || key == "home"
+        || key.ends_with("path")
+        || key.ends_with("_dir")
+        || key == "dir"
+        || key.ends_with("_paths")
+}
+
+/// 白名单事件本来就不是错误,传回来的只该是计数/状态;路径类字段一律去掉。
+fn strip_path_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|key, _| !is_path_field(key));
+            for child in map.values_mut() {
+                strip_path_fields(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_path_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 把 `\Users\<名字>\`、`/Users/<名字>/`、`/home/<名字>/` 里的用户名换成 `[user]`。
+/// 所有事件都过一遍:报错信息里常夹着完整路径(打不开某文件之类)。
+pub(crate) fn redact_user_paths(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let lower = input.to_ascii_lowercase();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &lower[i..];
+        let marker = ["users", "home"].into_iter().find(|word| {
+            rest.starts_with(word)
+                && i > 0
+                && matches!(bytes[i - 1], b'\\' | b'/')
+                && matches!(bytes.get(i + word.len()), Some(b'\\' | b'/'))
+        });
+        if let Some(word) = marker {
+            out.push_str(&input[i..i + word.len()]);
+            i += word.len();
+            // 分隔符(JSON 里的反斜杠是转义过的一对)
+            while i < bytes.len() && matches!(bytes[i], b'\\' | b'/') {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && !matches!(bytes[i], b'\\' | b'/' | b'"' | b'\'' | b' ') {
+                i += 1;
+            }
+            if i > start {
+                out.push_str("[user]");
+            }
+            continue;
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
 
 fn is_reportable(event: &str, detail: &Value) -> bool {
     let lower = event.to_ascii_lowercase();
@@ -552,6 +639,45 @@ mod tests {
         let body = &t.calls.borrow()[0].1;
         assert!(!contains_secret_marker(body), "发出去的 body 里不能再有密钥标记: {body}");
         assert!(body.contains("[redacted]"));
+    }
+
+    #[test]
+    fn new_1_3_8_decision_events_are_reported_without_paths() {
+        let lines = [
+            r#"{"timestamp_ms":0,"pid":1,"event":"launcher.legacy_settings_sanitized","detail":{"provider_sync_disabled":true,"dropped_relay_profiles":2,"legacy_relay_fields_cleared":true}}"#,
+            r#"{"timestamp_ms":0,"pid":1,"event":"launcher.deleted_thread_leftover_sweep","detail":{"status":"deferred_budget","threads_cleaned":0,"error_count":0}}"#,
+            r#"{"timestamp_ms":0,"pid":1,"event":"launcher.windows_activation_recovered","detail":{"aumid":"OpenAI.Codex_2p2nqsd0c76g0!App","app_dir":"C:\\Users\\alice\\AppData\\Local\\x","attempts":2,"history":[{"error_code":"0x80073D28"}]}}"#,
+            r#"{"timestamp_ms":0,"pid":1,"event":"launcher.reserved_marketplace_config_cleaned","detail":{"removed":["openai-curated"],"backup":"C:\\Users\\alice\\.codex\\config.toml.bak"}}"#,
+            r#"{"timestamp_ms":0,"pid":1,"event":"renderer.app_server_request_patch_skipped","detail":{"misses":8,"lastEvent":"app_server_request_assets_missing"}}"#,
+        ];
+        let log = temp_log(&lines);
+        let t = FakeTransport::returning(&[202]);
+        let out = adapter(t.clone(), None).flush_diagnostic_log(&log, "d", "1.3.8", 20);
+        assert_eq!(out.uploaded, 5, "{out:?}");
+        for (_, body) in t.calls.borrow().iter() {
+            assert!(!body.contains("alice"), "不能上报用户名: {body}");
+            assert!(!body.contains("app_dir") && !body.contains("backup"), "路径字段要去掉: {body}");
+        }
+        let calls = t.calls.borrow();
+        let recovered: Value = serde_json::from_str(&calls[2].1).unwrap();
+        assert!(recovered["message"].as_str().unwrap().contains("0x80073D28"));
+    }
+
+    #[test]
+    fn user_names_in_paths_are_redacted_for_every_event() {
+        assert_eq!(
+            redact_user_paths(r#"open C:\\Users\\alice\\.codex\\x failed"#),
+            r#"open C:\\Users\\[user]\\.codex\\x failed"#
+        );
+        assert_eq!(redact_user_paths("/Users/bob/Library/x"), "/Users/[user]/Library/x");
+        assert_eq!(redact_user_paths("/home/carol/.codex"), "/home/[user]/.codex");
+        // 不是路径段的 users/home 不动
+        assert_eq!(redact_user_paths("users home homepage"), "users home homepage");
+        let line = r#"{"timestamp_ms":0,"pid":1,"event":"launcher.spawn_failed","detail":{"error":"cannot open C:\\Users\\alice\\x"}}"#;
+        let log = temp_log(&[line]);
+        let t = FakeTransport::returning(&[202]);
+        adapter(t.clone(), None).flush_diagnostic_log(&log, "d", "1.3.8", 20);
+        assert!(!t.calls.borrow()[0].1.contains("alice"));
     }
 
     #[test]

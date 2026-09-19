@@ -56,6 +56,26 @@ fn manifest_application_id_prefers_the_main_executable() {
     assert_eq!(manifest_application_id("<Applications></Applications>"), None);
 }
 
+/// S7:小写的 `codex.exe` 是包里带的 CLI,命令执行器也不是主程序 —— 它们排在前面
+/// 时不能被 `eq_ignore_ascii_case` 当成主程序选中。
+#[test]
+fn manifest_application_id_ignores_lowercase_cli_and_command_runner() {
+    let cli_first = r#"<Applications>
+      <Application Id="CodexCli" Executable="app\resources\codex.exe"/>
+      <Application Id="CodexCoreCommandRunner" Executable="app/codex-command-runner.exe"/>
+      <Application Id="App" Executable="app/ChatGPT.exe"/>
+    </Applications>"#;
+    assert_eq!(manifest_application_id(cli_first).as_deref(), Some("App"));
+
+    // 小写 codex.exe 即便不在 resources 下也不算主程序。
+    let lowercase_cli = r#"<Application Id="Cli" Executable="app/codex.exe"/><Application Id="Main" Executable="app/Codex.exe"/>"#;
+    assert_eq!(manifest_application_id(lowercase_cli).as_deref(), Some("Main"));
+
+    // 没有主程序时,跳过辅助程序取第一个普通条目。
+    let no_main = r#"<Application Id="CodexCoreCommandRunner" Executable="app/resources/runner.exe"/><Application Id="Other" Executable="app/other.exe"/>"#;
+    assert_eq!(manifest_application_id(no_main).as_deref(), Some("Other"));
+}
+
 #[test]
 fn aumid_reads_application_id_from_the_package_manifest() {
     let temp = tempfile::tempdir().unwrap();

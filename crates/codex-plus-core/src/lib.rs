@@ -8,6 +8,7 @@ pub mod codex_local_storage;
 pub mod codex_sqlite;
 pub mod connect;
 pub mod diagnostic_log;
+pub mod existing_instance; // recodex: 第二实例只激活窗口,不杀进程不拉起
 pub mod http_client;
 pub mod install;
 pub mod launcher;

@@ -6,8 +6,9 @@ pub mod storage;
 
 pub use backup::BackupStore;
 pub use deleted_leftovers::{
-    LeftoverSweepReport, LeftoverSweepStatus, sweep_deleted_thread_leftovers,
-    sweep_deleted_thread_leftovers_at_startup,
+    LeftoverSweepReport, LeftoverSweepStatus, STARTUP_SWEEP_BUDGET, record_undone_backups,
+    sweep_deleted_thread_leftovers, sweep_deleted_thread_leftovers_at_startup,
+    sweep_deleted_thread_leftovers_within,
 };
 pub use markdown::{MarkdownExportService, export_markdown_from_paths};
 pub use provider_sync::{

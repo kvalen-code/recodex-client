@@ -748,6 +748,8 @@ pub struct LegacySettingsSanitizeReport {
     pub dropped_relay_profiles: Vec<String>,
     pub dropped_aggregate_profiles: usize,
     pub active_relay_reset: bool,
+    /// 顶层遗留字段 `relayBaseUrl` / `relayApiKey` 被清掉了。
+    pub legacy_relay_fields_cleared: bool,
     pub backup: Option<PathBuf>,
 }
 
@@ -757,6 +759,7 @@ impl LegacySettingsSanitizeReport {
             || !self.dropped_relay_profiles.is_empty()
             || self.dropped_aggregate_profiles > 0
             || self.active_relay_reset
+            || self.legacy_relay_fields_cleared
     }
 }
 
@@ -879,6 +882,24 @@ pub fn sanitize_legacy_upstream_settings_object(
     if report.dropped_aggregate_profiles > 0 {
         raw.insert("aggregateRelayProfiles".to_string(), Value::Array(Vec::new()));
     }
+    // 顶层的 relayBaseUrl / relayApiKey 是 relayProfiles 出现之前的旧存法。只清
+    // relayProfiles 不够:profiles 回到默认那一条之后,`active_relay_profile()` 的
+    // 兼容分支看到这两个字段非默认,会用它们**重新造出**一条 MixedApi + 混入 Key
+    // 的中转配置 —— 等于什么都没清。一并删掉,交回默认值。
+    let legacy_base_url = raw
+        .get("relayBaseUrl")
+        .and_then(Value::as_str)
+        .is_some_and(|url| !url.is_empty() && url != default_relay_base_url());
+    let legacy_api_key = raw
+        .get("relayApiKey")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.is_empty());
+    if legacy_base_url || legacy_api_key {
+        report.legacy_relay_fields_cleared = true;
+    }
+    // 值是默认/空的也删:无害,只是让文件干净;算不算「改动」看上面的判断。
+    raw.remove("relayBaseUrl");
+    raw.remove("relayApiKey");
     if raw
         .get("activeAggregateRelayId")
         .and_then(Value::as_str)
@@ -1414,6 +1435,8 @@ mod tests {
             "activeRelayId": "relay-chat",
             "activeAggregateRelayId": "agg-1",
             "someUnknownKey": 7,
+            "relayBaseUrl": "https://relay.example.test/v1",
+            "relayApiKey": "sk-legacy-relay",
             "relayProfiles": [
                 { "id": "default", "name": "官方", "relayMode": "official", "protocol": "responses" },
                 { "id": "relay-chat", "name": "中转", "relayMode": "pureApi", "protocol": "chatCompletions" },
@@ -1441,6 +1464,7 @@ mod tests {
         );
         assert_eq!(report.dropped_aggregate_profiles, 1);
         assert!(report.active_relay_reset);
+        assert!(report.legacy_relay_fields_cleared);
         let backup = report.backup.clone().unwrap();
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
 
@@ -1451,6 +1475,14 @@ mod tests {
         assert!(settings.aggregate_relay_profiles.is_empty());
         assert!(settings.active_aggregate_relay_id.is_empty());
         assert!(!settings.active_relay_uses_protocol_proxy());
+        // 遗留的顶层中转字段也要清掉,否则 active_relay_profile() 会拿它们
+        // 重新拼出一条 MixedApi + 混入 Key 的配置。
+        assert_eq!(settings.relay_base_url, default_relay_base_url());
+        assert!(settings.relay_api_key.is_empty());
+        let active = settings.active_relay_profile();
+        assert_eq!(active.relay_mode, RelayMode::Official);
+        assert!(!active.official_mix_api_key);
+        assert!(active.api_key.is_empty());
         assert!(settings.recodex_legacy_settings_sanitized);
         let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw["someUnknownKey"], 7, "不认识的键要原样保留");

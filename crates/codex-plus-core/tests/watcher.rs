@@ -1,5 +1,6 @@
 use codex_plus_core::watcher::{
     build_spawn_launcher_command, build_watcher_install_plan, cdp_listening, codex_process_ids,
+    codex_process_ids_with,
     disable_watcher_at, enable_watcher_at, filter_killable_launcher_processes,
     process_id_is_running, process_ids_still_running, should_recover_stale_launcher,
     watcher_disabled_flag,
@@ -111,7 +112,56 @@ fn codex_process_filter_keeps_chatgpt_desktop_package_processes() {
         ),
     ];
 
-    assert_eq!(codex_process_ids(processes), vec![21, 22]);
+    // 包里带 Codex 运行时(新版宿主)。
+    assert_eq!(codex_process_ids_with(processes, |_| true), vec![21, 22]);
+}
+
+/// S8:OpenAI.ChatGPT-Desktop 也是老的纯聊天版。包里没有 Codex 运行时
+/// (`app\resources\codex.exe`)的进程不算 Codex —— 否则「有 Codex 进程但无 CDP」
+/// 会把用户正在用的聊天窗口杀掉。OpenAI.Codex 包不受影响。
+#[test]
+fn codex_process_filter_skips_chat_only_chatgpt_desktop_packages() {
+    let processes = [
+        (
+            31,
+            r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2025.100.0_x64__abc\app\ChatGPT.exe",
+        ),
+        (
+            32,
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.915.3509.0_x64__abc\app\ChatGPT.exe",
+        ),
+    ];
+    let probed = std::cell::RefCell::new(Vec::new());
+    let ids = codex_process_ids_with(processes, |app_entry| {
+        probed.borrow_mut().push(app_entry.to_string_lossy().to_string());
+        false
+    });
+    assert_eq!(ids, vec![32]);
+    let probed = probed.into_inner();
+    // 探的是**原始大小写**的包 app 目录,只为 ChatGPT-Desktop 探。
+    assert_eq!(
+        probed,
+        vec![r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2025.100.0_x64__abc\app"]
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn codex_process_filter_checks_the_real_package_for_a_codex_runtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let windows_apps = temp.path().join("WindowsApps");
+    let chat_only = windows_apps.join("OpenAI.ChatGPT-Desktop_1.2025.100.0_x64__abc");
+    let codex_host = windows_apps.join("OpenAI.ChatGPT-Desktop_1.2026.190.0_x64__abc");
+    std::fs::create_dir_all(chat_only.join("app")).unwrap();
+    std::fs::create_dir_all(codex_host.join("app").join("resources")).unwrap();
+    std::fs::write(codex_host.join("app").join("resources").join("codex.exe"), "").unwrap();
+    let chat_exe = chat_only.join("app").join("ChatGPT.exe").to_string_lossy().to_string();
+    let host_exe = codex_host.join("app").join("ChatGPT.exe").to_string_lossy().to_string();
+
+    assert_eq!(
+        codex_process_ids([(41, chat_exe.as_str()), (42, host_exe.as_str())]),
+        vec![42]
+    );
 }
 
 #[test]
@@ -213,13 +263,15 @@ fn find_codex_processes_ignores_packaged_resource_cli_binary() {
 #[cfg(windows)]
 #[test]
 fn find_codex_processes_combines_store_and_local_installs() {
+    // 商店包用 OpenAI.Codex:ChatGPT-Desktop 包还要到磁盘上确认有没有 Codex 运行时
+    // (见 codex_process_filter_skips_chat_only_chatgpt_desktop_packages)。
     let processes = [
         WindowsProcessInfo {
             process_id: 11,
             parent_process_id: 0,
             exe_file: "ChatGPT.exe".to_string(),
             executable_path: Some(std::path::PathBuf::from(
-                r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2026.133.0_x64__abc\app\ChatGPT.exe",
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.915.3509.0_x64__abc\app\ChatGPT.exe",
             )),
         },
         WindowsProcessInfo {
@@ -273,7 +325,9 @@ fn session_index_cleanup_process_guard_blocks_desktop_apps_but_not_cli() {
         find_session_index_cleanup_blocking_processes_from_snapshot(&processes),
         vec![11, 12, 13]
     );
-    assert_eq!(find_codex_processes_from_snapshot(&processes), vec![11, 13]);
+    // 11 是 ChatGPT-Desktop 包、这里的假路径下没有 Codex 运行时:清理守卫照样挡
+    // (宁可多挡),但它不算「Codex 进程」,不会被当成无 CDP 的 Codex 处理(S8)。
+    assert_eq!(find_codex_processes_from_snapshot(&processes), vec![13]);
 }
 
 #[cfg(windows)]
