@@ -264,6 +264,31 @@ pub fn plan_uninstall_shortcut_takeover(
         .then(|| (current_exe.to_path_buf(), LEGACY_UNINSTALL_FLAG.to_string()))
 }
 
+/// 「引用改写已做完」标记的版本。v2:加入了卸载项与「卸载 ReCodex」快捷方式的接管 ——
+/// 只写过 v1 标记的机器(更早的去品牌构建跑过)不能因此永远跳过这两项判断。
+/// 改写本身幂等、只动指向本目录的项,重跑一遍没有副作用。
+const SHORTCUT_MIGRATION_MARKER_VERSION: u32 = 2;
+
+/// 与路径无关的每台机器只需一次的活(改任务栏固定项的 AppUserModelID、接管老卸载程序的
+/// 入口)做完后记一笔,免得每次启动都扫一遍开始菜单。按 exe 路径区分:开发机上
+/// target\release 下跑过一次,不能挡住正式安装那份去改它自己的项。
+pub fn shortcut_migration_marker(locks_dir: &Path, exe: &Path) -> PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in normalize_path_text(&exe.to_string_lossy()).bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    locks_dir.join(format!(
+        "shortcut-migration-v{SHORTCUT_MIGRATION_MARKER_VERSION}-{hash:016x}.done"
+    ))
+}
+
+/// 这次启动要不要跑引用改写:旧 exe 还在,或当前版本的完成标记还没写。
+/// 旧版本(v1)的标记不算完成。
+pub fn shortcut_migration_needed(legacy_exists: bool, marker: Option<&Path>) -> bool {
+    legacy_exists || !marker.is_some_and(Path::exists)
+}
+
 /// 看起来像不像一个完整的 Windows exe。迁移时同目录已有 `recodex.exe` 就用它,
 /// 但一个半截文件(上次复制到一半断电)不能拿来接班。
 pub fn plausible_windows_exe(head: &[u8], len: u64) -> bool {
@@ -1096,20 +1121,11 @@ mod windows_impl {
         Ok(true)
     }
 
-    /// 与路径无关的每台机器只需一次的活(改任务栏固定项的 AppUserModelID)做完后记一笔,
-    /// 免得每次启动都扫一遍开始菜单。按 exe 路径区分:开发机上 target\release 下跑过一次,
-    /// 不能挡住正式安装那份去改它自己的固定项。
     fn shortcut_scan_marker(exe: &Path) -> Option<PathBuf> {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in normalize_path_text(&exe.to_string_lossy()).bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-        Some(
-            crate::paths::default_app_state_dir()
-                .join("locks")
-                .join(format!("shortcut-migration-v1-{hash:016x}.done")),
-        )
+        Some(shortcut_migration_marker(
+            &crate::paths::default_app_state_dir().join("locks"),
+            exe,
+        ))
     }
 
     /// 以新名启动后的后台杂务。
@@ -1129,8 +1145,7 @@ mod windows_impl {
             }
             let legacy_exists = legacy.exists();
             let marker = shortcut_scan_marker(&exe);
-            let marker_done = marker.as_ref().is_some_and(|marker| marker.exists());
-            if legacy_exists || !marker_done {
+            if shortcut_migration_needed(legacy_exists, marker.as_deref()) {
                 let report = retarget_references(legacy, &exe);
                 if !report.shortcuts_updated.is_empty() || !report.registry_updated.is_empty() {
                     worth_logging = true;
@@ -1408,6 +1423,29 @@ mod tests {
         let changes = plan_shortcut_changes(&info, &legacy_exe(), &new_exe());
         assert_eq!(changes.target, None);
         assert_eq!(changes.icon, Some(new_exe()));
+    }
+
+    /// 更早的构建只写过 v1 标记:不能算完成,卸载项/快捷方式接管的判断照样要跑一遍;
+    /// 写过 v2 之后才跳过。旧 exe 还在时不管标记,一律要跑。
+    #[test]
+    fn a_v1_marker_no_longer_skips_the_takeover_checks() {
+        let locks = tempfile::tempdir().unwrap();
+        let exe = new_exe();
+        let marker = shortcut_migration_marker(locks.path(), &exe);
+        let name = marker.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("shortcut-migration-v2-"), "{name}");
+        // 只有 v1 标记:仍要跑
+        let v1 = locks.path().join(name.replacen("-v2-", "-v1-", 1));
+        std::fs::write(&v1, b"1").unwrap();
+        assert!(shortcut_migration_needed(false, Some(&marker)));
+        // v2 写过:跳过;旧 exe 还在:不管标记照跑
+        std::fs::write(&marker, b"1").unwrap();
+        assert!(!shortcut_migration_needed(false, Some(&marker)));
+        assert!(shortcut_migration_needed(true, Some(&marker)));
+        // 标记按 exe 路径区分
+        let other = shortcut_migration_marker(locks.path(), &p("/elsewhere/recodex.exe"));
+        assert_ne!(other, marker);
+        assert!(shortcut_migration_needed(false, Some(&other)));
     }
 
     /// 老安装包的「卸载 ReCodex」:卸载项被接管时,快捷方式改指 `recodex.exe --legacy-uninstall`。
