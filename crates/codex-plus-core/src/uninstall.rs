@@ -169,11 +169,17 @@ pub fn run_legacy_uninstall() -> anyhow::Result<()> {
     }
     crate::watcher::stop_launcher_processes_and_wait();
     detail["remote"] = json!(crate::phone_remote::uninstall_cleanup());
+    // 与 ReCodex.nsi 卸载段同一张单子:自更新(.old/.new)与旧名接班(.migrating)的残留,
+    // 不清的话最后那步删不掉安装目录
     let extra = [
         uninstaller,
         dir.join("recodex.exe.old"),
         dir.join("recodex.exe.new"),
+        dir.join("recodex.exe.migrating"),
         dir.join("codex-plus-plus.exe"),
+        dir.join("codex-plus-plus.exe.old"),
+        dir.join("codex-plus-plus.exe.new"),
+        dir.join("codex-plus-plus.exe.migrating"),
     ];
     let scheduled = schedule_delete_after_exit(&exe, &extra, Some(&dir));
     if let Err(error) = &scheduled {

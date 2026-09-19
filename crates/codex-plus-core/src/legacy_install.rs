@@ -49,6 +49,8 @@ const LEGACY_MANAGER_DATA_DIR: &str = "com.bigpizzav3.codexplusplus.manager";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShortcutInfo {
     pub target: String,
+    /// 命令行参数(目标 exe 后面那段)。
+    pub arguments: String,
     pub icon: String,
     pub app_user_model_id: String,
 }
@@ -57,13 +59,18 @@ pub struct ShortcutInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShortcutChanges {
     pub target: Option<PathBuf>,
+    /// 新的命令行参数。None = 不动原来的参数。
+    pub arguments: Option<String>,
     pub icon: Option<PathBuf>,
     pub app_user_model_id: Option<String>,
 }
 
 impl ShortcutChanges {
     pub fn is_empty(&self) -> bool {
-        self.target.is_none() && self.icon.is_none() && self.app_user_model_id.is_none()
+        self.target.is_none()
+            && self.arguments.is_none()
+            && self.icon.is_none()
+            && self.app_user_model_id.is_none()
     }
 }
 
@@ -120,6 +127,7 @@ pub fn plan_shortcut_changes(info: &ShortcutInfo, legacy: &Path, current: &Path)
     let targets_ours = targets_legacy || same_file_path(&info.target, current);
     ShortcutChanges {
         target: targets_legacy.then(|| current.to_path_buf()),
+        arguments: None,
         icon: same_file_path(&info.icon, legacy).then(|| current.to_path_buf()),
         app_user_model_id: (targets_ours
             && info.app_user_model_id == LEGACY_CODEX_WINDOW_APP_USER_MODEL_ID)
@@ -223,6 +231,37 @@ pub fn legacy_uninstall_redirect(
         return None;
     }
     Some(format!("\"{}\" {LEGACY_UNINSTALL_FLAG}", current_exe.display()))
+}
+
+/// 卸载项的 UninstallString 是不是已经是我们接管后的 `"<current>" --legacy-uninstall`
+/// (上次启动改好了注册表、快捷方式却没改成时,靠它把快捷方式补上)。
+pub fn uninstall_entry_redirected_to(
+    values: &[(String, Option<String>)],
+    install_dir: &Path,
+    current_exe: &Path,
+) -> bool {
+    if !uninstall_entry_belongs_to(values, install_dir) {
+        return false;
+    }
+    values
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("UninstallString"))
+        .and_then(|(_, value)| value.as_deref())
+        .and_then(|value| value.trim().strip_suffix(LEGACY_UNINSTALL_FLAG))
+        .is_some_and(|exe| same_file_path(exe, current_exe))
+}
+
+/// 1.3.4 前的安装包在开始菜单建的「卸载 ReCodex」快捷方式直接指着本目录的 `uninstall.exe`:
+/// 从那里卸载,与改卸载项之前一样会漏删 recodex.exe。卸载项被接管时([`legacy_uninstall_redirect`]
+/// 或 [`uninstall_entry_redirected_to`] 成立),把它改成与卸载项相同的
+/// `"<current>" --legacy-uninstall`。只动目标正是本安装目录 `uninstall.exe` 的快捷方式。
+pub fn plan_uninstall_shortcut_takeover(
+    info: &ShortcutInfo,
+    install_dir: &Path,
+    current_exe: &Path,
+) -> Option<(PathBuf, String)> {
+    same_file_path(&info.target, &install_dir.join("uninstall.exe"))
+        .then(|| (current_exe.to_path_buf(), LEGACY_UNINSTALL_FLAG.to_string()))
 }
 
 /// 看起来像不像一个完整的 Windows exe。迁移时同目录已有 `recodex.exe` 就用它,
@@ -969,28 +1008,47 @@ mod windows_impl {
     /// AppUserModelID 换成新的。幂等:已经改过的不会再动。
     fn retarget_references(legacy: &Path, current: &Path) -> RetargetReport {
         let mut report = RetargetReport::default();
+        // 卸载项接管的判断必须在下面改写 DisplayIcon **之前**:它是判断「卸载程序是老的」的唯一信号。
+        let install_dir = current.parent();
+        let uninstall_values =
+            crate::windows_integration::read_current_user_string_values(UNINSTALL_SUBKEY).ok();
+        let redirect = uninstall_values
+            .as_deref()
+            .zip(install_dir)
+            .and_then(|(values, dir)| legacy_uninstall_redirect(values, dir, current));
+        // 开始菜单「卸载 ReCodex」与卸载项同进退:这次要接管,或上次已接管(快捷方式那步失败了在重试)。
+        let uninstall_takeover = redirect.is_some()
+            || uninstall_values
+                .as_deref()
+                .zip(install_dir)
+                .is_some_and(|(values, dir)| uninstall_entry_redirected_to(values, dir, current));
         let (updated, errors) = crate::windows_integration::update_shortcuts(
             &candidate_shortcuts(),
-            |info| plan_shortcut_changes(info, legacy, current),
+            |info| {
+                let mut changes = plan_shortcut_changes(info, legacy, current);
+                if let Some(dir) = install_dir.filter(|_| uninstall_takeover) {
+                    if let Some((target, arguments)) =
+                        plan_uninstall_shortcut_takeover(info, dir, current)
+                    {
+                        changes.target = Some(target);
+                        changes.arguments = Some(arguments);
+                    }
+                }
+                changes
+            },
         );
         report.shortcuts_updated = updated.iter().map(|path| path.display().to_string()).collect();
         report.errors.extend(errors);
-        // 必须在下面改写 DisplayIcon **之前**:它是判断「卸载程序是老的」的唯一信号。
-        if let (Ok(values), Some(dir)) = (
-            crate::windows_integration::read_current_user_string_values(UNINSTALL_SUBKEY),
-            current.parent(),
-        ) {
-            if let Some(command) = legacy_uninstall_redirect(&values, dir, current) {
-                match crate::windows_integration::set_current_user_string_value(
-                    UNINSTALL_SUBKEY,
-                    "UninstallString",
-                    &command,
-                ) {
-                    Ok(()) => report
-                        .registry_updated
-                        .push(format!(r"{UNINSTALL_SUBKEY}\UninstallString")),
-                    Err(error) => report.errors.push(format!("{error:#}")),
-                }
+        if let Some(command) = redirect {
+            match crate::windows_integration::set_current_user_string_value(
+                UNINSTALL_SUBKEY,
+                "UninstallString",
+                &command,
+            ) {
+                Ok(()) => report
+                    .registry_updated
+                    .push(format!(r"{UNINSTALL_SUBKEY}\UninstallString")),
+                Err(error) => report.errors.push(format!("{error:#}")),
             }
         }
         for (subkey, name) in EXE_REFERENCES {
@@ -1327,6 +1385,7 @@ mod tests {
     fn a_shortcut_to_the_legacy_exe_is_retargeted_with_its_icon() {
         let info = ShortcutInfo {
             target: legacy_exe().to_string_lossy().into(),
+            arguments: String::new(),
             icon: legacy_exe().to_string_lossy().into(),
             app_user_model_id: String::new(),
         };
@@ -1342,12 +1401,60 @@ mod tests {
     fn the_uninstall_shortcut_only_gets_its_icon_fixed() {
         let info = ShortcutInfo {
             target: in_install("uninstall.exe"),
+            arguments: String::new(),
             icon: legacy_exe().to_string_lossy().into(),
             app_user_model_id: String::new(),
         };
         let changes = plan_shortcut_changes(&info, &legacy_exe(), &new_exe());
         assert_eq!(changes.target, None);
         assert_eq!(changes.icon, Some(new_exe()));
+    }
+
+    /// 老安装包的「卸载 ReCodex」:卸载项被接管时,快捷方式改指 `recodex.exe --legacy-uninstall`。
+    #[test]
+    fn the_uninstall_shortcut_follows_the_uninstall_entry_takeover() {
+        let info = ShortcutInfo {
+            target: in_install("uninstall.exe"),
+            arguments: String::new(),
+            icon: legacy_exe().to_string_lossy().into(),
+            app_user_model_id: String::new(),
+        };
+        assert_eq!(
+            plan_uninstall_shortcut_takeover(&info, &install_dir(), &new_exe()),
+            Some((new_exe(), "--legacy-uninstall".to_string()))
+        );
+        // 别的目录的 uninstall.exe、别的程序:不碰
+        let elsewhere = if cfg!(windows) { p(r"D:\other") } else { p("/other") };
+        assert_eq!(plan_uninstall_shortcut_takeover(&info, &elsewhere, &new_exe()), None);
+        let other = ShortcutInfo {
+            target: in_install("something-else.exe"),
+            ..info.clone()
+        };
+        assert_eq!(plan_uninstall_shortcut_takeover(&other, &install_dir(), &new_exe()), None);
+        // 已改过的(目标是 recodex.exe):不再动
+        let done = ShortcutInfo {
+            target: new_exe().to_string_lossy().into(),
+            arguments: "--legacy-uninstall".into(),
+            ..info
+        };
+        assert_eq!(plan_uninstall_shortcut_takeover(&done, &install_dir(), &new_exe()), None);
+    }
+
+    /// 上次已经改好了卸载项:快捷方式那步要能补做(认得我们写进去的命令行)。
+    #[test]
+    fn a_redirected_uninstall_entry_is_recognised() {
+        let mut entry = legacy_entry();
+        entry[2].1 = Some(in_install("recodex.exe"));
+        entry[3].1 = legacy_uninstall_redirect(&legacy_entry(), &install_dir(), &new_exe());
+        assert!(uninstall_entry_redirected_to(&entry, &install_dir(), &new_exe()));
+        // 没接管过的(老的、新安装包的)都不算
+        assert!(!uninstall_entry_redirected_to(&legacy_entry(), &install_dir(), &new_exe()));
+        let mut modern = legacy_entry();
+        modern[2].1 = Some(in_install("recodex.exe"));
+        assert!(!uninstall_entry_redirected_to(&modern, &install_dir(), &new_exe()));
+        // 别的目录那份
+        let elsewhere = if cfg!(windows) { p(r"D:\dev\target\release") } else { p("/dev/target/release") };
+        assert!(!uninstall_entry_redirected_to(&entry, &elsewhere, &elsewhere.join("recodex.exe")));
     }
 
     /// 从运行中的 Codex 窗口「固定到任务栏」时,固定项里记的是窗口的 AppUserModelID。
@@ -1357,6 +1464,7 @@ mod tests {
         for target in [legacy_exe(), new_exe()] {
             let info = ShortcutInfo {
                 target: target.to_string_lossy().into(),
+                arguments: String::new(),
                 icon: String::new(),
                 app_user_model_id: LEGACY_CODEX_WINDOW_APP_USER_MODEL_ID.into(),
             };
@@ -1375,6 +1483,7 @@ mod tests {
     fn upstream_pins_with_the_same_old_id_are_left_alone() {
         let info = ShortcutInfo {
             target: r"C:\Users\u\AppData\Local\Programs\Codex++\codex-plus-plus.exe".into(),
+            arguments: String::new(),
             icon: r"C:\Users\u\AppData\Local\Programs\Codex++\codex-plus-plus.exe".into(),
             app_user_model_id: LEGACY_CODEX_WINDOW_APP_USER_MODEL_ID.into(),
         };
@@ -1385,6 +1494,7 @@ mod tests {
     fn already_migrated_shortcuts_are_not_rewritten_again() {
         let info = ShortcutInfo {
             target: new_exe().to_string_lossy().into(),
+            arguments: String::new(),
             icon: new_exe().to_string_lossy().into(),
             app_user_model_id: CODEX_WINDOW_APP_USER_MODEL_ID.into(),
         };
@@ -1856,6 +1966,40 @@ mod tests {
         assert!(same_file_path(&seen.target, &current), "{seen:?}");
         assert!(same_file_path(&seen.icon, &current), "{seen:?}");
         assert_eq!(seen.app_user_model_id, CODEX_WINDOW_APP_USER_MODEL_ID);
+
+        // 老安装包的「卸载 ReCodex」:目标与参数一起改,读回来就是卸载项里的那条命令
+        let uninstaller = dir.path().join("uninstall.exe");
+        std::fs::write(&uninstaller, b"MZ").unwrap();
+        let uninstall_link = dir.path().join("uninstall.lnk");
+        create_shortcut(&ShortcutSpec {
+            path: uninstall_link.clone(),
+            target: uninstaller.clone(),
+            arguments: String::new(),
+            working_directory: Some(dir.path().to_path_buf()),
+            description: "test".into(),
+            icon: Some(legacy.clone()),
+            show_minimized: false,
+        })
+        .unwrap();
+        let (updated, errors) = update_shortcuts(std::slice::from_ref(&uninstall_link), |info| {
+            let mut changes = plan_shortcut_changes(info, &legacy, &current);
+            if let Some((target, arguments)) = plan_uninstall_shortcut_takeover(info, dir.path(), &current) {
+                changes.target = Some(target);
+                changes.arguments = Some(arguments);
+            }
+            changes
+        });
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(updated, vec![uninstall_link.clone()]);
+        let seen = std::cell::RefCell::new(ShortcutInfo::default());
+        let _ = update_shortcuts(std::slice::from_ref(&uninstall_link), |info| {
+            *seen.borrow_mut() = info.clone();
+            ShortcutChanges::default()
+        });
+        let seen = seen.into_inner();
+        assert!(same_file_path(&seen.target, &current), "{seen:?}");
+        assert_eq!(seen.arguments, "--legacy-uninstall");
+        assert!(same_file_path(&seen.icon, &current), "{seen:?}");
     }
 
     /// 上次认领(改名成 .merging)之后中途退出:下次要接着合并,不能把它丢成孤儿。

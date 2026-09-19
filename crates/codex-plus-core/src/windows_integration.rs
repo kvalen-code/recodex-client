@@ -191,6 +191,8 @@ pub fn update_shortcuts(
             let mut target = vec![0u16; 1024];
             // flags = 0:取长路径、不解析(Resolve 可能去搜盘、弹窗)
             let _ = shell_link.GetPath(&mut target, std::ptr::null_mut(), 0);
+            let mut arguments = vec![0u16; 1024];
+            let _ = shell_link.GetArguments(&mut arguments);
             let mut icon = vec![0u16; 1024];
             let mut icon_index = 0i32;
             let _ = shell_link.GetIconLocation(&mut icon, &mut icon_index);
@@ -202,6 +204,7 @@ pub fn update_shortcuts(
                 .unwrap_or_default();
             let info = crate::legacy_install::ShortcutInfo {
                 target: nul_terminated_wide_to_string(&target),
+                arguments: nul_terminated_wide_to_string(&arguments),
                 icon: nul_terminated_wide_to_string(&icon),
                 app_user_model_id,
             };
@@ -214,6 +217,11 @@ pub fn update_shortcuts(
                 shell_link
                     .SetPath(PCWSTR(wide_null(new_target.as_os_str()).as_ptr()))
                     .context("设置快捷方式目标失败")?;
+            }
+            if let Some(new_arguments) = &changes.arguments {
+                shell_link
+                    .SetArguments(PCWSTR(wide_null(new_arguments.as_str()).as_ptr()))
+                    .context("设置快捷方式参数失败")?;
             }
             if let Some(new_icon) = &changes.icon {
                 shell_link
