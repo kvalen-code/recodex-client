@@ -75,6 +75,9 @@ pub enum FlowEvent {
     RuntimeError(String),
     Rejected,
     Expired,
+    /// 后台把这条请求记成 `cancelled`:同一台电脑又发起了新的配对(`recodex app`,或别处再开了
+    /// 手机远程)把它顶替了。这里的确认码已作废。
+    Superseded,
     TimedOut,
     DaemonStarted,
     DaemonFailed(String),
@@ -85,6 +88,8 @@ pub const MSG_REJECTED: &str =
     "已在手机上拒绝这次连接。如果不是你本人操作请忽略;要重新连接,点「连接手机」。";
 pub const MSG_EXPIRED: &str = "确认已过期(10 分钟内没有完成),请重新连接。";
 pub const MSG_TIMED_OUT: &str = "10 分钟内没有在手机上完成确认,已取消。请重新连接。";
+/// 与命令行 errPairSuperseded 同义(桌面端的说法)。
+pub const MSG_SUPERSEDED: &str = "这次配对已在别处重新发起(这台电脑上运行了 recodex app,或在别处打开了手机远程),这里的确认码已作废。请以最新显示的确认码为准;要在这里继续,点「连接手机」。";
 
 pub fn reduce(phase: &Phase, event: FlowEvent) -> Phase {
     match event {
@@ -106,6 +111,9 @@ pub fn reduce(phase: &Phase, event: FlowEvent) -> Phase {
         },
         FlowEvent::Expired => Phase::Error {
             message: MSG_EXPIRED.into(),
+        },
+        FlowEvent::Superseded => Phase::Error {
+            message: MSG_SUPERSEDED.into(),
         },
         FlowEvent::TimedOut => Phase::Error {
             message: MSG_TIMED_OUT.into(),
@@ -558,6 +566,13 @@ async fn pair(
                         apply(generation, FlowEvent::Expired);
                         break Ok(None);
                     }
+                    Ok(Ok(s)) if s == recodex_integration::remote_pair::REMOTE_PAIR_CANCELLED => {
+                        // 被顶替(或已撤回):后台已是终态,不用再撤;别处那次配对照常进行,
+                        // 开关保持打开。
+                        settled_on_server = true;
+                        apply(generation, FlowEvent::Superseded);
+                        break Ok(None);
+                    }
                     Ok(Ok(s)) if s == recodex_integration::remote_pair::REMOTE_PAIR_APPROVED => {
                         apply(generation, FlowEvent::PhoneApproved);
                     }
@@ -958,6 +973,13 @@ mod tests {
                 message: MSG_EXPIRED.into()
             }
         );
+        assert_eq!(
+            reduce(&w, FlowEvent::Superseded),
+            Phase::Error {
+                message: MSG_SUPERSEDED.into()
+            }
+        );
+        assert!(MSG_SUPERSEDED.contains("已在别处重新发起"));
         assert_eq!(
             reduce(&w, FlowEvent::TimedOut),
             Phase::Error {

@@ -3,8 +3,11 @@
 //!
 //! 与命令行 `recodex app` 同一口径(internal/authflow/client_remote.go):
 //!   - `POST /api/cli/auth/remote/pair` body `{public_key, machine_name, platform}` → `{id, code, expires_at}`;
-//!   - `GET /api/cli/auth/remote/pair/{id}` → `{status: pending|approved|rejected|expired}`;
-//!   - `POST /api/cli/auth/remote/pair/{id}/cancel` 撤回(幂等,只认发起设备)。
+//!   - `GET /api/cli/auth/remote/pair/{id}` → `{status: pending|approved|rejected|expired|cancelled}`;
+//!   - `POST /api/cli/auth/remote/pair/{id}/cancel` 撤回:Bearer 设备令牌、body 可空(这里发 `{}`),
+//!     对发起它的设备永远 200 且幂等(pending → `cancelled`,终态原样回),别人的/不存在的 id 回 404。
+//!
+//! `cancelled` = 发起它的电脑撤回了,或同一设备又发起了新的配对把它顶替了。
 //!
 //! 服务端错误体是 `{"error":"<文本>"}`,不是结构化 code —— 这里只按状态码分流
 //! (401 → Unauthorized / 429 → RateLimited / 其余 → Unavailable),由调用方翻成人话。
@@ -17,6 +20,7 @@ pub const REMOTE_PAIR_PENDING: &str = "pending";
 pub const REMOTE_PAIR_APPROVED: &str = "approved";
 pub const REMOTE_PAIR_REJECTED: &str = "rejected";
 pub const REMOTE_PAIR_EXPIRED: &str = "expired";
+pub const REMOTE_PAIR_CANCELLED: &str = "cancelled";
 
 /// 远程组件运行时的更新渠道名(sub2api P65)。
 pub const REMOTE_UPDATE_CHANNEL: &str = "remote";
@@ -79,7 +83,7 @@ impl<T: Transport> Adapter<T> {
         Ok(created)
     }
 
-    /// 查自己发起的配对请求:pending / approved / rejected / expired。
+    /// 查自己发起的配对请求:pending / approved / rejected / expired / cancelled。
     pub fn remote_pair_status(&self, id: &str) -> Result<String, AdapterError> {
         if !valid_pair_id(id) {
             return Err(AdapterError::InvalidConfiguration(
@@ -90,7 +94,7 @@ impl<T: Transport> Adapter<T> {
         let response: RemotePairStatusResponse = self.request("GET", &path, None)?;
         match response.status.as_str() {
             REMOTE_PAIR_PENDING | REMOTE_PAIR_APPROVED | REMOTE_PAIR_REJECTED
-            | REMOTE_PAIR_EXPIRED => Ok(response.status),
+            | REMOTE_PAIR_EXPIRED | REMOTE_PAIR_CANCELLED => Ok(response.status),
             _ => Err(AdapterError::InvalidResponse(
                 "remote pair status is malformed".into(),
             )),
@@ -253,8 +257,8 @@ mod tests {
     }
 
     #[test]
-    fn status_accepts_only_the_four_states() {
-        for status in ["pending", "approved", "rejected", "expired"] {
+    fn status_accepts_only_the_five_states() {
+        for status in ["pending", "approved", "rejected", "expired", "cancelled"] {
             let a = adapter(200, &format!(r#"{{"status":"{status}"}}"#));
             assert_eq!(a.remote_pair_status("abc_DEF-1").unwrap(), status);
             assert_eq!(
@@ -285,6 +289,10 @@ mod tests {
             (calls[0].0.as_str(), calls[0].1.as_str()),
             ("POST", "/api/cli/auth/remote/pair/abc_DEF-1/cancel")
         );
+        // Bearer 设备令牌;body 与命令行一样发 `{}`(后台允许空 body)
+        assert_eq!((calls[0].2.as_str(), calls[0].3.as_str()), ("rct_testtoken", "{}"));
+        // 已是终态时后台原样回当前状态(仍是 200):同样算撤回成功
+        assert!(adapter(200, r#"{"status":"approved"}"#).remote_pair_cancel("abc").is_ok());
         assert!(adapter(200, "{}").remote_pair_cancel("../x").is_err());
         assert_eq!(
             adapter(404, "").remote_pair_cancel("abc").unwrap_err(),
