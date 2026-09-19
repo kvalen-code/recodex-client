@@ -107,14 +107,28 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    // recodex-overlay: 卸载程序调用的入口,在单实例锁与接班之前处理、做完即退出。
+    // recodex-overlay: 卸载程序调用的两个入口,都在单实例锁与接班之前处理、做完即退出。
     //   --remote-cleanup   NSIS 卸载程序:停手机远程守护进程、撤开机自启(不删数据);
+    //   --legacy-uninstall 1.3.4 前的安装留下的卸载项被改指这里(见 legacy_install),
+    //                      跑完老卸载程序后把 recodex.exe 与安装目录一并删掉。
     if args.iter().any(|arg| arg == "--remote-cleanup") {
         let notes = codex_plus_core::phone_remote::uninstall_cleanup();
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "launcher.remote_cleanup",
             json!({ "notes": notes }),
         );
+        return Ok(());
+    }
+    if args
+        .iter()
+        .any(|arg| arg == codex_plus_core::legacy_install::LEGACY_UNINSTALL_FLAG)
+    {
+        if let Err(error) = codex_plus_core::uninstall::run_legacy_uninstall() {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "launcher.legacy_uninstall_failed",
+                json!({ "error": error.to_string() }),
+            );
+        }
         return Ok(());
     }
     let helper_only = args.iter().any(|arg| arg == "--helper-only");

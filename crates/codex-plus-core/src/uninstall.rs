@@ -72,28 +72,120 @@ fn remove_appdata_dirs(warnings: &mut Vec<String>) -> usize {
 ///    进程能正常存活到删除完成。
 #[cfg(windows)]
 fn schedule_self_delete(exe: &Path) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    schedule_delete_after_exit(exe, &[], None)
+}
 
-    let exe_str = exe.to_string_lossy().to_string();
-    let bat = exe.with_extension("cleanup.bat");
-    // 最多重试 60 次(约 60 秒);删成功就跳出,最后把 .bat 自己也删掉
-    let script = format!(
+/// 清理脚本本体(纯文本,单测覆盖)。先删 `exe`(删不掉 = 还在运行,隔一秒重试,最多约 60 秒),
+/// 再删 `extra`;给了 `remove_dir` 就在最后把它(非递归,空了才删得掉)一并删掉。
+///
+/// 最后一行把「删脚本自己」与 rmdir 写在**同一行**:cmd 按行读批处理,删掉自己之后
+/// 下一行就读不到了 —— 同一行里的命令在删之前已经解析完,照样执行。
+pub fn build_cleanup_script(exe: &Path, extra: &[PathBuf], remove_dir: Option<&Path>) -> String {
+    let exe_str = exe.to_string_lossy();
+    let mut script = format!(
         "@echo off\r\n\
          for /l %%i in (1,1,60) do (\r\n\
          \x20 del /f /q \"{exe_str}\" >nul 2>&1\r\n\
          \x20 if not exist \"{exe_str}\" goto done\r\n\
          \x20 ping -n 2 127.0.0.1 >nul\r\n\
          )\r\n\
-         :done\r\n\
-         del /f /q \"%~f0\" >nul 2>&1\r\n"
+         :done\r\n"
     );
-    std::fs::write(&bat, script)?;
+    for file in extra {
+        script.push_str(&format!("del /f /q \"{}\" >nul 2>&1\r\n", file.to_string_lossy()));
+    }
+    match remove_dir {
+        Some(dir) => script.push_str(&format!(
+            "del /f /q \"%~f0\" >nul 2>&1 & rmdir \"{}\" >nul 2>&1\r\n",
+            dir.to_string_lossy()
+        )),
+        None => script.push_str("del /f /q \"%~f0\" >nul 2>&1\r\n"),
+    }
+    script
+}
+
+/// 要删目录时脚本放到临时目录、工作目录也设到临时目录 —— 否则脚本自己和 cmd 的
+/// 当前目录都会占着那个目录,rmdir 永远失败。
+#[cfg(windows)]
+fn schedule_delete_after_exit(exe: &Path, extra: &[PathBuf], remove_dir: Option<&Path>) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let bat = match remove_dir {
+        Some(_) => std::env::temp_dir().join(format!("recodex-cleanup-{}.bat", std::process::id())),
+        None => exe.with_extension("cleanup.bat"),
+    };
+    std::fs::write(&bat, build_cleanup_script(exe, extra, remove_dir))?;
     std::process::Command::new("cmd")
         .args(["/c", &bat.to_string_lossy()])
+        .current_dir(std::env::temp_dir())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
+}
+
+/// `recodex.exe --legacy-uninstall`:「程序和功能」里卸载 1.3.4 之前装的 ReCodex。
+///
+/// 卸载项的 UninstallString 由 legacy_install 在迁移时改指这里(见
+/// `legacy_install::legacy_uninstall_redirect`)。做的事:
+///   1. 原地跑老的 `uninstall.exe`(`_?=<目录>`:NSIS 默认会把自己拷到临时目录后立刻返回,
+///      带上它才会在原处跑、并等它结束)—— 确认页、删快捷方式和注册表都照旧由它做;
+///   2. 卸载项还在 = 用户在确认页点了取消(或它失败了):什么都不删,原样退出;
+///   3. 卸载项没了:停掉其它还在跑的 ReCodex、停手机远程守护进程并撤开机自启,
+///      再安排删除 recodex.exe、老卸载程序与安装目录(非递归,里面还有别的东西就留着)。
+///
+/// 老卸载程序已经不在了(被人手动删过)时直接走第 3 步,并替它删掉快捷方式与卸载项 ——
+/// 用户是在「程序和功能」里点了卸载的,不能让他卡在一个卸不掉的条目上。
+#[cfg(windows)]
+pub fn run_legacy_uninstall() -> anyhow::Result<()> {
+    const UNINSTALL_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ReCodex";
+    let exe = std::env::current_exe()?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("无法定位安装目录"))?
+        .to_path_buf();
+    let uninstaller = dir.join("uninstall.exe");
+    let mut detail = json!({ "uninstaller_present": uninstaller.is_file() });
+    if uninstaller.is_file() {
+        let status = std::process::Command::new(&uninstaller)
+            .arg(format!("_?={}", dir.display()))
+            .current_dir(std::env::temp_dir())
+            .status()?;
+        detail["uninstaller_exit"] = json!(status.code());
+        let still_registered =
+            crate::windows_integration::read_current_user_string_values(UNINSTALL_SUBKEY)
+                .is_ok_and(|values| !values.is_empty());
+        if still_registered {
+            detail["cancelled"] = json!(true);
+            let _ = crate::diagnostic_log::append_diagnostic_log("launcher.legacy_uninstall", detail);
+            return Ok(());
+        }
+    } else {
+        let result =
+            crate::install::uninstall_entrypoints(&crate::install::InstallOptions::default());
+        detail["entrypoints"] = json!(result.status);
+        let _ = crate::windows_integration::delete_current_user_key(UNINSTALL_SUBKEY);
+        let _ = crate::windows_integration::delete_current_user_key(r"Software\ReCodex");
+    }
+    crate::watcher::stop_launcher_processes_and_wait();
+    detail["remote"] = json!(crate::phone_remote::uninstall_cleanup());
+    let extra = [
+        uninstaller,
+        dir.join("recodex.exe.old"),
+        dir.join("recodex.exe.new"),
+        dir.join("codex-plus-plus.exe"),
+    ];
+    let scheduled = schedule_delete_after_exit(&exe, &extra, Some(&dir));
+    if let Err(error) = &scheduled {
+        detail["error"] = json!(error.to_string());
+    }
+    let _ = crate::diagnostic_log::append_diagnostic_log("launcher.legacy_uninstall", detail);
+    scheduled.map_err(Into::into)
+}
+
+#[cfg(not(windows))]
+pub fn run_legacy_uninstall() -> anyhow::Result<()> {
+    anyhow::bail!("--legacy-uninstall 只用于 Windows")
 }
 
 #[cfg(not(windows))]
@@ -251,6 +343,30 @@ mod tests {
             perform.contains("phone_remote::uninstall_cleanup()"),
             "必须停手机远程守护进程并撤开机自启,否则卸完每次开机都去拉一个已删除的运行时"
         );
+    }
+
+    #[test]
+    fn cleanup_script_removes_extra_files_and_the_directory_on_one_final_line() {
+        let dir = PathBuf::from(r"C:\Users\u\AppData\Local\Programs\ReCodex");
+        let script = build_cleanup_script(
+            &dir.join("recodex.exe"),
+            &[dir.join("uninstall.exe")],
+            Some(&dir),
+        );
+        assert!(script.starts_with("@echo off\r\n"));
+        assert!(script.contains("del /f /q \"C:\\Users\\u\\AppData\\Local\\Programs\\ReCodex\\recodex.exe\""));
+        assert!(script.contains("del /f /q \"C:\\Users\\u\\AppData\\Local\\Programs\\ReCodex\\uninstall.exe\" >nul 2>&1\r\n"));
+        // 删脚本自己与 rmdir 必须在同一行(删了自己之后 cmd 读不到下一行)
+        let last = script.trim_end().lines().last().unwrap();
+        assert_eq!(
+            last,
+            "del /f /q \"%~f0\" >nul 2>&1 & rmdir \"C:\\Users\\u\\AppData\\Local\\Programs\\ReCodex\" >nul 2>&1"
+        );
+        // 不递归删目录:用户放在里面的东西不能跟着没了
+        assert!(!script.contains("/s"));
+        let plain = build_cleanup_script(&dir.join("recodex.exe"), &[], None);
+        assert!(plain.trim_end().ends_with("del /f /q \"%~f0\" >nul 2>&1"));
+        assert!(!plain.contains("rmdir"));
     }
 
     /// 设备 ID 留在磁盘上,重装后会拿一个**已被服务端吊销**的身份去登录。

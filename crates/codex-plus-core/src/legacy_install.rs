@@ -175,6 +175,53 @@ pub fn uninstall_entry_belongs_to(values: &[(String, Option<String>)], install_d
     })
 }
 
+/// 启动器用来接管「老卸载程序」的命令行参数。
+pub const LEGACY_UNINSTALL_FLAG: &str = "--legacy-uninstall";
+
+/// 1.3.4 之前的安装包写的卸载项,要不要改指我们自己的 `--legacy-uninstall`。
+///
+/// 背景:老安装包生成的 `uninstall.exe` 只认得 `codex-plus-plus.exe` —— 它删旧名 exe、
+/// 快捷方式和注册表,却不知道迁移后多出来的 `recodex.exe`,于是「程序和功能」里卸载完,
+/// 新名 exe 和安装目录留在磁盘上。那个卸载程序是 NSIS 编出来的,改不了它本身,
+/// 只能把卸载项的 UninstallString 换成 `"<目录>\recodex.exe" --legacy-uninstall`:
+/// 由我们原地跑一遍老卸载程序(界面、确认页照旧),它确认卸完后再删掉 recodex.exe 与目录。
+///
+/// 只在三件事同时成立时才改(任何一条不满足都返回 None,什么都不动):
+///   1. 卸载项属于**这个**安装目录(别处还有一份 ReCodex 的不碰);
+///   2. UninstallString 就是本目录的 `uninstall.exe`(已经改过的、或别的写法都不碰);
+///   3. DisplayIcon 还指着本目录的旧名 exe —— 只有老安装包会这么写,新安装包写的是
+///      recodex.exe。这是「卸载程序是老的」唯一可靠的信号,所以必须在迁移改写 DisplayIcon
+///      **之前**判断(retarget_references 里就是这个顺序)。
+pub fn legacy_uninstall_redirect(
+    values: &[(String, Option<String>)],
+    install_dir: &Path,
+    current_exe: &Path,
+) -> Option<String> {
+    if !uninstall_entry_belongs_to(values, install_dir) {
+        return None;
+    }
+    let value_of = |key: &str| {
+        values
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .and_then(|(_, value)| value.clone())
+    };
+    let uninstall = value_of("UninstallString")?;
+    if !same_file_path(&uninstall, &install_dir.join("uninstall.exe")) {
+        return None;
+    }
+    let icon = value_of("DisplayIcon")?;
+    // DisplayIcon 可能带 ",0" 之类的图标序号
+    let icon = match icon.rsplit_once(',') {
+        Some((path, index)) if index.trim().parse::<i32>().is_ok() => path.to_string(),
+        _ => icon,
+    };
+    if !same_file_path(&icon, &install_dir.join(exe_file_name(LEGACY_SILENT_BINARY))) {
+        return None;
+    }
+    Some(format!("\"{}\" {LEGACY_UNINSTALL_FLAG}", current_exe.display()))
+}
+
 /// 看起来像不像一个完整的 Windows exe。迁移时同目录已有 `recodex.exe` 就用它,
 /// 但一个半截文件(上次复制到一半断电)不能拿来接班。
 pub fn plausible_windows_exe(head: &[u8], len: u64) -> bool {
@@ -675,6 +722,24 @@ mod windows_impl {
         );
         report.shortcuts_updated = updated.iter().map(|path| path.display().to_string()).collect();
         report.errors.extend(errors);
+        // 必须在下面改写 DisplayIcon **之前**:它是判断「卸载程序是老的」的唯一信号。
+        if let (Ok(values), Some(dir)) = (
+            crate::windows_integration::read_current_user_string_values(UNINSTALL_SUBKEY),
+            current.parent(),
+        ) {
+            if let Some(command) = legacy_uninstall_redirect(&values, dir, current) {
+                match crate::windows_integration::set_current_user_string_value(
+                    UNINSTALL_SUBKEY,
+                    "UninstallString",
+                    &command,
+                ) {
+                    Ok(()) => report
+                        .registry_updated
+                        .push(format!(r"{UNINSTALL_SUBKEY}\UninstallString")),
+                    Err(error) => report.errors.push(format!("{error:#}")),
+                }
+            }
+        }
         for (subkey, name) in EXE_REFERENCES {
             let Ok(values) = crate::windows_integration::read_current_user_string_values(subkey) else {
                 continue;
@@ -988,6 +1053,58 @@ mod tests {
         );
         // 已经是新名:幂等
         assert_eq!(replace_exe_path(&new_exe().to_string_lossy(), &legacy, &new_exe()), None);
+    }
+
+    fn legacy_entry() -> Vec<(String, Option<String>)> {
+        // 1.3.4 之前的安装包写的样子(见 ReCodex.nsi 的历史版本)
+        vec![
+            ("DisplayName".to_string(), Some("ReCodex".to_string())),
+            ("DisplayVersion".to_string(), Some("1.2.60".to_string())),
+            ("DisplayIcon".to_string(), Some(in_install("codex-plus-plus.exe"))),
+            ("UninstallString".to_string(), Some(in_install("uninstall.exe"))),
+            ("Publisher".to_string(), Some("ReCodex".to_string())),
+        ]
+    }
+
+    #[test]
+    fn legacy_uninstaller_is_redirected_to_our_own_flag() {
+        let command = legacy_uninstall_redirect(&legacy_entry(), &install_dir(), &new_exe())
+            .expect("老安装包写的卸载项应当被接管");
+        assert_eq!(command, format!("\"{}\" --legacy-uninstall", new_exe().display()));
+        // 带引号的 UninstallString、带图标序号的 DisplayIcon 也认
+        let mut quoted = legacy_entry();
+        quoted[2].1 = Some(format!("{},0", in_install("codex-plus-plus.exe")));
+        quoted[3].1 = Some(format!("\"{}\"", in_install("uninstall.exe")));
+        assert!(legacy_uninstall_redirect(&quoted, &install_dir(), &new_exe()).is_some());
+    }
+
+    #[test]
+    fn new_installer_entries_are_left_alone() {
+        // 1.3.4+ 的安装包:DisplayIcon 就是 recodex.exe,卸载程序本身认得新名 —— 不动
+        let mut modern = legacy_entry();
+        modern[2].1 = Some(in_install("recodex.exe"));
+        assert_eq!(legacy_uninstall_redirect(&modern, &install_dir(), &new_exe()), None);
+    }
+
+    #[test]
+    fn already_redirected_or_foreign_entries_are_left_alone() {
+        // 已经改过:幂等
+        let mut done = legacy_entry();
+        done[3].1 = Some(format!("\"{}\" --legacy-uninstall", new_exe().display()));
+        assert_eq!(legacy_uninstall_redirect(&done, &install_dir(), &new_exe()), None);
+        // 别的目录里的另一份 ReCodex(比如开发机 target\release 跑起来的):不碰正式安装的卸载项
+        let elsewhere = if cfg!(windows) { p(r"D:\dev\target\release") } else { p("/dev/target/release") };
+        assert_eq!(
+            legacy_uninstall_redirect(&legacy_entry(), &elsewhere, &elsewhere.join("recodex.exe")),
+            None
+        );
+        // 卸载项里缺字段:不猜
+        let partial: Vec<_> = legacy_entry().into_iter().filter(|(name, _)| name != "DisplayIcon").collect();
+        assert_eq!(legacy_uninstall_redirect(&partial, &install_dir(), &new_exe()), None);
+        // UninstallString 指向别的程序:不碰
+        let mut other = legacy_entry();
+        other[3].1 = Some(in_install("something-else.exe"));
+        assert_eq!(legacy_uninstall_redirect(&other, &install_dir(), &new_exe()), None);
     }
 
     #[test]
