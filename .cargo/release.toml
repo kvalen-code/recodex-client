@@ -17,10 +17,23 @@
 #
 # 别在发布 CI 里设 RUSTFLAGS 环境变量:它会整体覆盖这里的值。发布 CI 在构建后有一步
 # 自检,exe 里再出现 `crates\codex-plus-*` 就失败。
+#
+# 依赖(crates.io)的源码路径是 `$CARGO_HOME\registry\src\index.crates.io-*\<crate>\...`
+# 的绝对路径,同样会编进 exe(实测 800 多处)—— 本机构建就是 `C:\Users\<用户名>\.cargo\...`,
+# 把构建者的用户名带出去。remap 只认字面前缀、cargo 配置里又不能展开环境变量,
+# 所以这里只能写死已知构建机的 CARGO_HOME(下面两条:GitHub 的 Windows / macOS runner)。
+# **本机出货构建**要再追加一条指向自己 CARGO_HOME 的(数组会与本文件合并,不是覆盖):
+#
+#     cargo build --release -p codex-plus-launcher --config .cargo/release.toml `
+#       --config "build.rustflags=['--remap-path-prefix=$env:USERPROFILE\.cargo=cargo']"
+#
+# (bash:`--config "build.rustflags=['--remap-path-prefix=$HOME/.cargo=cargo']"`)
 [build]
 rustflags = [
     "--remap-path-prefix=crates/codex-plus-core=recodex/core",
     "--remap-path-prefix=crates/codex-plus-data=recodex/data",
     "--remap-path-prefix=crates/recodex-integration=recodex/integration",
     "--remap-path-prefix=apps/codex-plus-launcher=recodex/launcher",
+    "--remap-path-prefix=C:\\Users\\runneradmin\\.cargo=cargo",
+    "--remap-path-prefix=/Users/runner/.cargo=cargo",
 ]
