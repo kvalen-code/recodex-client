@@ -144,9 +144,13 @@ pub fn create_shortcut(spec: &ShortcutSpec) -> anyhow::Result<()> {
 
 /// 逐个读取 .lnk,让 `decide` 决定要不要改、改成什么,需要改的就写回。
 ///
-/// COM 只初始化一次(扫开始菜单可能上百个文件)。单个文件读不了/写不了只记进
+/// COM 只初始化一次(扫开始菜单可能上百个文件)。单个文件写不了只记进
 /// 返回的错误列表,不影响其余文件 —— 调用方(启动时的旧名迁移)要的是「尽量改」,
 /// 不是「全有或全无」。返回 (改写成功的路径, 错误说明)。
+///
+/// **读不了的 .lnk 不算错误**(见 [`crate::legacy_install::shortcut_failure_counts`]):
+/// 开始菜单里总有几个坏链接/没权限的文件,和我们毫无关系;算错误的话调用方永远
+/// 写不上「已完成」标记、也永远不删旧 exe,每次启动都重扫几千个文件。
 #[cfg(windows)]
 pub fn update_shortcuts(
     paths: &[PathBuf],
@@ -165,10 +169,13 @@ pub fn update_shortcuts(
         }
     };
     for path in paths {
+        use crate::legacy_install::ShortcutFailureStage as Stage;
+        let mut stage = Stage::Setup;
         let result: anyhow::Result<bool> = (|| unsafe {
             let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
                 .context("创建 ShellLink COM 对象失败")?;
             let persist_file: IPersistFile = shell_link.cast().context("获取 IPersistFile 失败")?;
+            stage = Stage::Read;
             let wide_path = wide_null(path.as_os_str());
             // 要改 AppUserModelID 就得以读写方式打开(只读打开时属性存储 SetValue 报
             // STG_E_ACCESSDENIED);只读文件打不开读写就退回只读 —— 至少还能判断要不要改。
@@ -202,6 +209,7 @@ pub fn update_shortcuts(
             if changes.is_empty() {
                 return Ok(false);
             }
+            stage = Stage::Write;
             if let Some(new_target) = &changes.target {
                 shell_link
                     .SetPath(PCWSTR(wide_null(new_target.as_os_str()).as_ptr()))
@@ -227,7 +235,10 @@ pub fn update_shortcuts(
         match result {
             Ok(true) => updated.push(path.clone()),
             Ok(false) => {}
-            Err(error) => errors.push(format!("{}:{error:#}", path.display())),
+            Err(error) if crate::legacy_install::shortcut_failure_counts(stage) => {
+                errors.push(format!("{}:{error:#}", path.display()))
+            }
+            Err(_) => {}
         }
     }
     (updated, errors)

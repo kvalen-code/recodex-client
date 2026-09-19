@@ -8,10 +8,13 @@
 //! 这里在启动时替用户做安装包会做的那几件事,**任何一步失败都只记日志、照常运行**:
 //!
 //! 1. 以旧名启动时([`handoff_from_legacy_binary`]):把自己复制成同目录的 `recodex.exe`,
-//!    改写指向旧 exe 的快捷方式与注册表项,然后从新名重新拉起、本进程退出;
-//! 2. 以新名启动时([`spawn_startup_housekeeping`],后台线程):同目录里还躺着旧 exe 就
-//!    再改写一遍引用(幂等)并删掉它;任务栏固定项里的旧 AppUserModelID 换成新的;
-//!    卸载项的 DisplayVersion 跟上当前版本;清理确认已迁移完的旧数据残留。
+//!    从新名拉起,**确认新进程真的活着并拿到了单实例锁**才退出。这一步**不改任何入口**
+//!    (快捷方式/固定项/注册表):没签名的包被杀软拦下或秒杀时,入口还指着能用的旧 exe。
+//!    确认不了就杀掉新进程、删掉复制品、以旧名照常运行,并退避 7 天不再尝试;
+//! 2. 以新名启动、拿到单实例锁之后([`spawn_startup_housekeeping`],后台线程):先等新
+//!    exe 稳定跑一会儿,再把指向旧 exe 的引用改过来(幂等)、改全了才删旧 exe;任务栏
+//!    固定项里的旧 AppUserModelID 换成新的;开机自启项改用新名字;卸载项的
+//!    DisplayVersion 跟上当前版本;清理确认已迁移完的旧数据残留。
 //!
 //! 旧名识别(`LEGACY_SILENT_BINARY`、watcher 里的进程匹配)一律保留 —— 迁移失败的
 //! 机器还会以旧名跑下去,新代码必须认得自己。
@@ -180,6 +183,106 @@ pub fn uninstall_entry_belongs_to(values: &[(String, Option<String>)], install_d
 pub fn plausible_windows_exe(head: &[u8], len: u64) -> bool {
     const MIN_PLAUSIBLE_SIZE: u64 = 64 * 1024;
     head.starts_with(b"MZ") && len >= MIN_PLAUSIBLE_SIZE
+}
+
+/// 更新快捷方式时一个文件在哪一步失败了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutFailureStage {
+    /// COM 对象都建不出来:环境问题,哪个快捷方式都判断不了
+    Setup,
+    /// 读 .lnk 失败:开始菜单里的坏链接、没权限的文件,和我们无关
+    Read,
+    /// 读出来确实要改,但写回失败
+    Write,
+}
+
+/// 这一类失败算不算「引用没改全」。算的话调用方不写完成标记、不删旧 exe。
+///
+/// 读不了的 .lnk 不算:否则一个无关的坏链接就让迁移永远完不成、每次启动都重扫
+/// 几千个文件。代价是一个恰好指向旧 exe 又恰好读不了的快捷方式会在旧 exe 删掉后失效 ——
+/// 读不了的快捷方式用户本来也点不开。
+pub fn shortcut_failure_counts(stage: ShortcutFailureStage) -> bool {
+    !matches!(stage, ShortcutFailureStage::Read)
+}
+
+/// 接班失败后多久内不再尝试。每次启动都复制 20 MB、拉起、被杀、回退,
+/// 既拖慢启动又会反复触发杀软告警。
+pub const HANDOFF_BACKOFF_SECS: u64 = 7 * 24 * 3600;
+
+/// 上次接班失败的时间(unix 秒)在退避期内吗。
+///
+/// 记录在「未来」(用户把系统时间往回调过)一律视为过期 —— 否则可能一辈子不再尝试。
+pub fn handoff_backoff_active(last_failure_unix: Option<u64>, now_unix: u64) -> bool {
+    last_failure_unix
+        .is_some_and(|last| last <= now_unix && now_unix - last < HANDOFF_BACKOFF_SECS)
+}
+
+/// 退避记录文件的内容:第一行是失败时间的 unix 秒,其余(失败原因)忽略。
+pub fn parse_handoff_backoff(text: &str) -> Option<u64> {
+    text.lines().next()?.trim().parse().ok()
+}
+
+/// 等新进程报到的上限。新进程要先同步托管配置、跟随推荐模型(网络,各自有 5~10 秒
+/// 超时),由自更新重启时还要等旧 launcher 让出单实例锁(最多约 10 秒),然后才拿锁
+/// 报到 —— 给短了会把一个健康但网络慢的新进程误杀。只有失败路径才会等满,
+/// 成功路径新进程早就在前台干活了。
+pub const HANDOFF_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+/// 报到之后还要再活这么久才算接班成功:杀软的启发式查杀常在进程起来后一两秒动手。
+pub const HANDOFF_READY_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 等新进程接班时每一轮的判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffVerdict {
+    Waiting,
+    Confirmed,
+    Failed(&'static str),
+}
+
+/// - `ready_for`:新进程报到(拿到单实例锁)之后过了多久;没报到是 None;
+/// - `child_alive`:新进程此刻还在不在;
+/// - `elapsed`:从拉起到现在。
+///
+/// 进程没了就是失败 —— 不管报没报到(报到后秒退多半是被杀软查杀)。
+/// 报到后活过宽限期才算成功。没报到、超时也是失败。
+pub fn judge_handoff(
+    ready_for: Option<std::time::Duration>,
+    child_alive: bool,
+    elapsed: std::time::Duration,
+) -> HandoffVerdict {
+    if !child_alive {
+        return HandoffVerdict::Failed(if ready_for.is_some() {
+            "exited_after_ready"
+        } else {
+            "exited_before_ready"
+        });
+    }
+    match ready_for {
+        Some(ready_for) if ready_for >= HANDOFF_READY_GRACE => HandoffVerdict::Confirmed,
+        Some(_) => HandoffVerdict::Waiting,
+        None if elapsed >= HANDOFF_READY_TIMEOUT => HandoffVerdict::Failed("ready_timeout"),
+        None => HandoffVerdict::Waiting,
+    }
+}
+
+/// 旧名 exe 接班时通过这个环境变量把「报到文件」的路径交给新进程。
+/// 新进程拿到单实例锁后往里写 `ready`;文件由旧进程事先建好、事后删掉,
+/// 所以继承了这个变量的后代进程(Codex、自更新重启出来的 launcher)找不到文件就什么都不写。
+const HANDOFF_READY_ENV: &str = "RECODEX_LEGACY_HANDOFF_READY";
+const HANDOFF_READY_CONTENT: &[u8] = b"ready";
+
+/// 以新名运行、拿到锁之后:同目录旧 exe 还在时,先等这么久再去改入口、删旧 exe。
+/// 新 exe 若在这段时间里被杀软干掉,入口还都指着旧 exe,用户点了照样能用。
+#[cfg_attr(not(windows), allow(dead_code))]
+const RETARGET_SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 开机自启项(注册表 Run 值 / 启动文件夹快捷方式)的值里提到的是不是我们的 exe
+/// (旧名或新名、同一安装目录)。上游 Codex++ 用的是同一个名字,不是我们的不碰。
+pub fn autostart_value_is_ours(value: &str, legacy: &Path, current: &Path) -> bool {
+    let haystack = value.replace('/', "\\").to_ascii_lowercase();
+    [legacy, current].iter().any(|exe| {
+        let needle = normalize_path_text(&exe.to_string_lossy());
+        !needle.is_empty() && haystack.contains(&needle)
+    })
 }
 
 /// 旧数据目录里这些东西都是可再生的(状态快照、日志、锁),不算「有没迁移的数据」。
@@ -366,9 +469,11 @@ pub fn upstream_codexplusplus_present() -> bool {
 
 /// 以旧名启动时迁移到新名,并从新名重新拉起。
 ///
-/// 返回 true 表示新进程已经拉起,调用方应**立即退出**(不要再去抢单实例锁、启动 Codex);
-/// 返回 false 表示照常以当前身份继续运行 —— 不是旧名、不在 Windows、或者迁移中途失败。
-/// 失败一律只写诊断日志,下次启动会再试。
+/// 返回 true 表示新进程已经拉起**并确认接班**(拿到了单实例锁、活过了宽限期),
+/// 调用方应**立即退出**(不要再去抢单实例锁、启动 Codex);
+/// 返回 false 表示照常以当前身份继续运行 —— 不是旧名、不在 Windows、已有实例在跑、
+/// 处于失败退避期、或者这次接班没成功(新进程已被清理,[`HANDOFF_BACKOFF_SECS`] 内不再试)。
+/// 这一步不改任何快捷方式/注册表,失败了用户的入口也原样可用。
 pub fn handoff_from_legacy_binary(args: &[String]) -> bool {
     #[cfg(windows)]
     {
@@ -383,7 +488,11 @@ pub fn handoff_from_legacy_binary(args: &[String]) -> bool {
 
 /// 启动后的后台杂务:清理旧 exe、改写旧引用、同步卸载项版本、清理旧数据残留。
 /// 全部在后台线程里做,不拖慢启动;失败只写诊断日志。
+///
+/// **只能由拿到单实例锁的进程调用**:两个实例同时改快捷方式、删旧 exe 会互相踩。
+/// 同时它也是旧名接班的「报到」点 —— 拿到锁、走到这里,就告诉等在外面的旧进程可以退了。
 pub fn spawn_startup_housekeeping() {
+    announce_handoff_ready();
     let _ = std::thread::Builder::new()
         .name("recodex-legacy-housekeeping".to_string())
         .spawn(|| {
@@ -391,6 +500,17 @@ pub fn spawn_startup_housekeeping() {
             windows_impl::housekeeping();
             cleanup_legacy_data_leftovers();
         });
+}
+
+/// 由旧名接班拉起时,告诉等着的旧进程「我已拿到单实例锁」。
+/// 报到文件由旧进程事先建好;不存在(不是接班拉起、或旧进程已放弃)就什么都不做。
+fn announce_handoff_ready() {
+    let Some(path) = std::env::var_os(HANDOFF_READY_ENV).map(PathBuf::from) else {
+        return;
+    };
+    if path.is_file() {
+        let _ = std::fs::write(&path, HANDOFF_READY_CONTENT);
+    }
 }
 
 /// 自更新就位后调用:卸载项里的版本号跟上。只在卸载项属于当前安装目录时才写。
@@ -498,11 +618,12 @@ mod windows_impl {
 
     const UNINSTALL_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ReCodex";
     /// 可能引用了旧 exe 路径的注册表项:(子键, 值名)。都只在值确实提到旧 exe 时才改。
-    const EXE_REFERENCES: [(&str, &str); 6] = [
+    const EXE_REFERENCES: [(&str, &str); 7] = [
         (UNINSTALL_SUBKEY, "DisplayIcon"),
         (UNINSTALL_SUBKEY, "UninstallString"),
         (UNINSTALL_SUBKEY, "QuietUninstallString"),
-        // 从 Codex++ 迁移过来的机器上,开机自启项可能指着这个 exe
+        // 从 Codex++ 迁移过来的机器上,开机自启项可能指着这个 exe(新旧两个名字都看)
+        (crate::watcher::WATCHER_RUN_KEY, crate::watcher::LEGACY_WATCHER_RUN_NAME),
         (crate::watcher::WATCHER_RUN_KEY, crate::watcher::WATCHER_RUN_NAME),
         (r"Software\Classes\codexplusplus\shell\open\command", ""),
         (r"Software\Classes\dreamskin\shell\open\command", ""),
@@ -540,7 +661,41 @@ mod windows_impl {
         registry || default_dir || running
     }
 
-    /// 以旧名启动时:备好新名 exe → 改写引用 → 从新名拉起。
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default()
+    }
+
+    fn handoff_backoff_path() -> PathBuf {
+        crate::paths::default_app_state_dir()
+            .join("locks")
+            .join("legacy-handoff-backoff")
+    }
+
+    /// 单实例锁现在是不是空着。带 `--await-guard`(自更新重启拉起)时旧 launcher 还要
+    /// 一两秒才退,等它最多约 10 秒 —— 和 main.rs 里 acquire_guard_maybe_waiting 一样。
+    ///
+    /// 被占着就不接班:新进程拿不到锁只会去激活已有实例然后退出,永远等不到报到,
+    /// 会被误判成失败而进入退避。交给旧名这次照常走「激活已有实例」即可。
+    fn single_instance_lock_free(args: &[String]) -> bool {
+        let attempts = if args.iter().any(|arg| arg == "--await-guard") { 40 } else { 1 };
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            // 拿到就立刻放掉(临时值当场 drop),留给新进程
+            if crate::ports::acquire_resilient_loopback_port_guard(crate::ports::launcher_guard_port())
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 以旧名启动时:备好新名 exe → 从新名拉起 → 等它报到。**不改任何入口。**
     pub(super) fn handoff(args: &[String]) -> bool {
         let Ok(exe) = std::env::current_exe() else {
             return false;
@@ -548,28 +703,121 @@ mod windows_impl {
         let Some(target) = legacy_handoff_target(&exe) else {
             return false;
         };
+        let backoff_path = handoff_backoff_path();
+        let last_failure = std::fs::read_to_string(&backoff_path)
+            .ok()
+            .and_then(|text| parse_handoff_backoff(&text));
+        if handoff_backoff_active(last_failure, unix_now()) {
+            return false;
+        }
+        if !single_instance_lock_free(args) {
+            return false;
+        }
+
         let mut detail = json!({ "from": exe, "to": target });
+        let mut copied = false;
         let outcome = (|| -> anyhow::Result<()> {
-            let copied = ensure_target_binary(&exe, &target)?;
+            copied = ensure_target_binary(&exe, &target)?;
             detail["copied"] = json!(copied);
-            let report = retarget_references(&exe, &target);
-            detail["shortcuts_updated"] = json!(report.shortcuts_updated);
-            detail["registry_updated"] = json!(report.registry_updated);
-            if !report.errors.is_empty() {
-                // 引用没改全不阻止接班:新 exe 接班后还会再改一遍(幂等),
-                // 旧 exe 在引用改全之前不会被删。
-                detail["reference_errors"] = json!(report.errors);
+            match spawn_and_confirm(&target, args, &mut detail)? {
+                HandoffVerdict::Confirmed => Ok(()),
+                HandoffVerdict::Failed(reason) => anyhow::bail!("新进程没有接班:{reason}"),
+                HandoffVerdict::Waiting => anyhow::bail!("新进程没有接班:waiting"),
             }
-            spawn_detached(&target, args)?;
-            Ok(())
         })();
         let handed_off = outcome.is_ok();
         if let Err(error) = outcome {
             detail["error"] = json!(format!("{error:#}"));
+            // 复制品是我们放的才删;同目录原本就有的 recodex.exe(新安装包装的)不碰
+            if copied {
+                detail["copy_removed"] = json!(remove_file_with_retry(&target));
+            }
+            if let Some(parent) = backoff_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&backoff_path, format!("{}\n{error:#}\n", unix_now()));
+            detail["retry_after_secs"] = json!(HANDOFF_BACKOFF_SECS);
+        } else {
+            let _ = std::fs::remove_file(&backoff_path);
         }
         detail["handed_off"] = json!(handed_off);
         let _ = crate::diagnostic_log::append_diagnostic_log("launcher.legacy_binary_handoff", detail);
         handed_off
+    }
+
+    /// 拉起新进程,等它报到并活过宽限期。确认不了就把它杀掉(还活着的话)。
+    /// 只返回终局(Confirmed / Failed)。
+    fn spawn_and_confirm(
+        target: &Path,
+        args: &[String],
+        detail: &mut serde_json::Value,
+    ) -> anyhow::Result<HandoffVerdict> {
+        let ready_file = crate::paths::default_app_state_dir().join("locks").join(format!(
+            "legacy-handoff-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        if let Some(parent) = ready_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&ready_file, b"")?;
+        let mut child = match spawn_detached(target, args, &ready_file) {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(&ready_file);
+                return Err(error.into());
+            }
+        };
+        // 新进程要把 Codex 窗口带到前台;我们是用户刚点开的前台进程,把这个权利让给它
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(child.id());
+        }
+        let started = std::time::Instant::now();
+        let mut ready_at: Option<std::time::Instant> = None;
+        let verdict = loop {
+            if ready_at.is_none()
+                && std::fs::read(&ready_file).is_ok_and(|bytes| bytes == HANDOFF_READY_CONTENT)
+            {
+                ready_at = Some(std::time::Instant::now());
+            }
+            let alive = matches!(child.try_wait(), Ok(None));
+            let verdict = judge_handoff(ready_at.map(|at| at.elapsed()), alive, started.elapsed());
+            if verdict != HandoffVerdict::Waiting {
+                break verdict;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let _ = std::fs::remove_file(&ready_file);
+        detail["child_pid"] = json!(child.id());
+        detail["waited_ms"] = json!(started.elapsed().as_millis() as u64);
+        if let HandoffVerdict::Failed(_) = verdict {
+            if let Ok(Some(status)) = child.try_wait() {
+                detail["child_exit_code"] = json!(status.code());
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+                detail["child_killed"] = json!(true);
+            }
+        }
+        Ok(verdict)
+    }
+
+    /// 刚被杀掉的进程,映像要过一会儿才释放。
+    fn remove_file_with_retry(path: &Path) -> bool {
+        for attempt in 0..10 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => return true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) => {}
+            }
+        }
+        false
     }
 
     /// 确保 `target` 是一个可用的 exe。已有且像样就用现成的(返回 false);
@@ -598,18 +846,28 @@ mod windows_impl {
         Ok(true)
     }
 
-    fn spawn_detached(target: &Path, args: &[String]) -> std::io::Result<()> {
+    fn spawn_detached(
+        target: &Path,
+        args: &[String],
+        ready_file: &Path,
+    ) -> std::io::Result<std::process::Child> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         // 与 watcher::restart_with_fresh_launcher 相同的起法。参数原样转交
         // (包括 --await-guard:由自更新重启拉起时,旧 launcher 可能还没退干净)。
         let mut command = std::process::Command::new(target);
-        command.args(args).creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        command
+            .args(args)
+            .env(HANDOFF_READY_ENV, ready_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
         if let Some(dir) = target.parent() {
             command.current_dir(dir);
         }
-        command.spawn().map(|_| ())
+        command.spawn()
     }
 
     #[derive(Default)]
@@ -740,31 +998,52 @@ mod windows_impl {
         // 只有以新名 recodex.exe 运行时才清理旧 exe、改写引用。以旧名运行说明接班失败了
         // (handoff 那边已记过日志),此时旧 exe 正是我们自己,什么都不能删。
         let legacy = legacy_sibling(&exe);
-        let legacy_exists = legacy.as_ref().is_some_and(|legacy| legacy.exists());
-        let marker = shortcut_scan_marker(&exe);
-        let marker_done = marker.as_ref().is_some_and(|marker| marker.exists());
-        if let Some(legacy) = legacy.as_ref().filter(|_| legacy_exists || !marker_done) {
-            let report = retarget_references(legacy, &exe);
-            if !report.shortcuts_updated.is_empty() || !report.registry_updated.is_empty() {
-                worth_logging = true;
-                detail["shortcuts_updated"] = json!(report.shortcuts_updated);
-                detail["registry_updated"] = json!(report.registry_updated);
+        if let Some(legacy) = legacy.as_ref() {
+            if legacy.exists() {
+                // 刚接班的新 exe 先跑一会儿再动入口:要是它被杀软干掉,入口还都指着旧 exe。
+                // 进程在这之前退出(用户关了 Codex)就留给下次启动。
+                std::thread::sleep(RETARGET_SETTLE);
             }
-            if report.errors.is_empty() {
-                if let Some(marker) = &marker {
-                    if let Some(parent) = marker.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let _ = std::fs::write(marker, b"1");
-                }
-                if legacy_exists {
-                    // 引用全改完了才删旧 exe;改不全就留着,免得哪个入口点了没反应
+            let legacy_exists = legacy.exists();
+            let marker = shortcut_scan_marker(&exe);
+            let marker_done = marker.as_ref().is_some_and(|marker| marker.exists());
+            if legacy_exists || !marker_done {
+                let report = retarget_references(legacy, &exe);
+                if !report.shortcuts_updated.is_empty() || !report.registry_updated.is_empty() {
                     worth_logging = true;
-                    detail["legacy_removed"] = json!(delete_legacy_binary(legacy));
+                    detail["shortcuts_updated"] = json!(report.shortcuts_updated);
+                    detail["registry_updated"] = json!(report.registry_updated);
                 }
-            } else {
+                if report.errors.is_empty() {
+                    if let Some(marker) = &marker {
+                        if let Some(parent) = marker.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(marker, b"1");
+                    }
+                    if legacy_exists {
+                        // 引用全改完了才删旧 exe;改不全就留着,免得哪个入口点了没反应
+                        worth_logging = true;
+                        detail["legacy_removed"] = json!(delete_legacy_binary(legacy));
+                    }
+                } else {
+                    worth_logging = true;
+                    detail["error"] = json!(report.errors.join("; "));
+                }
+            }
+            // 旧 exe 早就没了、.old/.new 还在(以前只在删旧 exe 那一次顺带删一回,
+            // 删不掉就永远留着):不看旧 exe 在不在,每次都单独清
+            if !legacy.exists() {
+                let leftovers = remove_legacy_update_leftovers(legacy);
+                if !leftovers.is_empty() {
+                    worth_logging = true;
+                    detail["leftovers_removed"] = json!(leftovers);
+                }
+            }
+            let autostart = migrate_watcher_autostart(legacy, &exe);
+            if !autostart.is_empty() {
                 worth_logging = true;
-                detail["error"] = json!(report.errors.join("; "));
+                detail["autostart_renamed"] = json!(autostart);
             }
         }
 
@@ -785,20 +1064,132 @@ mod windows_impl {
         }
     }
 
-    /// 删旧 exe(连同自更新留下的 .old/.new)。刚交接完时旧进程可能还没退干净、
-    /// 映像还锁着,所以重试一会儿;还删不掉就留给下次启动。
-    fn delete_legacy_binary(legacy: &Path) -> bool {
-        for suffix in [".old", ".new"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", legacy.display()));
+    /// 自更新(selfupdate.rs)在旧名 exe 旁边留下的 `.old` / `.new`,
+    /// 以及接班复制到一半留下的 `recodex.exe.migrating`。
+    fn legacy_update_leftovers(legacy: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = [".old", ".new"]
+            .iter()
+            .map(|suffix| PathBuf::from(format!("{}{suffix}", legacy.display())))
+            .collect();
+        if let Some(target) = legacy_handoff_target(legacy) {
+            paths.push(PathBuf::from(format!("{}.migrating", target.display())));
         }
-        for _ in 0..30 {
-            match std::fs::remove_file(legacy) {
-                Ok(()) => return true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
-                Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+        paths
+    }
+
+    /// 各自独立地删一次,返回删掉的。`.migrating` 可能正被另一个旧名进程写着,
+    /// 只删 10 分钟以前的。
+    fn remove_legacy_update_leftovers(legacy: &Path) -> Vec<String> {
+        const STALE: std::time::Duration = std::time::Duration::from_secs(600);
+        let mut removed = Vec::new();
+        for path in legacy_update_leftovers(legacy) {
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            let is_staging = path.extension().is_some_and(|ext| ext == "migrating");
+            if is_staging
+                && meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.elapsed().ok())
+                    .is_none_or(|age| age < STALE)
+            {
+                continue;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                removed.push(path.display().to_string());
             }
         }
-        false
+        removed
+    }
+
+    /// 开机自启项改名:`CodexPlusPlusWatcher` → `ReCodexWatcher`(注册表 Run 值与启动文件夹
+    /// 里的快捷方式)。只动指向**我们 exe** 的 —— 上游 Codex++ 用的是同一个旧名字。
+    /// 返回改了哪些。
+    fn migrate_watcher_autostart(legacy: &Path, current: &Path) -> Vec<String> {
+        use crate::watcher::{
+            LEGACY_WATCHER_RUN_NAME, LEGACY_WATCHER_STARTUP_SHORTCUT_NAME, WATCHER_RUN_KEY,
+            WATCHER_RUN_NAME, WATCHER_STARTUP_SHORTCUT_NAME,
+        };
+        let mut changed = Vec::new();
+        if let Ok(values) = crate::windows_integration::read_current_user_string_values(WATCHER_RUN_KEY) {
+            let legacy_value = values
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(LEGACY_WATCHER_RUN_NAME))
+                .and_then(|(_, value)| value.clone())
+                .filter(|value| autostart_value_is_ours(value, legacy, current));
+            if let Some(value) = legacy_value {
+                let value = replace_exe_path(&value, legacy, current).unwrap_or(value);
+                let has_new = values
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(WATCHER_RUN_NAME));
+                // 先写新名、成功了再删旧名:中途失败也至少留着一个能用的自启项
+                let written = has_new
+                    || crate::windows_integration::set_current_user_string_value(
+                        WATCHER_RUN_KEY,
+                        WATCHER_RUN_NAME,
+                        &value,
+                    )
+                    .is_ok();
+                if written
+                    && crate::windows_integration::delete_current_user_value(
+                        WATCHER_RUN_KEY,
+                        LEGACY_WATCHER_RUN_NAME,
+                    )
+                    .is_ok()
+                {
+                    changed.push(format!(r"{WATCHER_RUN_KEY}\{WATCHER_RUN_NAME}"));
+                }
+            }
+        }
+        if let Some(dir) = crate::watcher::startup_folder() {
+            let old = dir.join(LEGACY_WATCHER_STARTUP_SHORTCUT_NAME);
+            if old.is_file() {
+                // 目标已由 retarget_references 改过;这里只看它是不是我们的
+                let target = std::cell::RefCell::new(String::new());
+                let _ = crate::windows_integration::update_shortcuts(std::slice::from_ref(&old), |info| {
+                    *target.borrow_mut() = info.target.clone();
+                    ShortcutChanges::default()
+                });
+                let target = target.into_inner();
+                if autostart_value_is_ours(&target, legacy, current) {
+                    let new = dir.join(WATCHER_STARTUP_SHORTCUT_NAME);
+                    let moved = if new.exists() {
+                        std::fs::remove_file(&old).is_ok()
+                    } else {
+                        std::fs::rename(&old, &new).is_ok()
+                    };
+                    if moved {
+                        changed.push(new.display().to_string());
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// 删旧 exe,连同自更新留下的 .old/.new。刚交接完时旧进程可能还没退干净、
+    /// 映像还锁着,所以三个一起重试一会儿;还删不掉就留给下次启动
+    /// (下次旧 exe 已不在时,.old/.new 由 [`remove_legacy_update_leftovers`] 单独清)。
+    /// 返回旧 exe 是否已删掉。
+    fn delete_legacy_binary(legacy: &Path) -> bool {
+        let mut paths = vec![legacy.to_path_buf()];
+        paths.extend(
+            [".old", ".new"]
+                .iter()
+                .map(|suffix| PathBuf::from(format!("{}{suffix}", legacy.display()))),
+        );
+        for attempt in 0..30 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            paths.retain(|path| match std::fs::remove_file(path) {
+                Ok(()) => false,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            });
+            if paths.is_empty() {
+                break;
+            }
+        }
+        !legacy.exists()
     }
 }
 
@@ -940,6 +1331,121 @@ mod tests {
         assert!(!CODEX_WINDOW_APP_USER_MODEL_ID.contains("bigpizza"));
         assert!(!CODEX_WINDOW_APP_USER_MODEL_ID.contains("codexplusplus"));
         assert_ne!(CODEX_WINDOW_APP_USER_MODEL_ID, LEGACY_CODEX_WINDOW_APP_USER_MODEL_ID);
+    }
+
+    // ---------- 接班确认与退避 ----------
+
+    fn secs(value: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(value)
+    }
+
+    #[test]
+    fn handoff_is_confirmed_only_after_ready_and_surviving_the_grace_period() {
+        assert_eq!(judge_handoff(None, true, secs(1)), HandoffVerdict::Waiting, "还没报到");
+        assert_eq!(
+            judge_handoff(Some(secs(0)), true, secs(3)),
+            HandoffVerdict::Waiting,
+            "刚报到,还在宽限期里"
+        );
+        assert_eq!(
+            judge_handoff(Some(HANDOFF_READY_GRACE), true, secs(5)),
+            HandoffVerdict::Confirmed
+        );
+    }
+
+    /// 杀软拦下/秒杀:进程没了就是失败,报没报到都一样。
+    #[test]
+    fn a_dead_child_is_a_failed_handoff_even_after_ready() {
+        assert_eq!(
+            judge_handoff(None, false, secs(0)),
+            HandoffVerdict::Failed("exited_before_ready")
+        );
+        assert_eq!(
+            judge_handoff(Some(secs(1)), false, secs(4)),
+            HandoffVerdict::Failed("exited_after_ready")
+        );
+    }
+
+    #[test]
+    fn a_child_that_never_reports_times_out() {
+        assert_eq!(
+            judge_handoff(None, true, HANDOFF_READY_TIMEOUT - secs(1)),
+            HandoffVerdict::Waiting
+        );
+        assert_eq!(
+            judge_handoff(None, true, HANDOFF_READY_TIMEOUT),
+            HandoffVerdict::Failed("ready_timeout")
+        );
+        // 超时前一刻才报到:按宽限期判,不因总时长超了就失败
+        assert_eq!(
+            judge_handoff(Some(secs(1)), true, HANDOFF_READY_TIMEOUT + secs(1)),
+            HandoffVerdict::Waiting
+        );
+    }
+
+    /// 报到之前要经过网络同步与等锁,超时给短了会误杀健康的新进程。
+    #[test]
+    fn the_ready_timeout_leaves_room_for_network_sync_and_guard_wait() {
+        assert!(HANDOFF_READY_TIMEOUT >= secs(30));
+    }
+
+    #[test]
+    fn handoff_backs_off_for_seven_days_after_a_failure() {
+        let now = 1_800_000_000;
+        assert!(!handoff_backoff_active(None, now), "没失败过就试");
+        assert!(handoff_backoff_active(Some(now), now));
+        assert!(handoff_backoff_active(Some(now - HANDOFF_BACKOFF_SECS + 1), now));
+        assert!(!handoff_backoff_active(Some(now - HANDOFF_BACKOFF_SECS), now), "满 7 天再试");
+        // 系统时间被往回调过:记录在未来,不能因此永远不再试
+        assert!(!handoff_backoff_active(Some(now + 3600), now));
+    }
+
+    #[test]
+    fn backoff_record_is_the_first_line_in_unix_seconds() {
+        assert_eq!(
+            parse_handoff_backoff("1800000000\n新进程没有接班:ready_timeout\n"),
+            Some(1_800_000_000)
+        );
+        assert_eq!(parse_handoff_backoff(" 42 "), Some(42));
+        assert_eq!(parse_handoff_backoff(""), None);
+        assert_eq!(parse_handoff_backoff("garbage"), None, "坏记录当没有,照常尝试");
+    }
+
+    // ---------- 快捷方式错误口径 ----------
+
+    /// 读不了的 .lnk(坏链接、没权限)和我们无关,不能挡住完成标记与删旧 exe;
+    /// 要改而没改成、或 COM 本身不可用,才算没改全。
+    #[test]
+    fn only_shortcuts_that_needed_a_change_but_failed_count_as_errors() {
+        assert!(!shortcut_failure_counts(ShortcutFailureStage::Read));
+        assert!(shortcut_failure_counts(ShortcutFailureStage::Write));
+        assert!(shortcut_failure_counts(ShortcutFailureStage::Setup));
+    }
+
+    // ---------- 开机自启项改名 ----------
+
+    #[test]
+    fn autostart_entries_are_renamed_only_when_they_point_at_us() {
+        let legacy = legacy_exe();
+        let current = new_exe();
+        assert!(autostart_value_is_ours(
+            &format!("\"{}\" --debug-port 9229", legacy.display()),
+            &legacy,
+            &current
+        ));
+        assert!(autostart_value_is_ours(
+            &current.to_string_lossy().to_uppercase(),
+            &legacy,
+            &current
+        ));
+        // 上游 Codex++ 的自启项用同一个名字,但不在我们的目录
+        let upstream = if cfg!(windows) {
+            r#""C:\Users\u\AppData\Local\Programs\Codex++\codex-plus-plus.exe" --debug-port 9229"#
+        } else {
+            r#""/home/u/Codex++/codex-plus-plus.exe" --debug-port 9229"#
+        };
+        assert!(!autostart_value_is_ours(upstream, &legacy, &current));
+        assert!(!autostart_value_is_ours("", &legacy, &current));
     }
 
     // ---------- 注册表字符串 ----------

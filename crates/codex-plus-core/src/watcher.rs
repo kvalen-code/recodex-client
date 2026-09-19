@@ -13,9 +13,14 @@ pub const CDP_PROBE_TIMEOUT_SECONDS: f64 = 0.5;
 pub const TAKEOVER_FAILURE_BACKOFF_SECONDS: f64 = 30.0;
 pub const RESTART_STOP_WAIT_TIMEOUT_MS: u64 = 5_000;
 const RESTART_STOP_WAIT_INTERVAL_MS: u64 = 100;
-pub const WATCHER_RUN_NAME: &str = "CodexPlusPlusWatcher";
+pub const WATCHER_RUN_NAME: &str = "ReCodexWatcher";
 pub const WATCHER_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-pub const WATCHER_STARTUP_SHORTCUT_NAME: &str = "CodexPlusPlusWatcher.lnk";
+pub const WATCHER_STARTUP_SHORTCUT_NAME: &str = "ReCodexWatcher.lnk";
+/// recodex-overlay: 改名前的自启项名字。从 Codex++ 迁移过来的机器上还留着它;
+/// 启动时指向我们 exe 的会被改成新名字(legacy_install),卸载时新旧都清。
+/// 上游 Codex++ 用的也是这个名字 —— 只动指向我们 exe 的。
+pub const LEGACY_WATCHER_RUN_NAME: &str = "CodexPlusPlusWatcher";
+pub const LEGACY_WATCHER_STARTUP_SHORTCUT_NAME: &str = "CodexPlusPlusWatcher.lnk";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatcherInstallPlan {
@@ -251,6 +256,10 @@ pub fn uninstall_watcher() -> anyhow::Result<()> {
     if let Some(shortcut) = startup_shortcut_path() {
         let _ = std::fs::remove_file(shortcut);
     }
+    // 旧名字的只在指向我们时才删:上游 Codex++ 用同一个名字
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = uninstall_watcher_pointing_at(&exe);
+    }
     stop_launcher_processes();
     Ok(())
 }
@@ -258,7 +267,8 @@ pub fn uninstall_watcher() -> anyhow::Result<()> {
 /// 卸载时清理**指向本 exe** 的开机自启项。
 ///
 /// 背景:瘦身版 ReCodex 自己从不调用 `install_watcher`(那是已下线的 manager 干的),
-/// 但**从 Codex++ 迁移过来的用户**,注册表 Run 里留着 `CodexPlusPlusWatcher`。
+/// 但**从 Codex++ 迁移过来的用户**,注册表 Run 里留着 `CodexPlusPlusWatcher`
+/// (启动时会改名成 `ReCodexWatcher`,新旧两个名字这里都认)。
 /// 我们的卸载原先完全不碰它 —— 卸完之后每次开机都会去拉一个已经被删掉的 exe。
 ///
 /// 只在 Run 值里确实提到**我们即将删除的这个 exe** 时才动手:
@@ -271,22 +281,33 @@ pub fn uninstall_watcher_pointing_at(exe: &Path) -> bool {
     else {
         return false;
     };
-    let exe_key = exe.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
-    let points_at_us = values.iter().any(|(name, value)| {
-        name == WATCHER_RUN_NAME
-            && value.as_deref().is_some_and(|value| {
-                value.to_ascii_lowercase().replace('/', "\\").contains(&exe_key)
-            })
-    });
-    if !points_at_us {
-        return false;
+    // 旧名接班前留下的自启项指向同目录的旧名 exe,也算我们的
+    let exe_keys: Vec<String> = std::iter::once(exe.to_path_buf())
+        .chain(crate::legacy_install::legacy_sibling(exe))
+        .map(|path| path.to_string_lossy().to_ascii_lowercase().replace('/', "\\"))
+        .collect();
+    let mut removed = false;
+    for (run_name, shortcut_name) in [
+        (WATCHER_RUN_NAME, WATCHER_STARTUP_SHORTCUT_NAME),
+        (LEGACY_WATCHER_RUN_NAME, LEGACY_WATCHER_STARTUP_SHORTCUT_NAME),
+    ] {
+        let points_at_us = values.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(run_name)
+                && value.as_deref().is_some_and(|value| {
+                    let value = value.to_ascii_lowercase().replace('/', "\\");
+                    exe_keys.iter().any(|key| value.contains(key.as_str()))
+                })
+        });
+        if !points_at_us {
+            continue;
+        }
+        let _ = crate::windows_integration::delete_current_user_value(WATCHER_RUN_KEY, run_name);
+        if let Some(shortcut) = startup_folder().map(|dir| dir.join(shortcut_name)) {
+            let _ = std::fs::remove_file(shortcut);
+        }
+        removed = true;
     }
-    let _ =
-        crate::windows_integration::delete_current_user_value(WATCHER_RUN_KEY, WATCHER_RUN_NAME);
-    if let Some(shortcut) = startup_shortcut_path() {
-        let _ = std::fs::remove_file(shortcut);
-    }
-    true
+    removed
 }
 
 #[cfg(not(windows))]
@@ -781,6 +802,12 @@ fn spawn_launcher(launcher_path: &Path, debug_port: u16) {
 
 #[cfg(windows)]
 fn startup_shortcut_path() -> Option<PathBuf> {
+    startup_folder().map(|dir| dir.join(WATCHER_STARTUP_SHORTCUT_NAME))
+}
+
+/// 当前用户的「启动」文件夹。
+#[cfg(windows)]
+pub(crate) fn startup_folder() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|appdata| {
         PathBuf::from(appdata)
             .join("Microsoft")
@@ -788,7 +815,6 @@ fn startup_shortcut_path() -> Option<PathBuf> {
             .join("Start Menu")
             .join("Programs")
             .join("Startup")
-            .join(WATCHER_STARTUP_SHORTCUT_NAME)
     })
 }
 
