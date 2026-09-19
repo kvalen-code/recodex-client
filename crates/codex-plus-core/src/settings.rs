@@ -262,6 +262,9 @@ pub struct BackendSettings {
     pub codex_app_session_delete: bool,
     #[serde(rename = "codexAppMarkdownExport", default = "default_true")]
     pub codex_app_markdown_export: bool,
+    // 会话「更多」菜单里的「原地复制会话」(借官方的「从这里创建聊天分支」)
+    #[serde(rename = "codexAppSessionCopy", default = "default_true")]
+    pub codex_app_session_copy: bool,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
     #[serde(rename = "codexAppForceChineseLocale", default = "default_true")]
@@ -382,6 +385,7 @@ impl Default for BackendSettings {
             codex_app_plugin_marketplace_unlock: true,
             codex_app_session_delete: true,
             codex_app_markdown_export: true,
+            codex_app_session_copy: true,
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: true,
             codex_app_fast_startup: false,
@@ -760,6 +764,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppPluginMarketplaceUnlock");
     merge_bool_setting(target, source, "codexAppSessionDelete");
     merge_bool_setting(target, source, "codexAppMarkdownExport");
+    merge_bool_setting(target, source, "codexAppSessionCopy");
     merge_bool_setting(target, source, "codexAppPasteFix");
     merge_bool_setting(target, source, "codexAppForceChineseLocale");
     merge_bool_setting(target, source, "recodexAutoSwitchOrg"); // recodex-overlay:auto-switch-merge

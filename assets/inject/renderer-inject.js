@@ -403,7 +403,7 @@
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexDeleteVersion = "7";
   const codexExportVersion = "1";
-  const codexActionGroupVersion = "5";
+  const codexActionGroupVersion = "6";
   const codexArchiveRowActionsVersion = "1";
   const codexArchiveDeleteAllVersion = "2";
   const codexConversationViewVersion = "1";
@@ -1136,13 +1136,14 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { pluginMarketplaceUnlock: true, sessionDelete: true, markdownExport: true, sessionCopy: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
     pluginMarketplaceUnlock: "codexAppPluginMarketplaceUnlock",
     sessionDelete: "codexAppSessionDelete",
     markdownExport: "codexAppMarkdownExport",
+    sessionCopy: "codexAppSessionCopy",
     threadIdBadge: "codexAppThreadIdBadge",
     conversationView: "codexAppConversationView",
     threadScrollRestore: "codexAppThreadScrollRestore",
@@ -1177,6 +1178,7 @@
         pluginMarketplaceUnlock: false,
         sessionDelete: false,
         markdownExport: false,
+        sessionCopy: false,
         pasteFix: false,
         threadIdBadge: false,
         conversationView: false,
@@ -6166,6 +6168,10 @@
   }
 
   function removeActionGroups(row) {
+    // 「更多」菜单挂在 body 上而不在行里,重建操作组时要一起摘掉,否则每次重建都漏一个(上游 888f2bd)。
+    document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
+      if (menu.__codexSessionMoreRow === row) menu.remove();
+    });
     row.querySelectorAll(`.${actionGroupClass}`).forEach((group) => group.remove());
   }
 
@@ -6329,7 +6335,7 @@
 
   function attachButton(row) {
     const settings = codexPlusSettings();
-    if (!settings.sessionDelete && !settings.markdownExport) {
+    if (!settings.sessionDelete && !settings.markdownExport && !settings.sessionCopy) {
       removeActionGroups(row);
       row.dataset.codexDeleteRow = "false";
       return;
@@ -6338,7 +6344,10 @@
     const existingDeleteButton = existingGroup?.querySelector(`.${buttonClass}`);
     const existingMoreButton = existingGroup?.querySelector(`.${moreButtonClass}`);
     const existingExportButton = existingGroup?.querySelector(`.${exportButtonClass}`);
-    const needsMoreMenu = settings.markdownExport;
+    const needsMoreMenu = settings.markdownExport || settings.sessionCopy;
+    // 「更多」菜单里有哪些项:开关变了(比如只关了原地复制)也要重建,光看有没有菜单按钮不够。
+    const moreMenuItems = [settings.markdownExport && "export", settings.sessionCopy && "copy"].filter(Boolean).join(",");
+    const staleMoreMenuItems = needsMoreMenu && existingGroup?.dataset.codexMoreMenuItems !== moreMenuItems;
     const hasUnexpectedDelete = !settings.sessionDelete && !!existingDeleteButton;
     const hasUnexpectedMore = !needsMoreMenu && !!existingMoreButton;
     const hasUnexpectedExport = !!existingExportButton;
@@ -6346,7 +6355,7 @@
     const missingMore = needsMoreMenu && !existingMoreButton;
     const deleteReady = !settings.sessionDelete || existingDeleteButton?.dataset.codexDeleteVersion === codexDeleteVersion;
     const groupReady = existingGroup?.dataset.codexActionGroupVersion === codexActionGroupVersion;
-    if (groupReady && deleteReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
+    if (groupReady && deleteReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore && !staleMoreMenuItems) {
       return;
     }
     removeActionGroups(row);
@@ -6357,7 +6366,8 @@
     const group = document.createElement("div");
     group.className = actionGroupClass;
     group.dataset.codexActionGroupVersion = codexActionGroupVersion;
-    if (settings.markdownExport) {
+    if (needsMoreMenu) {
+      group.dataset.codexMoreMenuItems = moreMenuItems;
       const moreButton = document.createElement("button");
       moreButton.type = "button";
       moreButton.className = `${actionButtonClass} ${moreButtonClass}`;
@@ -6374,6 +6384,12 @@
           closeSessionMoreMenus();
           exportMarkdown(ref);
         }));
+      }
+      if (settings.sessionCopy) {
+        const sessionCopyItem = createSessionMoreMenuItem(codexPlusUiText("原地复制会话"), "⧉", activateSessionCopyMenuItem);
+        sessionCopyItem.dataset.codexSessionCopyMenu = "true";
+        sessionCopyItem.__codexSessionCopyRow = row;
+        moreMenu.appendChild(sessionCopyItem);
       }
       const openMoreMenu = (event) => {
         stopActionButtonEvent(row, moreButton, event);
@@ -7516,6 +7532,122 @@
     if (window.__codexSessionDeleteScanPending) return;
     window.__codexSessionDeleteScanPending = true;
     window.__codexSessionDeleteScanTimer = setTimeout(runScheduledScan, 200);
+  }
+
+  // ── 注入到官方界面的新文案:跟随面板语言(recodex.lang > Codex 界面语言),
+  //    未支持的语种回落简体 —— 与 recodex-panel-inject.js 的 currentLang() 同一规则。
+  const codexPlusUiStrings = {
+    tw: {
+      "原地复制会话": "原地複製對話",
+      "找不到要复制的会话": "找不到要複製的對話",
+      "会话加载超时，请稍后重试": "對話載入逾時，請稍後再試",
+      "当前会话没有可复制的回答": "目前對話沒有可複製的回答",
+    },
+    ru: {
+      "原地复制会话": "Дублировать чат",
+      "找不到要复制的会话": "Не найден чат для копирования",
+      "会话加载超时，请稍后重试": "Чат загружается слишком долго, попробуйте ещё раз",
+      "当前会话没有可复制的回答": "В этом чате нет ответа, от которого можно сделать копию",
+    },
+  };
+
+  function codexPlusUiLang() {
+    try {
+      const saved = localStorage.getItem("recodex.lang");
+      if (saved === "zh" || saved === "tw" || saved === "ru") return saved;
+    } catch {
+    }
+    const raw = String(document.documentElement?.lang || navigator.language || "").toLowerCase();
+    if (raw.startsWith("zh-tw") || raw.startsWith("zh-hk") || raw.startsWith("zh-hant")) return "tw";
+    if (raw.startsWith("ru")) return "ru";
+    return "zh";
+  }
+
+  function codexPlusUiText(text) {
+    return codexPlusUiStrings[codexPlusUiLang()]?.[text] || text;
+  }
+
+  // ── 原地复制会话 ───────────────────────────────────────────
+  // 移植自上游「原地复制会话」:切到该会话,点它最后一条回答上官方的「从这里创建聊天分支」,
+  // 在同一工作区里得到一份完整副本。只借官方按钮,不自己改会话数据。
+  // (上游同批的「自动重命名当前会话」没有移植:它靠官方重命名窗口里的 AI 建议标题按钮,
+  //  Codex 26.915 的重命名窗口已经没有这个按钮,移植过来只会永远提示失败。)
+  const sessionCopyMenuActivationTimeoutMs = 12000;
+  const sessionCopyForkButtonWaitMs = 4000;
+  // 官方「从这里创建聊天分支」按钮的 aria-label(assistantMessageContent.forkAriaLabel),
+  // 取自 Codex 26.915 各语言包;"Fork from here" 是旧版英文文案。
+  const sessionCopyForkAriaLabels = [
+    "从这里创建聊天分支",
+    "從此處分支對話",
+    "從此處分支複製對話",
+    "Создать форк чата отсюда",
+    "Fork chat from here",
+    "Fork from here",
+  ];
+
+  function sessionCopyActivationIsDuplicate(target) {
+    if (!(target instanceof HTMLElement)) return false;
+    const now = Date.now();
+    const activatedAt = Number(target.dataset.codexSessionCopyActivatedAt || 0);
+    if (activatedAt && now - activatedAt < 600) return true;
+    target.dataset.codexSessionCopyActivatedAt = String(now);
+    return false;
+  }
+
+  async function waitForSessionElement(resolveElement, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const element = resolveElement();
+      if (element) return element;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return null;
+  }
+
+  async function selectSessionRowForAction(row) {
+    if (!(row instanceof HTMLElement) || !row.isConnected) return false;
+    const targetId = row.getAttribute("data-app-action-sidebar-thread-id") || "";
+    if (!targetId) return false;
+    if (row.getAttribute("data-app-action-sidebar-thread-selected") !== "true") row.click();
+    return !!await waitForSessionElement(() => {
+      const selected = [...document.querySelectorAll(selectors.sidebarThread)]
+        .find((candidate) => candidate.getAttribute("data-app-action-sidebar-thread-selected") === "true");
+      return selected?.getAttribute("data-app-action-sidebar-thread-id") === targetId ? selected : null;
+    }, sessionCopyMenuActivationTimeoutMs);
+  }
+
+  function sessionCopyForkButton() {
+    const selector = sessionCopyForkAriaLabels.map((label) => `button[aria-label="${label}"]`).join(",");
+    return [...document.querySelectorAll(selector)]
+      .filter(visibleElement)
+      .filter((button) => !isExtensionUiNode(button))
+      .at(-1) || null;
+  }
+
+  async function activateSessionCopyMenuItem(event) {
+    const item = event?.currentTarget;
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    event?.stopImmediatePropagation?.();
+    if (sessionCopyActivationIsDuplicate(item)) return;
+    closeSessionMoreMenus();
+    const row = item?.__codexSessionCopyRow;
+    if (!(row instanceof HTMLElement) || !row.isConnected) {
+      showToast(codexPlusUiText("找不到要复制的会话"), null);
+      return;
+    }
+    if (!await selectSessionRowForAction(row)) {
+      showToast(codexPlusUiText("会话加载超时，请稍后重试"), null);
+      return;
+    }
+    // 切过去后回答列表是异步挂上来的,等官方按钮出现再点。
+    const forkButton = await waitForSessionElement(sessionCopyForkButton, sessionCopyForkButtonWaitMs);
+    if (!forkButton) {
+      showToast(codexPlusUiText("当前会话没有可复制的回答"), null);
+      return;
+    }
+    sendCodexPlusDiagnostic("session_copy_fork_clicked", {});
+    forkButton.click();
   }
 
   void loadBackendSettingsForStartup();
