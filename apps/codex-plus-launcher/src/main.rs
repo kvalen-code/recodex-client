@@ -1523,4 +1523,21 @@ mod legacy_handoff_placement_tests {
         assert_eq!(calls.len(), 1, "launcher_main 里只能调用一次");
         assert!(calls[0].0 > guard, "必须在拿到单实例锁之后");
     }
+
+    /// 启动顺序:单实例锁 → 旧安装清理(接班报到点)→ 手机远程自动接入,各只一次。
+    /// 手机远程要是跑在锁前面,第二个实例(只是来激活窗口的)也会去发起配对、拉守护进程。
+    #[test]
+    fn phone_remote_starts_once_after_guard_and_housekeeping() {
+        let source = include_str!("main.rs");
+        let start = source.find("async fn launcher_main(").expect("找不到 launcher_main");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("launcher_main 没有结尾")];
+        let guard = body.find("acquire_guard_maybe_waiting(options.debug_port").expect("没有抢锁");
+        let housekeeping = body.find("spawn_startup_housekeeping();").expect("没有清理");
+        // 拼出来,免得这条测试自己的字面量也被数进去
+        let remote_call = ["phone_remote::", "start_from_saved_settings();"].concat();
+        assert_eq!(source.matches(remote_call.as_str()).count(), 1, "整个启动器里只能调用一次");
+        let remote = body.find(remote_call.as_str()).expect("launcher_main 里没有手机远程自动接入");
+        assert!(guard < housekeeping && housekeeping < remote, "顺序必须是 锁 → 清理 → 手机远程");
+    }
 }
