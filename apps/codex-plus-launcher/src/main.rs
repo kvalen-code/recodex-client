@@ -1514,7 +1514,8 @@ mod legacy_handoff_placement_tests {
     /// 旧 exe 清理/改入口只能由单实例锁的持有者做;它也是旧名接班的报到点。
     #[test]
     fn housekeeping_runs_only_after_the_single_instance_guard() {
-        let source = include_str!("main.rs");
+        // 按 LF 找函数结尾:Windows 上 core.autocrlf=true 检出的是 CRLF
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let start = source.find("async fn launcher_main(").expect("找不到 launcher_main");
         let body = &source[start..];
         let body = &body[..body.find("\n}\n").expect("launcher_main 没有结尾")];
@@ -1528,7 +1529,8 @@ mod legacy_handoff_placement_tests {
     /// 手机远程要是跑在锁前面,第二个实例(只是来激活窗口的)也会去发起配对、拉守护进程。
     #[test]
     fn phone_remote_starts_once_after_guard_and_housekeeping() {
-        let source = include_str!("main.rs");
+        // 按 LF 找函数结尾:Windows 上 core.autocrlf=true 检出的是 CRLF
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let start = source.find("async fn launcher_main(").expect("找不到 launcher_main");
         let body = &source[start..];
         let body = &body[..body.find("\n}\n").expect("launcher_main 没有结尾")];
