@@ -118,6 +118,10 @@ where
 
     let mut warnings: Vec<String> = Vec::new();
 
+    // 手机远程:先停守护进程、撤开机自启 —— 下一步会删掉 ~/.recodex(运行时就在里面),
+    // 不停的话 Windows 上运行时文件被占着删不掉,开机自启项也会指向一个不存在的程序。
+    warnings.extend(crate::phone_remote::uninstall_cleanup());
+
     // 2) 删我们的数据目录与快捷方式
     if let Err(error) = remove_codex_owned_dir() {
         warnings.push(format!("删除 ~/.codex/recodex 失败:{error}"));
@@ -242,6 +246,10 @@ mod tests {
         assert!(
             perform.contains("remove_codex_owned_dir()"),
             "必须清理 ~/.codex/recodex"
+        );
+        assert!(
+            perform.contains("phone_remote::uninstall_cleanup()"),
+            "必须停手机远程守护进程并撤开机自启,否则卸完每次开机都去拉一个已删除的运行时"
         );
     }
 

@@ -87,6 +87,13 @@ Section "Install"
 SectionEnd
 
 Section "Uninstall"
+  ; 手机远程:停掉后台守护进程、撤掉开机自启项 ReCodexRemote(与命令行 recodex app 写的是同一项)。
+  ; 必须在 taskkill 之前 —— 要借 recodex.exe 去调远程组件的 daemon stop。
+  ; 远程组件的数据目录(%USERPROFILE%\.recodex\remote)不在这里删,与其它用户数据一样保留。
+  nsExec::ExecToLog '"$INSTDIR\recodex.exe" --remote-cleanup'
+  ; recodex.exe 起不来时的兜底:至少别让开机自启继续指着它
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "ReCodexRemote"
+
   nsExec::ExecToLog 'taskkill /IM recodex.exe /F'
   nsExec::ExecToLog 'taskkill /IM codex-plus-plus.exe /F'
 

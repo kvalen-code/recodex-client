@@ -107,6 +107,16 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // recodex-overlay: 卸载程序调用的入口,在单实例锁与接班之前处理、做完即退出。
+    //   --remote-cleanup   NSIS 卸载程序:停手机远程守护进程、撤开机自启(不删数据);
+    if args.iter().any(|arg| arg == "--remote-cleanup") {
+        let notes = codex_plus_core::phone_remote::uninstall_cleanup();
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.remote_cleanup",
+            json!({ "notes": notes }),
+        );
+        return Ok(());
+    }
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
     // recodex-overlay: 老安装自更新上来仍叫 codex-plus-plus.exe(自更新只换内容不换文件名)。
     // 复制成同目录的 recodex.exe、改好快捷方式与卸载项,从新名重新拉起,本进程直接退出。
