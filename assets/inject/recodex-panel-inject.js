@@ -21,6 +21,8 @@
     "/self-update", "/uninstall", "/quit", "/restart-codex",
     "/weixin/start", "/weixin/stop", "/weixin/qr-start", "/weixin/qr-status",
     "/recodex/login/poll", "/recodex/gateway/fastest",
+    // 手机远程:关开关/断开要等远程组件停掉后台服务(最长约 1 分钟)
+    "/remote/disable", "/remote/unpair",
   ];
 
   function bridge(path, payload) {
@@ -108,6 +110,18 @@
       "原生菜单本地化": "原生選單在地化", "原生菜单本地化(仅 Codex 151 及更早)": "原生選單在地化(僅 Codex 151 及更早)", "Zed Remote 打开": "Zed Remote 開啟",
       "上游 worktree 创建": "上游 worktree 建立",
       "账号": "帳號", "增强": "增強", "微信": "微信", "高级": "進階",
+      // 手机远程
+      "手机": "手機", "正在准备…": "正在準備…", "手机已允许,正在完成连接…": "手機已允許,正在完成連線…",
+      "等待手机确认": "等待手機確認", "正在启动后台服务…": "正在啟動背景服務…",
+      "已连接 · 手机可控制这台电脑": "已連線 · 手機可控制這台電腦", "已配对 · 后台服务未运行": "已配對 · 背景服務未執行",
+      "未连接": "未連線", "读取状态失败": "讀取狀態失敗", "跟随账号自动连接": "跟隨帳號自動連線",
+      "打开后,用同一个 ReCodex 账号登录的手机 App 可以控制这台电脑;开机自动启动。": "開啟後,用同一個 ReCodex 帳號登入的手機 App 可以控制這台電腦;開機自動啟動。",
+      "确认码": "確認碼", "电脑": "電腦", "在手机 ReCodex App 上点「允许」,或用 App 扫码": "在手機 ReCodex App 上點「允許」,或用 App 掃碼",
+      "请核对手机上显示的确认码与这里一致。": "請核對手機上顯示的確認碼與這裡一致。",
+      "手机端弹窗暂不可用,请用 App 扫码": "手機端彈窗暫不可用,請用 App 掃碼", "请稍候…": "請稍候…",
+      "启动后台服务": "啟動背景服務", "重新配对": "重新配對",
+      "断开后手机将无法再控制这台电脑,要再连需重新配对。": "斷開後手機將無法再控制這台電腦,要再連需重新配對。",
+      "确认断开": "確認斷開", "断开这台电脑": "斷開這台電腦", "连接手机": "連線手機", "操作失败,请重试": "操作失敗,請重試",
       "界面语言": "介面語言", "UI 助手": "UI 助手",
       "跟随 Codex 语言;英语等未支持语种显示简体中文。": "跟隨 Codex 語言;英語等未支援語種顯示簡體中文。",
       "打开 MotionSites,快速生成前端界面。": "開啟 MotionSites,快速產生前端介面。",
@@ -215,6 +229,18 @@
       "原生菜单本地化": "Локализация системного меню", "原生菜单本地化(仅 Codex 151 及更早)": "Локализация системного меню (только Codex 151 и старше)", "Zed Remote 打开": "Открывать в Zed Remote",
       "上游 worktree 创建": "Создание upstream worktree",
       "账号": "Аккаунт", "增强": "Функции", "微信": "WeChat", "高级": "Ещё",
+      // 手机远程
+      "手机": "Телефон", "正在准备…": "Подготовка…", "手机已允许,正在完成连接…": "Разрешено на телефоне, завершаем подключение…",
+      "等待手机确认": "Ждём подтверждения на телефоне", "正在启动后台服务…": "Запуск фоновой службы…",
+      "已连接 · 手机可控制这台电脑": "Подключено · телефон управляет этим компьютером", "已配对 · 后台服务未运行": "Сопряжено · фоновая служба не запущена",
+      "未连接": "Не подключено", "读取状态失败": "Не удалось получить статус", "跟随账号自动连接": "Подключать автоматически по аккаунту",
+      "打开后,用同一个 ReCodex 账号登录的手机 App 可以控制这台电脑;开机自动启动。": "Приложение ReCodex на телефоне с тем же аккаунтом сможет управлять этим компьютером; запуск при входе в систему.",
+      "确认码": "Код подтверждения", "电脑": "Компьютер", "在手机 ReCodex App 上点「允许」,或用 App 扫码": "Нажмите «Разрешить» в приложении ReCodex на телефоне или отсканируйте код",
+      "请核对手机上显示的确认码与这里一致。": "Убедитесь, что код на телефоне совпадает с этим.",
+      "手机端弹窗暂不可用,请用 App 扫码": "Запрос на телефоне недоступен, отсканируйте код в приложении", "请稍候…": "Подождите…",
+      "启动后台服务": "Запустить фоновую службу", "重新配对": "Сопрячь заново",
+      "断开后手机将无法再控制这台电脑,要再连需重新配对。": "После отключения телефон больше не сможет управлять этим компьютером; для повторного подключения нужно сопряжение.",
+      "确认断开": "Подтвердить отключение", "断开这台电脑": "Отключить этот компьютер", "连接手机": "Подключить телефон", "操作失败,请重试": "Не получилось, повторите",
       "界面语言": "Язык интерфейса", "UI 助手": "UI-помощник",
       "跟随 Codex 语言;英语等未支持语种显示简体中文。": "Следует языку Codex; для неподдерживаемых языков — упрощённый китайский.",
       "打开 MotionSites,快速生成前端界面。": "Откройте MotionSites — быстрая генерация интерфейсов.",
@@ -362,8 +388,8 @@
   document.documentElement.appendChild(style);
 
   // ── Tab ────────────────────────────────────────────────────
-  const TABS = ["account", "enh", "wx", "adv"];
-  const TAB_LABEL = { account: "账号", enh: "增强", wx: "微信", adv: "高级" };
+  const TABS = ["account", "enh", "wx", "rm", "adv"];
+  const TAB_LABEL = { account: "账号", enh: "增强", wx: "微信", rm: "手机", adv: "高级" };
   let activeTab = "account";
 
   function renderTabLabels() {
@@ -384,8 +410,10 @@
     if (activeTab === "account") render();
     else if (activeTab === "enh") renderEnhancements();
     else if (activeTab === "wx") renderWeixin();
+    else if (activeTab === "rm") renderRemote(true);
     else if (activeTab === "adv") renderAdvanced();
     if (activeTab !== "wx") wxStopPolling();
+    if (activeTab !== "rm") rmStopPolling();
   }
 
   // ── DOM ────────────────────────────────────────────────────
@@ -410,6 +438,7 @@
     `<div class="rcx-pane on" data-pane="account"><div id="recodex-body"></div></div>` +
     `<div class="rcx-pane" data-pane="enh"><div id="recodex-enh"></div></div>` +
     `<div class="rcx-pane" data-pane="wx"><div id="recodex-wx"></div></div>` +
+    `<div class="rcx-pane" data-pane="rm"><div id="recodex-rm"></div></div>` +
     `<div class="rcx-pane" data-pane="adv"><div id="recodex-adv"></div></div>`;
   document.documentElement.appendChild(fab);
   document.documentElement.appendChild(panel);
@@ -1235,6 +1264,157 @@
       wxQrTimer = setTimeout(tick, 2000);
     };
     wxQrTimer = setTimeout(tick, 2000);
+  }
+
+  // ── 手机远程:跟随账号配对(手机弹窗)+ 扫码兜底,两者同时给(经 /remote/* 桥)──
+  // 状态全在 launcher 的 phone_remote 里;面板只画、只转发。流程进行中每 2 秒刷一次,
+  // 内容没变就不重绘(二维码不闪)。
+  let rmTimer = null;
+  let rmLastSig = "";
+  let rmConfirmUnpair = false;
+  function rmStopPolling() {
+    if (rmTimer) { clearTimeout(rmTimer); rmTimer = null; }
+  }
+  const rm = () => panel.querySelector("#recodex-rm");
+
+  function rmNote(text, isError) {
+    const c = rm();
+    if (!c) return;
+    let n = c.querySelector("#rm-note");
+    if (!n) { n = document.createElement("div"); n.id = "rm-note"; n.style.marginTop = "8px"; c.appendChild(n); }
+    n.className = isError ? "rcx-err" : "rcx-muted";
+    n.style.fontSize = "12px";
+    n.textContent = text;
+  }
+
+  // 「482 193」:后端给的是纯 6 位,这里只负责排版(后端也给了 codeDisplay,两边一致)
+  function rmCode(res) {
+    const code = String((res && (res.codeDisplay || res.code)) || "");
+    return /^\d{6}$/.test(code) ? code.slice(0, 3) + " " + code.slice(3) : code;
+  }
+
+  // 状态行:[文字, 徽标样式]
+  function rmStateText(res) {
+    const phase = res.phase;
+    // 下载进度等细节写在下面那行,徽标里只放短状态
+    if (phase === "preparing") return [t("正在准备…"), "warn"];
+    if (phase === "waiting") return [res.approved ? t("手机已允许,正在完成连接…") : t("等待手机确认"), "warn"];
+    if (phase === "finishing") return [t("正在启动后台服务…"), "warn"];
+    if (phase === "error") return [t("出错"), "warn"];
+    if (res.paired && res.daemonRunning) return [t("已连接 · 手机可控制这台电脑"), "on"];
+    if (res.paired) return [t("已配对 · 后台服务未运行"), "warn"];
+    return [t("未连接"), ""];
+  }
+
+  async function renderRemote(force) {
+    const c = rm();
+    if (!c) return;
+    rmStopPolling();
+    const res = await bridge("/remote/status", {});
+    if (activeTab !== "rm") return;
+    if (bridgeUnavailable(res)) { rmLastSig = ""; renderBridgeDown(c, () => renderRemote(true), res); return; }
+    if (!res || res.status !== "ok") {
+      rmLastSig = "";
+      c.innerHTML = `<div class="rcx-err">${esc((res && res.message) || t("读取状态失败"))}</div>
+        <button class="rcx-act sec" id="rm-retry">${t("重试")}</button>`;
+      c.querySelector("#rm-retry").onclick = () => renderRemote(true);
+      return;
+    }
+    const sig = JSON.stringify([res.enabled, res.phase, res.detail, res.code, res.approved, res.phonePrompt,
+      res.phoneNote, res.message, res.paired, res.daemonRunning, rmConfirmUnpair]);
+    if (force || sig !== rmLastSig) {
+      rmLastSig = sig;
+      rmDraw(c, res);
+    }
+    if (res.busy) rmTimer = setTimeout(() => renderRemote(false), 2000);
+  }
+
+  function rmDraw(c, res) {
+    const [stateText, stateCls] = rmStateText(res);
+    let html = `<label class="rcx-toggle"><span>${t("跟随账号自动连接")}</span>` +
+      `<input type="checkbox" id="rm-toggle" ${res.enabled ? "checked" : ""}></label>`;
+    html += `<div class="rcx-muted" style="font-size:12px;margin-bottom:4px">${
+      t("打开后,用同一个 ReCodex 账号登录的手机 App 可以控制这台电脑;开机自动启动。")}</div>`;
+    html += `<div class="rcx-row"><span class="rcx-k">${t("状态")}</span><span class="rcx-badge ${stateCls}">${esc(stateText)}</span></div>`;
+
+    if (res.phase === "waiting") {
+      html += `<div style="text-align:center;margin-top:10px">` +
+        `<div class="rcx-muted">${t("确认码")}</div>` +
+        `<div id="rm-code" style="font:700 30px/1.2 ui-monospace,Menlo,Consolas,monospace;letter-spacing:4px;color:#e6e9ef;margin:2px 0">${esc(rmCode(res))}</div>` +
+        `<div class="rcx-muted">${t("电脑")}:${esc(res.machineName || "")}</div></div>`;
+      if (res.qrSvg) html += `<div class="rcx-qr">${res.qrSvg}</div>`;
+      html += `<div class="rcx-muted" style="margin-top:8px;font-size:12px">${
+        t("在手机 ReCodex App 上点「允许」,或用 App 扫码")}</div>`;
+      html += `<div class="rcx-muted" style="font-size:12px">${t("请核对手机上显示的确认码与这里一致。")}</div>`;
+      if (!res.phonePrompt) {
+        html += `<div class="rcx-err" style="font-size:12px;margin-top:4px">${
+          esc(t("手机端弹窗暂不可用,请用 App 扫码") + (res.phoneNote ? ":" + res.phoneNote : ""))}</div>`;
+      }
+      html += `<button class="rcx-act sec" id="rm-cancel">${t("取消")}</button>`;
+    } else if (res.phase === "preparing" || res.phase === "finishing") {
+      html += `<div class="rcx-muted" style="margin-top:8px">${esc(res.detail || t("请稍候…"))}</div>`;
+      html += `<button class="rcx-act sec" id="rm-cancel">${t("取消")}</button>`;
+    } else {
+      if (res.phase === "error" && res.message) {
+        html += `<div class="rcx-err" style="font-size:12px;margin-top:6px">${esc(res.message)}</div>`;
+      }
+      if (res.statusError) {
+        html += `<div class="rcx-muted" style="font-size:12px;margin-top:6px">${esc(res.statusError)}</div>`;
+      }
+      if (res.paired) {
+        if (!res.daemonRunning || res.phase === "error") {
+          html += `<button class="rcx-act" id="rm-connect">${t("启动后台服务")}</button>`;
+        }
+        html += `<button class="rcx-act sec" id="rm-repair">${t("重新配对")}</button>`;
+        html += rmConfirmUnpair
+          ? `<div class="rcx-err" style="font-size:12px;margin-top:8px">${
+              t("断开后手机将无法再控制这台电脑,要再连需重新配对。")}</div>` +
+            `<button class="rcx-act sec" id="rm-unpair-yes" style="color:#ff8b80">${t("确认断开")}</button>` +
+            `<button class="rcx-act sec" id="rm-unpair-no">${t("取消")}</button>`
+          : `<button class="rcx-act sec" id="rm-unpair" style="color:#ff8b80">${t("断开这台电脑")}</button>`;
+      } else if (res.enabled || res.phase === "error") {
+        html += `<button class="rcx-act" id="rm-connect">${t("连接手机")}</button>`;
+      }
+    }
+    c.innerHTML = html;
+
+    const toggle = c.querySelector("#rm-toggle");
+    toggle.onchange = async () => {
+      const want = toggle.checked;
+      toggle.disabled = true;
+      rmConfirmUnpair = false;
+      const r = await bridge(want ? "/remote/enable" : "/remote/disable", {});
+      toggle.disabled = false;
+      if (!r || r.status !== "ok") {
+        toggle.checked = !want;
+        rmNote((r && (r.message || (r.error && r.error.message))) || t("设置没有生效,请重试"), true);
+        return;
+      }
+      renderRemote(true);
+    };
+    const act = (id, path) => {
+      const b = c.querySelector(id);
+      if (!b) return;
+      b.onclick = async () => {
+        b.disabled = true;
+        const r = await bridge(path, {});
+        if (!r || r.status !== "ok") {
+          b.disabled = false;
+          rmNote((r && (r.message || (r.error && r.error.message))) || t("操作失败,请重试"), true);
+          return;
+        }
+        rmConfirmUnpair = false;
+        renderRemote(true);
+      };
+    };
+    act("#rm-connect", "/remote/connect");
+    act("#rm-repair", "/remote/repair");
+    act("#rm-cancel", "/remote/cancel");
+    act("#rm-unpair-yes", "/remote/unpair");
+    const unpair = c.querySelector("#rm-unpair");
+    if (unpair) unpair.onclick = () => { rmConfirmUnpair = true; renderRemote(true); };
+    const unpairNo = c.querySelector("#rm-unpair-no");
+    if (unpairNo) unpairNo.onclick = () => { rmConfirmUnpair = false; renderRemote(true); };
   }
 
   // ── 官方侧边栏账号区接管 ────────────────────────────────────
