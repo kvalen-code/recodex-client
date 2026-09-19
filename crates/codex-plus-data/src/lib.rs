@@ -1,9 +1,14 @@
 pub mod backup;
+pub mod deleted_leftovers;
 pub mod markdown;
 pub mod provider_sync;
 pub mod storage;
 
 pub use backup::BackupStore;
+pub use deleted_leftovers::{
+    LeftoverSweepReport, LeftoverSweepStatus, sweep_deleted_thread_leftovers,
+    sweep_deleted_thread_leftovers_at_startup,
+};
 pub use markdown::{MarkdownExportService, export_markdown_from_paths};
 pub use provider_sync::{
     ProviderSyncResult, ProviderSyncStatus, ProviderSyncTargetList, ProviderSyncTargetOption,
