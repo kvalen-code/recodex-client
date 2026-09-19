@@ -162,11 +162,68 @@ fn ensure_executable_payload(bytes: &[u8]) -> anyhow::Result<()> {
             bytes.len()
         );
     }
-    #[cfg(windows)]
-    if !bytes.starts_with(b"MZ") {
-        anyhow::bail!("安装包不是 Windows 可执行文件(缺少 MZ 头),已拒绝替换");
+    ensure_native_executable_format(bytes, std::env::consts::OS)
+}
+
+/// 包体必须是**本平台**的可执行格式。
+///
+/// 服务端的更新清单不分平台:同一个 manifest_url 发给所有客户端,指着的是 Windows 的
+/// recodex.exe。原先这里只在 Windows 上查 MZ 头,macOS 上什么都不查 —— 于是 mac 用户
+/// 在面板里点「更新」,会把一个 Windows exe 写进 `.app/Contents/MacOS/`,重启即死,
+/// 而且和上面 JSON 那种情况一样没有任何代码会把 `.old` 换回来。
+///
+/// 按目标系统认魔数,不认识的平台一律拒绝(宁可更新不了,也不能把自己换成打不开的东西)。
+/// `os` 取 `std::env::consts::OS`,做成参数是为了让每个平台的分支在任何机器上都测得到。
+fn ensure_native_executable_format(bytes: &[u8], os: &str) -> anyhow::Result<()> {
+    let ok = match os {
+        "windows" => bytes.starts_with(b"MZ"),
+        "macos" => is_mach_o(bytes),
+        "linux" => bytes.starts_with(b"\x7fELF"),
+        _ => false,
+    };
+    if ok {
+        return Ok(());
     }
-    Ok(())
+    let expected = match os {
+        "windows" => "Windows 可执行文件(MZ 头)",
+        "macos" => "macOS 可执行文件(Mach-O)",
+        "linux" => "Linux 可执行文件(ELF)",
+        _ => "本平台支持的可执行文件",
+    };
+    anyhow::bail!(
+        "安装包不是{expected},已拒绝替换{}",
+        if detect_executable_os(bytes).is_some_and(|found| found != os) {
+            "(下载到的是别的平台的安装包,多半是服务端的更新清单没有区分平台)"
+        } else {
+            ""
+        }
+    )
+}
+
+/// Mach-O 的几种魔数:32/64 位、两种字节序,以及 universal(fat)包。
+fn is_mach_o(bytes: &[u8]) -> bool {
+    const MAGICS: [[u8; 4]; 6] = [
+        [0xcf, 0xfa, 0xed, 0xfe], // MH_MAGIC_64,小端(arm64 / x86_64 实际就是这个)
+        [0xce, 0xfa, 0xed, 0xfe], // MH_MAGIC,小端
+        [0xfe, 0xed, 0xfa, 0xcf], // MH_MAGIC_64,大端
+        [0xfe, 0xed, 0xfa, 0xce], // MH_MAGIC,大端
+        [0xca, 0xfe, 0xba, 0xbe], // FAT_MAGIC(universal)
+        [0xca, 0xfe, 0xba, 0xbf], // FAT_MAGIC_64
+    ];
+    bytes.len() >= 4 && MAGICS.iter().any(|magic| bytes[..4] == magic[..])
+}
+
+/// 只用于把错误信息说清楚:认得出是哪个平台的包就说出来。
+fn detect_executable_os(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"MZ") {
+        Some("windows")
+    } else if is_mach_o(bytes) {
+        Some("macos")
+    } else if bytes.starts_with(b"\x7fELF") {
+        Some("linux")
+    } else {
+        None
+    }
 }
 
 /// 把新包就位。返回被保留的旧文件路径(供调用方在下次启动时清理)。
@@ -244,19 +301,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(windows)]
+    /// 本平台的一个「像样的」包体:对的魔数 + 足够大。
+    fn native_payload(fill: u8) -> Vec<u8> {
+        let mut payload = match std::env::consts::OS {
+            "windows" => b"MZ".to_vec(),
+            "macos" => vec![0xcf, 0xfa, 0xed, 0xfe],
+            _ => b"\x7fELF".to_vec(),
+        };
+        payload.resize(128 * 1024, fill);
+        payload
+    }
+
+    fn sized(prefix: &[u8]) -> Vec<u8> {
+        let mut payload = prefix.to_vec();
+        payload.resize(128 * 1024, 0);
+        payload
+    }
+
     #[test]
-    fn payload_without_mz_header_is_rejected() {
-        // 够大但不是 PE —— 比如 OSS 返回的 HTML 错误页
+    fn payload_without_native_header_is_rejected() {
+        // 够大但不是可执行文件 —— 比如 OSS 返回的 HTML 错误页
         let junk = vec![b'<'; 128 * 1024];
         assert!(ensure_executable_payload(&junk).is_err());
     }
 
     #[test]
     fn plausible_executable_passes() {
-        let mut payload = vec![b'M', b'Z'];
-        payload.resize(128 * 1024, 0);
-        assert!(ensure_executable_payload(&payload).is_ok());
+        assert!(ensure_executable_payload(&native_payload(0)).is_ok());
+    }
+
+    /// 线上真实会发生的:更新清单不分平台,mac 客户端拿到的是 Windows 的 recodex.exe。
+    /// 原先 mac 上根本不查格式,exe 会被写进 .app 里,重启即死。
+    #[test]
+    fn a_windows_exe_is_refused_on_macos() {
+        let error = ensure_native_executable_format(&sized(b"MZ"), "macos")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Mach-O"), "{error}");
+        assert!(error.contains("别的平台"), "要说清是拿错了平台的包:{error}");
+    }
+
+    #[test]
+    fn a_mach_o_binary_is_refused_on_windows() {
+        let error = ensure_native_executable_format(&sized(&[0xcf, 0xfa, 0xed, 0xfe]), "windows")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MZ"), "{error}");
+        assert!(error.contains("别的平台"), "{error}");
+    }
+
+    #[test]
+    fn every_mach_o_flavour_is_accepted_on_macos() {
+        for magic in [
+            [0xcf, 0xfa, 0xed, 0xfe],
+            [0xce, 0xfa, 0xed, 0xfe],
+            [0xfe, 0xed, 0xfa, 0xcf],
+            [0xfe, 0xed, 0xfa, 0xce],
+            [0xca, 0xfe, 0xba, 0xbe],
+            [0xca, 0xfe, 0xba, 0xbf],
+        ] {
+            ensure_native_executable_format(&sized(&magic), "macos")
+                .unwrap_or_else(|error| panic!("{magic:02x?} 应当被认作 Mach-O:{error}"));
+        }
+    }
+
+    #[test]
+    fn native_formats_pass_on_their_own_platform() {
+        ensure_native_executable_format(&sized(b"MZ"), "windows").unwrap();
+        ensure_native_executable_format(&sized(b"\x7fELF"), "linux").unwrap();
+        assert!(ensure_native_executable_format(&sized(b"MZ"), "linux").is_err());
+    }
+
+    /// 没见过的平台一律拒绝:宁可更新不了,也不能把自己换成打不开的东西。
+    #[test]
+    fn unknown_platforms_refuse_everything() {
+        for payload in [sized(b"MZ"), sized(&[0xcf, 0xfa, 0xed, 0xfe]), sized(b"\x7fELF")] {
+            assert!(ensure_native_executable_format(&payload, "freebsd").is_err());
+        }
     }
 
     #[test]
@@ -267,9 +388,8 @@ mod tests {
         let exe = dir.join("app.exe");
         std::fs::write(&exe, b"old").unwrap();
 
-        // 形态检查在最前面,所以这里得给一个像样的包体(MZ 头 + 足够大)
-        let mut payload = vec![b'M', b'Z'];
-        payload.resize(128 * 1024, 7);
+        // 形态检查在最前面,所以这里得给一个像样的包体(本平台魔数 + 足够大)
+        let payload = native_payload(7);
 
         let old = stage_replacement(&exe, &payload).unwrap();
         assert_eq!(std::fs::read(&exe).unwrap(), payload);
