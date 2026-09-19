@@ -366,6 +366,12 @@ pub struct BackendSettings {
     pub active_aggregate_relay_id: String,
     #[serde(rename = "relayTestModel", default = "default_relay_test_model")]
     pub relay_test_model: String,
+    /// recodex-overlay: 上游 Codex++ 遗留设置的一次性清理已做过(见
+    /// `SettingsStore::sanitize_legacy_upstream_settings_once`)。必须是正式字段:
+    /// 别的写入方走 `save()` 会按结构体重新序列化,不认识的键会被丢掉,标记一丢
+    /// 就会再清一次 —— 把用户之后自己建的东西也清掉。
+    #[serde(rename = "recodexLegacySettingsSanitized", default)]
+    pub recodex_legacy_settings_sanitized: bool,
 }
 
 impl Default for BackendSettings {
@@ -426,6 +432,7 @@ impl Default for BackendSettings {
             aggregate_relay_profiles: Vec::new(),
             active_aggregate_relay_id: String::new(),
             relay_test_model: default_relay_test_model(),
+            recodex_legacy_settings_sanitized: false,
         }
     }
 }
@@ -727,6 +734,181 @@ impl SettingsStore {
             Ok(_) | Err(_) => Ok(settings_to_object(&BackendSettings::default())),
         }
     }
+}
+
+/// 一次性清理上游遗留设置的结果。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LegacySettingsSanitizeReport {
+    pub provider_sync_disabled: bool,
+    pub dropped_relay_profiles: Vec<String>,
+    pub dropped_aggregate_profiles: usize,
+    pub active_relay_reset: bool,
+    pub backup: Option<PathBuf>,
+}
+
+impl LegacySettingsSanitizeReport {
+    pub fn changed(&self) -> bool {
+        self.provider_sync_disabled
+            || !self.dropped_relay_profiles.is_empty()
+            || self.dropped_aggregate_profiles > 0
+            || self.active_relay_reset
+    }
+}
+
+const LEGACY_SANITIZED_KEY: &str = "recodexLegacySettingsSanitized";
+
+impl SettingsStore {
+    /// 从上游 Codex++ 数据目录(`~/.codex-session-delete`)整体搬过来的设置里,
+    /// 有两类东西在 ReCodex 里是**有害**的,一次性清掉:
+    ///
+    ///   - `providerSyncEnabled = true`:每次启动跑上游的 provider_sync,改写会话库里
+    ///     的 provider 归属 —— ReCodex 的托管配置自己管 provider,两边会互相打架;
+    ///   - 中转 / 聚合 / chat 协议(以及「官方 + 混入 API Key」)的 relay 配置:启动时
+    ///     按它改写 config.toml,并拉起一个没人用的协议代理占着 57321。ReCodex 面板里
+    ///     没有这些设置的入口,用户看不见也关不掉。
+    ///
+    /// ReCodex 自己的安装不会产生这两类状态(面板不暴露这些开关),所以对「已经搬过、
+    /// 还没清过」的设置同样适用:以 `recodexLegacySettingsSanitized` 为标记只做一次。
+    /// 动手前把原文件备份成 `settings.json.pre-recodex-legacy-sanitize.bak`(已有不覆盖)。
+    /// 文件不存在(全新安装)时什么都不做,也不写标记。
+    pub fn sanitize_legacy_upstream_settings_once(
+        &self,
+    ) -> anyhow::Result<Option<LegacySettingsSanitizeReport>> {
+        let contents = match fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read settings {}", self.path.display()));
+            }
+        };
+        // 读不成对象的文件 load() 会当默认值处理;这里不去碰它。
+        let Ok(Value::Object(mut raw)) = serde_json::from_str::<Value>(&contents) else {
+            return Ok(None);
+        };
+        if raw.get(LEGACY_SANITIZED_KEY).and_then(Value::as_bool) == Some(true) {
+            return Ok(None);
+        }
+        let mut report = sanitize_legacy_upstream_settings_object(&mut raw);
+        raw.insert(LEGACY_SANITIZED_KEY.to_string(), Value::Bool(true));
+        if report.changed() {
+            let backup = PathBuf::from(format!(
+                "{}.pre-recodex-legacy-sanitize.bak",
+                self.path.display()
+            ));
+            if !backup.exists() {
+                atomic_write(&backup, contents.as_bytes())?;
+            }
+            report.backup = Some(backup);
+        }
+        let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
+        atomic_write(&self.path, &bytes)?;
+        Ok(Some(report))
+    }
+}
+
+/// 纯数据版本,便于测试。只改需要改的键,其余原样保留(包括本结构体不认识的键)。
+pub fn sanitize_legacy_upstream_settings_object(
+    raw: &mut Map<String, Value>,
+) -> LegacySettingsSanitizeReport {
+    let mut report = LegacySettingsSanitizeReport::default();
+    if raw.get("providerSyncEnabled").and_then(Value::as_bool) == Some(true) {
+        raw.insert("providerSyncEnabled".to_string(), Value::Bool(false));
+        report.provider_sync_disabled = true;
+    }
+
+    if let Some(Value::Array(profiles)) = raw.get_mut("relayProfiles") {
+        let mut kept = Vec::with_capacity(profiles.len());
+        for profile in profiles.drain(..) {
+            if is_plain_official_relay_profile(&profile) {
+                kept.push(profile);
+            } else {
+                report.dropped_relay_profiles.push(
+                    profile
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        *profiles = kept;
+    }
+    if !report.dropped_relay_profiles.is_empty() {
+        let remaining_ids = raw
+            .get("relayProfiles")
+            .and_then(Value::as_array)
+            .map(|profiles| {
+                profiles
+                    .iter()
+                    .filter_map(|profile| profile.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if remaining_ids.is_empty() {
+            // 全删光了就交回默认值(一条「官方」配置),别留一个空数组。
+            raw.remove("relayProfiles");
+        }
+        let active = raw
+            .get("activeRelayId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !remaining_ids.contains(&active) {
+            match remaining_ids.first() {
+                Some(first) => {
+                    raw.insert("activeRelayId".to_string(), Value::String(first.clone()));
+                }
+                None => {
+                    raw.remove("activeRelayId");
+                }
+            }
+            report.active_relay_reset = true;
+        }
+    }
+
+    if let Some(Value::Array(aggregates)) = raw.get("aggregateRelayProfiles") {
+        report.dropped_aggregate_profiles = aggregates.len();
+    }
+    if report.dropped_aggregate_profiles > 0 {
+        raw.insert("aggregateRelayProfiles".to_string(), Value::Array(Vec::new()));
+    }
+    if raw
+        .get("activeAggregateRelayId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        raw.insert(
+            "activeAggregateRelayId".to_string(),
+            Value::String(String::new()),
+        );
+        report.active_relay_reset = true;
+    }
+    report
+}
+
+/// ReCodex 里唯一「无害」的 relay 配置:官方模式、Responses 协议、不混入 API Key、
+/// 没有按模型分流。其余都是上游 Codex++ 的中转玩法。注意 relayMode 缺省是
+/// mixedApi(与 `RelayMode::default()` 一致),缺字段不能当成官方。
+fn is_plain_official_relay_profile(profile: &Value) -> bool {
+    let relay_mode = profile
+        .get("relayMode")
+        .and_then(Value::as_str)
+        .unwrap_or("mixedApi");
+    let protocol = profile
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or("responses");
+    let mix_api_key = profile
+        .get("officialMixApiKey")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_routes = profile
+        .get("modelRoutes")
+        .and_then(Value::as_array)
+        .is_some_and(|routes| !routes.is_empty());
+    relay_mode == "official" && protocol == "responses" && !mix_api_key && !has_routes
 }
 
 fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<String, Value>) {
@@ -1218,6 +1400,91 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn legacy_upstream_settings() -> Value {
+        json!({
+            "providerSyncEnabled": true,
+            "relayProfilesEnabled": true,
+            "activeRelayId": "relay-chat",
+            "activeAggregateRelayId": "agg-1",
+            "someUnknownKey": 7,
+            "relayProfiles": [
+                { "id": "default", "name": "官方", "relayMode": "official", "protocol": "responses" },
+                { "id": "relay-chat", "name": "中转", "relayMode": "pureApi", "protocol": "chatCompletions" },
+                { "id": "mixed-no-mode", "name": "缺字段=mixedApi" },
+                { "id": "official-mix", "relayMode": "official", "officialMixApiKey": true },
+                { "id": "routes", "relayMode": "official", "modelRoutes": [{ "model": "x" }] }
+            ],
+            "aggregateRelayProfiles": [{ "id": "agg-1", "name": "聚合", "members": [] }]
+        })
+    }
+
+    #[test]
+    fn legacy_upstream_settings_are_sanitized_once_with_backup() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let original = serde_json::to_string_pretty(&legacy_upstream_settings()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let store = SettingsStore::new(path.clone());
+
+        let report = store.sanitize_legacy_upstream_settings_once().unwrap().unwrap();
+        assert!(report.provider_sync_disabled);
+        assert_eq!(
+            report.dropped_relay_profiles,
+            vec!["relay-chat", "mixed-no-mode", "official-mix", "routes"]
+        );
+        assert_eq!(report.dropped_aggregate_profiles, 1);
+        assert!(report.active_relay_reset);
+        let backup = report.backup.clone().unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+
+        let settings = store.load().unwrap();
+        assert!(!settings.provider_sync_enabled);
+        assert_eq!(settings.active_relay_id, "default");
+        assert_eq!(settings.relay_profiles.len(), 1);
+        assert!(settings.aggregate_relay_profiles.is_empty());
+        assert!(settings.active_aggregate_relay_id.is_empty());
+        assert!(!settings.active_relay_uses_protocol_proxy());
+        assert!(settings.recodex_legacy_settings_sanitized);
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["someUnknownKey"], 7, "不认识的键要原样保留");
+
+        // 标记在:之后用户自己再开的东西不会被再清一次(即便经过 save() 往返)。
+        let mut again = store.load().unwrap();
+        again.provider_sync_enabled = true;
+        store.save(&again).unwrap();
+        assert_eq!(store.sanitize_legacy_upstream_settings_once().unwrap(), None);
+        assert!(store.load().unwrap().provider_sync_enabled);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_sanitize_marks_clean_settings_without_backup_and_skips_missing_file() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        assert_eq!(store.sanitize_legacy_upstream_settings_once().unwrap(), None);
+        assert!(!path.exists(), "全新安装不应凭空写出设置文件");
+
+        std::fs::write(&path, r#"{"providerSyncEnabled":false,"enhancementsEnabled":true}"#)
+            .unwrap();
+        let report = store.sanitize_legacy_upstream_settings_once().unwrap().unwrap();
+        assert!(!report.changed());
+        assert!(report.backup.is_none());
+        assert!(store.load().unwrap().recodex_legacy_settings_sanitized);
+        assert!(!dir.join("settings.json.pre-recodex-legacy-sanitize.bak").exists());
+
+        // 全部 relay 都是遗留的 → 回到默认的一条官方配置。
+        let mut raw = legacy_upstream_settings().as_object().unwrap().clone();
+        raw["relayProfiles"] = json!([{ "id": "relay-chat", "relayMode": "pureApi" }]);
+        let report = sanitize_legacy_upstream_settings_object(&mut raw);
+        assert_eq!(report.dropped_relay_profiles, vec!["relay-chat"]);
+        assert!(!raw.contains_key("relayProfiles"));
+        assert!(!raw.contains_key("activeRelayId"));
+        let settings: BackendSettings = serde_json::from_value(Value::Object(raw)).unwrap();
+        assert_eq!(settings.active_relay_profile().relay_mode, RelayMode::Official);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

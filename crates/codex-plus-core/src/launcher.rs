@@ -1195,7 +1195,9 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
-        SettingsStore::default().load()
+        let store = SettingsStore::default();
+        sanitize_legacy_upstream_settings_nonfatal(&store);
+        store.load()
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
@@ -3168,6 +3170,40 @@ pub fn bridge_watchdog_elapsed_secs(consecutive_failures: u32) -> u64 {
     (0..consecutive_failures)
         .map(|failures| bridge_watchdog_delay(failures).as_secs())
         .sum()
+}
+
+/// 启动时对上游 Codex++ 遗留设置做一次性清理(见
+/// `SettingsStore::sanitize_legacy_upstream_settings_once`)。失败不影响启动。
+///
+/// 放在启动流程读设置的这一处:它早于 provider_sync、relay 配置应用和协议代理
+/// 的判断,清理完再读,本次启动就不会再按遗留设置行事。测试进程里除非显式
+/// 指定了设置路径,否则不碰 —— 那是开发机上真实的 ~/.recodex/settings.json。
+fn sanitize_legacy_upstream_settings_nonfatal(store: &SettingsStore) {
+    if crate::diagnostic_log::running_under_test_harness()
+        && !crate::paths::settings_path_overridden_for_tests()
+    {
+        return;
+    }
+    match store.sanitize_legacy_upstream_settings_once() {
+        Ok(Some(report)) if report.changed() => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.legacy_settings_sanitized",
+                serde_json::json!({
+                    "provider_sync_disabled": report.provider_sync_disabled,
+                    "dropped_relay_profiles": report.dropped_relay_profiles.len(),
+                    "dropped_aggregate_profiles": report.dropped_aggregate_profiles,
+                    "active_relay_reset": report.active_relay_reset,
+                }),
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.legacy_settings_sanitize_failed",
+                serde_json::json!({ "message": format!("{error:#}") }),
+            );
+        }
+    }
 }
 
 /// 第二个 launcher 发现已有实例时,主实例实际在用的端口。
