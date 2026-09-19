@@ -131,6 +131,12 @@ pub fn running_under_test_harness() -> bool {
     test_harness_diagnostic_log_path().is_some()
 }
 
+/// 测试二进制的名字(按它给测试数据分目录/分文件),非测试进程返回 None。
+pub fn test_harness_binary_name() -> Option<String> {
+    test_harness_diagnostic_log_path()
+        .and_then(|path| path.file_stem().and_then(|stem| stem.to_str()).map(str::to_string))
+}
+
 /// 测试进程的诊断日志落在这里(按测试二进制名分文件,便于看出是谁在写)。
 pub fn test_harness_log_dir() -> PathBuf {
     std::env::temp_dir().join("recodex-test-diagnostics")

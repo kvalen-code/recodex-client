@@ -48,14 +48,10 @@ const MARKER_VERSION: u64 = 1;
 /// 启动期清扫最多占用的时间。它挡在拉起 Codex 前面,超出部分顺延到下次启动。
 pub const STARTUP_SWEEP_BUDGET: Duration = Duration::from_millis(1500);
 
-/// 限时清扫里单份备份的大小上限。
-///
-/// 预算只在**备份之间**检查,而清理一条线程要把残骸并回它最新的那份备份:那一步是
-/// 「整份读进内存 → pretty 重新序列化 → 原子写回」,几百 MB 的备份(rollout 以
-/// base64 存在里面)一次就能超时好几秒,正好卡在拉起 Codex 前面。超过上限的这一轮
-/// 直接顺延(不打标记,下次还会再来),并记在报告里,好知道现实里到底有没有发生。
-/// 不限时的整轮清扫(`sweep_deleted_thread_leftovers`)不受这个上限约束。
-pub const MAX_MERGE_BACKUP_BYTES: u64 = 32 * 1024 * 1024;
+// 残骸不再并回主备份文件(那是「整份读入 + pretty 重写」,几百 MB 的备份能把启动
+// 卡住好几秒),改成写同 token 的 sidecar `<token>.leftovers.json`,撤销时由
+// BackupStore::read_backup 合回去。所以这里不需要任何备份大小上限 —— 上一版为此
+// 加的 32MB 上限会让超大备份对应的幽灵条目**永远**清不掉(第三轮审计 应修 1)。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,8 +76,6 @@ pub struct LeftoverSweepReport {
     pub catalog_rows_removed: usize,
     /// 这一轮没下结论、留到下次的线程数（库查不了/清理中途失败/超时）。
     pub threads_deferred: usize,
-    /// 因为备份太大(见 `MAX_MERGE_BACKUP_BYTES`)而顺延的线程数。
-    pub threads_oversized: usize,
     pub errors: Vec<String>,
 }
 
@@ -96,7 +90,6 @@ impl LeftoverSweepReport {
             global_state_entries_removed: 0,
             catalog_rows_removed: 0,
             threads_deferred: 0,
-            threads_oversized: 0,
             errors: Vec::new(),
         }
     }
@@ -120,7 +113,6 @@ pub fn sweep_deleted_thread_leftovers_at_startup(codex_home: &Path, backup_dir: 
     let nothing_happened = report.status == LeftoverSweepStatus::Completed
         && report.threads_cleaned == 0
         && report.threads_deferred == 0
-        && report.threads_oversized == 0
         && report.errors.is_empty();
     if !nothing_happened {
         // 只上报计数与状态;错误信息里可能带本机路径,只报条数。
@@ -132,7 +124,6 @@ pub fn sweep_deleted_thread_leftovers_at_startup(codex_home: &Path, backup_dir: 
                 "threads_cleaned": report.threads_cleaned,
                 "threads_still_present": report.threads_still_present,
                 "threads_deferred": report.threads_deferred,
-                "threads_oversized": report.threads_oversized,
                 "session_index_lines_removed": report.session_index_lines_removed,
                 "global_state_entries_removed": report.global_state_entries_removed,
                 "catalog_rows_removed": report.catalog_rows_removed,
@@ -157,19 +148,6 @@ pub fn sweep_deleted_thread_leftovers_within(
     codex_home: &Path,
     backup_dir: &Path,
     budget: Duration,
-) -> anyhow::Result<LeftoverSweepReport> {
-    // 不限时的整轮清扫不设大小上限(没人在等它);限时的启动清扫要躲开巨型备份。
-    let merge_size_cap = (budget != Duration::MAX).then_some(MAX_MERGE_BACKUP_BYTES);
-    sweep_deleted_thread_leftovers_with_limits(codex_home, backup_dir, budget, merge_size_cap)
-}
-
-/// 限时 + 单份备份大小上限。上限单独暴露出来是为了能测:真造一份 32MB 的备份
-/// 只会让测试变慢,证明不了别的。
-pub fn sweep_deleted_thread_leftovers_with_limits(
-    codex_home: &Path,
-    backup_dir: &Path,
-    budget: Duration,
-    merge_size_cap: Option<u64>,
 ) -> anyhow::Result<LeftoverSweepReport> {
     let deadline = Instant::now().checked_add(budget);
     let out_of_time = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
@@ -279,15 +257,6 @@ pub fn sweep_deleted_thread_leftovers_with_limits(
             Presence::Absent => {}
         }
         let newest = token_ids.last().expect("每个线程至少一份备份").clone();
-        let newest_path = backup_dir.join(format!("{newest}.json"));
-        if let Some(cap) = merge_size_cap {
-            let too_big = fs::metadata(&newest_path).map(|meta| meta.len() > cap).unwrap_or(false);
-            if too_big {
-                // 不打标记:下次启动(或不限时的整轮清扫)还会再处理它。
-                report.threads_oversized += 1;
-                continue;
-            }
-        }
         match clean_thread(codex_home, backup_dir, &newest, &thread_id) {
             Ok(None) => mark_all(&mut marker, &token_ids, "no_leftovers"),
             Ok(Some(cleaned)) => {
@@ -346,8 +315,14 @@ fn clean_thread(
         .map(Vec::len)
         .unwrap_or(0);
 
-    // 先备份：并进原删除备份，撤销原 token 就能连同这些条目一起恢复。
-    merge_into_backup(&backup_dir.join(format!("{newest_token}.json")), &leftovers)?;
+    // 先备份:写进同 token 的 sidecar(几 KB),撤销原 token 时 BackupStore 会把它
+    // 合回来 —— 不去动可能有几百 MB 的主备份文件。
+    let store = crate::BackupStore::new(backup_dir.to_path_buf());
+    anyhow::ensure!(
+        store.path_for(newest_token).is_file(),
+        "备份不存在:{newest_token}"
+    );
+    store.append_leftovers(newest_token, &leftovers)?;
 
     let session_index_lines =
         crate::provider_sync::remove_session_index_entry(codex_home, thread_id)?;
@@ -593,86 +568,6 @@ fn session_index_thread_ids(codex_home: &Path) -> anyhow::Result<HashSet<String>
         .filter_map(|value| value.get("id").and_then(Value::as_str).map(str::to_string))
         .map(|id| id.strip_prefix("local:").map(str::to_string).unwrap_or(id))
         .collect())
-}
-
-/// 把残骸并进已有备份：索引行取并集，侧边栏快照按条目补齐，目录缓存行追加
-/// （撤销时是 INSERT OR IGNORE，重复无害）。
-fn merge_into_backup(path: &Path, leftovers: &Map<String, Value>) -> anyhow::Result<()> {
-    let mut backup: Value = serde_json::from_slice(&fs::read(path)?)?;
-    let tables = backup
-        .get_mut("tables")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow::anyhow!("备份缺少 tables"))?;
-
-    if let Some(lines) = leftovers.get("__session_index").and_then(Value::as_array) {
-        let target = tables
-            .entry("__session_index")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Some(target) = target.as_array_mut() {
-            for line in lines {
-                if !target.contains(line) {
-                    target.push(line.clone());
-                }
-            }
-        }
-    }
-
-    if let Some(snapshot) = leftovers.get("__sidebar") {
-        match tables.get_mut("__sidebar") {
-            None => {
-                tables.insert("__sidebar".to_string(), snapshot.clone());
-            }
-            Some(existing) => merge_sidebar_snapshot(existing, snapshot),
-        }
-    }
-
-    codex_plus_core::settings::atomic_write(path, serde_json::to_string_pretty(&backup)?.as_bytes())
-}
-
-fn merge_sidebar_snapshot(existing: &mut Value, incoming: &Value) {
-    let Some(existing) = existing.as_object_mut() else {
-        return;
-    };
-    if let Some(incoming_global) = incoming.get("global_state").and_then(Value::as_object) {
-        let global = existing
-            .entry("global_state")
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Some(global) = global.as_object_mut() {
-            merge_missing(global, incoming_global);
-        }
-    }
-    if let Some(incoming_catalog) = incoming.get("catalog").and_then(Value::as_array) {
-        let catalog = existing
-            .entry("catalog")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Some(catalog) = catalog.as_array_mut() {
-            for entry in incoming_catalog {
-                if !catalog.contains(entry) {
-                    catalog.push(entry.clone());
-                }
-            }
-        }
-    }
-}
-
-/// 递归补齐：对象按键补缺，数组取并集，已有的标量不覆盖。
-fn merge_missing(target: &mut Map<String, Value>, incoming: &Map<String, Value>) {
-    for (key, value) in incoming {
-        match (target.get_mut(key), value) {
-            (None, _) => {
-                target.insert(key.clone(), value.clone());
-            }
-            (Some(Value::Object(target)), Value::Object(value)) => merge_missing(target, value),
-            (Some(Value::Array(target)), Value::Array(values)) => {
-                for value in values {
-                    if !target.contains(value) {
-                        target.push(value.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 fn list_backup_tokens(backup_dir: &Path) -> anyhow::Result<Vec<String>> {

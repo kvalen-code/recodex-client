@@ -515,6 +515,11 @@ impl SQLiteStorageAdapter {
     }
 
     pub fn undo(&self, token: &str) -> DeleteResult {
+        // 已经恢复成功的备份 token。批量撤销(一条会话在多个库里)中途失败时,
+        // 前面那几份是真的回来了,必须**立刻**记上 undone —— 否则启动清扫看它们
+        // 「有备份、库里也有」还好,可纯 API 那种只能靠标记,会被当成残骸再清一次
+        // (第三轮审计 5)。
+        let mut restored_tokens = Vec::new();
         let result = (|| -> anyhow::Result<DeleteResult> {
             let backups = undo_backups(&self.backup_store, token)?;
             let session_id = backups[0]["session_id"].as_str().unwrap_or("").to_string();
@@ -523,12 +528,8 @@ impl SQLiteStorageAdapter {
                 &self.db_path,
                 &self.allowed_db_paths,
                 self.codex_home.as_deref(),
+                &mut restored_tokens,
             )?;
-            // 撤销过的备份不再是「已删除的证据」:告诉启动清扫别再按它清一遍(R2)。
-            crate::deleted_leftovers::record_undone_backups(
-                self.backup_store.root(),
-                &undo_tokens(token),
-            );
             Ok(DeleteResult {
                 status: DeleteStatus::Undone,
                 session_id,
@@ -537,6 +538,9 @@ impl SQLiteStorageAdapter {
                 backup_path: None,
             })
         })();
+        // 撤销过的备份不再是「已删除的证据」:告诉启动清扫别再按它清一遍(R2)。
+        // 成功、部分成功都要记,只记真的恢复回来的那几份。
+        crate::deleted_leftovers::record_undone_backups(self.backup_store.root(), &restored_tokens);
         result.unwrap_or_else(|err| failed_with_undo("", err.to_string(), token, None))
     }
 
@@ -1051,6 +1055,7 @@ fn restore_backups(
     fallback_db_path: &Path,
     allowed_db_paths: &[PathBuf],
     codex_home: Option<&Path>,
+    restored_tokens: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     for backup in backups {
         let Some(tables) = backup["tables"].as_object() else {
@@ -1167,6 +1172,10 @@ fn restore_backups(
                     );
                 }
             }
+        }
+        // 这一份恢复完就登记:后面哪一份失败了,前面这些也不该再被当成「还删着」。
+        if let Some(token) = backup["token"].as_str() {
+            restored_tokens.push(token.to_string());
         }
     }
     Ok(())

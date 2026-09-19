@@ -510,6 +510,16 @@ async fn fetch_models_from_source(
     client: &reqwest::Client,
     source: &ModelSource,
 ) -> (Vec<String>, Value) {
+    fetch_models_from_source_with_timeout(client, source, MODEL_LIST_REQUEST_TIMEOUT).await
+}
+
+/// 超时是参数,这样「上游不响应时会不会挂死」能真的测出来(测试用几百毫秒,
+/// 生产用 MODEL_LIST_REQUEST_TIMEOUT)。
+async fn fetch_models_from_source_with_timeout(
+    client: &reqwest::Client,
+    source: &ModelSource,
+    timeout: std::time::Duration,
+) -> (Vec<String>, Value) {
     let endpoint = models_endpoint(&source.base_url);
     let mut safe_source = json!({
         "id": source.source_id,
@@ -530,7 +540,7 @@ async fn fetch_models_from_source(
     // 这里会永久挂起 —— 面板的模型列表就一直转圈(上游 b498c4c)。超时只加在这一次请求上。
     let mut request = client
         .get(&endpoint)
-        .timeout(MODEL_LIST_REQUEST_TIMEOUT)
+        .timeout(timeout)
         .header(reqwest::header::ACCEPT, "application/json");
     if !source.api_key.is_empty() {
         request = request.bearer_auth(&source.api_key);
@@ -977,16 +987,50 @@ mod models_endpoint_tests {
     use super::models_endpoint;
 
     /// 拉模型列表必须有总超时(上游 b498c4c):共用 client 没有,漏了就会永久挂起。
-    #[test]
-    fn model_list_fetch_has_a_request_timeout() {
+    ///
+    /// 行为测试:起一个**只接受连接、永不回应**的服务器,拉它必须在超时后带着
+    /// 失败状态返回,而不是把整个面板卡住(第三轮审计 11,原先只断言源码里有
+    /// `.timeout(...)` 这行字)。
+    #[tokio::test]
+    async fn model_list_fetch_times_out_instead_of_hanging() {
         assert_eq!(
             super::MODEL_LIST_REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(30)
+            std::time::Duration::from_secs(30),
+            "生产用的总超时"
         );
-        let source = include_str!("model_catalog.rs");
-        let body = &source[source.find("async fn fetch_models_from_source(").unwrap()..];
-        let body = &body[..body.find("fn failed_source(").unwrap()];
-        assert!(body.contains(".timeout(MODEL_LIST_REQUEST_TIMEOUT)"));
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // 收下连接就攥着不放,一个字节都不回。
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+            }
+        });
+        let source = super::ModelSource {
+            source_id: "test".to_string(),
+            source_type: "test".to_string(),
+            name: "hanging".to_string(),
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            api_key: String::new(),
+        };
+        let client = reqwest::Client::new();
+
+        let started = std::time::Instant::now();
+        let (models, status) = super::fetch_models_from_source_with_timeout(
+            &client,
+            &source,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+
+        assert!(models.is_empty());
+        assert_eq!(status["status"], "failed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "必须被超时掐断,实际用了 {:?}",
+            started.elapsed()
+        );
     }
 
     // 这个函数踩过两次拼接错:先是 ARK 的版本化 base 拼出 `/v3/v1/models`,

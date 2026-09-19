@@ -15,6 +15,12 @@ const PENDING_PROVIDER_IMPORT_FILE: &str = "pending-provider-import.json";
 const PENDING_REMOTE_CONTROL_RECOVERY_FILE: &str = "pending-remote-control-recovery.json";
 
 pub fn default_app_state_dir() -> PathBuf {
+    // 测试进程不许碰真实的 ~/.recodex:那里躺着用户的设置、状态文件、备份和单实例
+    // 锁文件。以前只有诊断日志做了重定向,于是跑测试会在真实目录里建/删锁文件
+    // (第三轮审计 10)。整个数据目录一起重定向到临时目录,按测试二进制分开。
+    if let Some(dir) = test_harness_app_state_dir() {
+        return dir;
+    }
     if let Some(home_dir) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
         let current = home_dir.join(APP_STATE_DIR);
         migrate_legacy_app_state_dir(&home_dir.join(LEGACY_APP_STATE_DIR), &current);
@@ -22,6 +28,15 @@ pub fn default_app_state_dir() -> PathBuf {
     }
 
     PathBuf::from(APP_STATE_DIR)
+}
+
+fn test_harness_app_state_dir() -> Option<PathBuf> {
+    let binary = crate::diagnostic_log::test_harness_binary_name()?;
+    let dir = crate::diagnostic_log::test_harness_log_dir()
+        .join("state")
+        .join(binary);
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
 }
 
 /// 把旧数据目录搬到新位置。只在「新目录还不存在且旧目录存在」时动手,
@@ -148,40 +163,64 @@ pub fn set_settings_path_for_tests(path: Option<PathBuf>) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// 这几条断言的是「都落在同一个数据目录下、文件名对」。不能再写死
+    /// `.recodex/xxx`:测试进程的数据目录已经重定向到临时目录了(见下一条)。
     #[test]
     fn default_settings_path_uses_app_state_directory() {
         let _guard = settings_path_test_guard();
         let path = default_settings_path();
 
-        assert!(path.ends_with(".recodex/settings.json"));
+        assert_eq!(path.parent(), Some(default_app_state_dir().as_path()));
+        assert!(path.ends_with(SETTINGS_FILE));
     }
 
     #[test]
     fn default_latest_status_path_uses_app_state_directory() {
         let path = default_latest_status_path();
 
-        assert!(path.ends_with(".recodex/latest-status.json"));
+        assert_eq!(path.parent(), Some(default_app_state_dir().as_path()));
+        assert!(path.ends_with(LATEST_STATUS_FILE));
     }
 
     #[test]
     fn default_diagnostic_log_path_uses_app_state_directory() {
         let path = default_diagnostic_log_path();
 
-        assert!(path.ends_with(".recodex/recodex.log"));
+        assert_eq!(path.parent(), Some(default_app_state_dir().as_path()));
+        assert!(path.ends_with(DIAGNOSTIC_LOG_FILE));
     }
 
     #[test]
     fn default_pending_provider_import_path_uses_app_state_directory() {
         let path = default_pending_provider_import_path();
 
-        assert!(path.ends_with(".recodex/pending-provider-import.json"));
+        assert_eq!(path.parent(), Some(default_app_state_dir().as_path()));
+        assert!(path.ends_with(PENDING_PROVIDER_IMPORT_FILE));
     }
 
     #[test]
     fn default_pending_remote_control_recovery_path_uses_app_state_directory() {
         let path = default_pending_remote_control_recovery_path();
 
-        assert!(path.ends_with(".recodex/pending-remote-control-recovery.json"));
+        assert_eq!(path.parent(), Some(default_app_state_dir().as_path()));
+        assert!(path.ends_with(PENDING_REMOTE_CONTROL_RECOVERY_FILE));
+    }
+
+    /// 第三轮审计 10:测试进程不许碰真实的 ~/.recodex —— 那里有用户的设置、状态
+    /// 文件、备份和单实例锁文件,以前跑测试会在里面建/删锁文件。
+    #[test]
+    fn test_harness_state_dir_is_redirected_out_of_the_user_home() {
+        let dir = default_app_state_dir();
+
+        assert!(
+            dir.starts_with(crate::diagnostic_log::test_harness_log_dir()),
+            "{dir:?} 应该落在测试临时目录下"
+        );
+        if let Some(home) = directories::BaseDirs::new() {
+            assert_ne!(dir, home.home_dir().join(APP_STATE_DIR), "不能是真实数据目录");
+        }
+        // 每个测试二进制一个子目录,互相不串数据。
+        assert!(dir.file_name().is_some_and(|name| !name.is_empty()));
     }
 
     #[test]

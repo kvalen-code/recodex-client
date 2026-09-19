@@ -427,3 +427,46 @@ fn unrelated_database_still_allows_the_index_fallback() {
     assert_eq!(result.status, DeleteStatus::LocalDeleted, "{}", result.message);
     assert!(!index_has(&h.home, "api2"));
 }
+
+/// 第三轮 5:批量撤销(一个 token 里裹着好几份备份)中途失败时,前面已经恢复成功的
+/// 那几份必须立刻拿到 undone 标记 —— 否则启动清扫会把它们当成残骸再清一次。
+#[test]
+fn partial_batch_undo_marks_the_backups_that_did_come_back() {
+    let h = home_with_thread();
+    // 第一份:带数据库行的正常删除。
+    let db_token = SQLiteStorageAdapter::new(&h.db, BackupStore::new(&h.backups))
+        .with_codex_home(&h.home)
+        .delete_local(&session("local:t1"))
+        .undo_token
+        .unwrap();
+    // 第二份:纯 API 会话(只有索引/侧边栏)。
+    let mut index = fs::read_to_string(h.home.join("session_index.jsonl")).unwrap();
+    index.push_str("{\"id\":\"api1\",\"thread_name\":\"API\",\"updated_at\":\"2026-09-20T00:00:00Z\"}\n");
+    fs::write(h.home.join("session_index.jsonl"), index).unwrap();
+    let api_token = delete_local_from_paths(
+        vec![h.db.clone()],
+        BackupStore::new(&h.backups),
+        &session("api1"),
+        Some(h.home.as_path()),
+    )
+    .undo_token
+    .unwrap();
+    // 把索引变成目录:第二份恢复必然失败,第一份已经恢复完了。
+    fs::remove_file(h.home.join("session_index.jsonl")).unwrap();
+    fs::create_dir(h.home.join("session_index.jsonl")).unwrap();
+
+    let grouped = serde_json::to_string(&vec![db_token.clone(), api_token.clone()]).unwrap();
+    let undone = SQLiteStorageAdapter::new(&h.db, BackupStore::new(&h.backups))
+        .with_codex_home(&h.home)
+        .undo(&grouped);
+
+    assert_eq!(undone.status, DeleteStatus::Failed, "{}", undone.message);
+    assert_eq!(thread_rows(&h.db, "t1"), 1, "第一份确实恢复了");
+    let marker: Value =
+        serde_json::from_slice(&fs::read(h.backups.join(".leftover-sweep.json")).unwrap()).unwrap();
+    assert_eq!(marker["processed"][&db_token], "undone", "恢复成功的要记上");
+    assert!(
+        marker["processed"].get(&api_token).is_none(),
+        "没恢复成功的不能记:它还得能再撤一次"
+    );
+}

@@ -108,7 +108,39 @@ const root = new FakeElement({
   ] : [],
 });
 const items = outline.collect(root);
+// ---- 观察范围 / 失败日志上限(第三轮 9) ----
+const scrollContainer = new FakeElement({ name: "scroll-1" });
+const observed = [];
+globalThis.MutationObserver = class {
+  constructor(callback) { this.callback = callback; }
+  observe(target, options) { observed.push({ target, options }); this.target = target; }
+  disconnect() { observed.push({ target: null, disconnected: true }); }
+  takeRecords() { return []; }
+};
+document.querySelector = (selector) => (selector === ".thread-scroll-container" ? scrollContainer : null);
+outline.disconnect();
+observed.length = 0;
+outline.observe();
+const firstTarget = observed.at(-1)?.target;
+outline.observe();
+const observeCallsAfterSameTarget = observed.filter((entry) => entry.target).length;
+const swapped = new FakeElement({ name: "scroll-2" });
+document.querySelector = (selector) => (selector === ".thread-scroll-container" ? swapped : null);
+outline.observe();
+const secondTarget = observed.at(-1)?.target;
+// 失败日志上限
+window.__codexSessionDeleteScanFailures = [];
+for (let i = 0; i < 80; i += 1) {
+  outline.runScanStep(() => { throw new Error(`boom-${i}`); });
+}
+const failures = window.__codexSessionDeleteScanFailures;
+
 const outlineCases = {
+  observedScrollContainer: firstTarget === scrollContainer,
+  observeIsIdempotentForTheSameTarget: observeCallsAfterSameTarget === 1,
+  reobservesWhenTheContainerIsSwapped: secondTarget === swapped,
+  scanFailureCap: failures.length,
+  scanFailureKeepsLatest: failures[failures.length - 1].includes("boom-79"),
   staleOutlineRemovedOnReinject: staleOutline.removed === 1,
   items: items.map((item) => ({ text: item.text, depth: item.depth })),
   headingYes: ["1. 背景", "总结", "方案：", "Next steps"].map(outline.looksLikeHeading),
@@ -198,6 +230,19 @@ fn answer_outline_reinjection_and_heading_collection() {
     );
     assert_eq!(outline["headingYes"], serde_json::json!([true, true, true, true]));
     assert_eq!(outline["headingNo"], serde_json::json!([false, false, false]));
+}
+
+/// 第三轮 9:大纲观察者只盯对话滚动区(不是整个 body),容器换了要跟着换;
+/// scan 失败日志有上限,别无限涨。
+#[test]
+fn answer_outline_observes_only_the_conversation_and_scan_failures_are_capped() {
+    let result = run_harness();
+    let outline = &result["outlineCases"];
+    assert_eq!(outline["observedScrollContainer"], true);
+    assert_eq!(outline["observeIsIdempotentForTheSameTarget"], true);
+    assert_eq!(outline["reobservesWhenTheContainerIsSwapped"], true);
+    assert_eq!(outline["scanFailureCap"], 50);
+    assert_eq!(outline["scanFailureKeepsLatest"], true);
 }
 
 /// 应修 1(前端):删到一半(partial)必须移除行**并且**给撤销按钮,文案保留「部分失败」;

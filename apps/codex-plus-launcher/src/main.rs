@@ -60,23 +60,27 @@ impl Default for LauncherHooks {
             )),
             bridge_context: Arc::new(Mutex::new(None)),
             // recodex-overlay: ReCodexState 只建一次(load 保存的凭据),跨重注入共享,不丢登录态。
+            // 诊断回传线程**不在这里起**:第二实例也会建 LauncherHooks,而回传线程会和
+            // 主实例抢同一个水位边车文件(两边各自推进水位 → 有的条目重复传、有的被跳过)。
+            // 由确定成为主实例的那一方调 start_diagnostics_flush(第三轮审计 12)。
             recodex: Arc::new(LauncherRecodexBridge {
-                state: {
-                    let state = recodex_integration::desktop::ReCodexState::from_env();
-                    // recodex-overlay:diag-flush — 后台把本地诊断日志里的报错(启动失败/连不上/
-                    // 任何 fail|error|panic)传回服务器;登录前也传(匿名口)。日志路径只有这层拿得到。
-                    state.spawn_diagnostics_flush(
-                        codex_plus_core::diagnostic_log::diagnostic_log_path(),
-                        env!("CARGO_PKG_VERSION"),
-                    );
-                    state
-                },
+                state: recodex_integration::desktop::ReCodexState::from_env(),
             }),
         }
     }
 }
 
 impl LauncherHooks {
+    /// recodex-overlay:diag-flush — 后台把本地诊断日志里的报错(启动失败/连不上/
+    /// 任何 fail|error|panic)传回服务器;登录前也传(匿名口)。日志路径只有这层拿得到。
+    /// 只有单实例锁的持有者能调:水位边车文件同一时间只能有一个写者。
+    fn start_diagnostics_flush(&self) {
+        self.recodex.state.spawn_diagnostics_flush(
+            codex_plus_core::diagnostic_log::diagnostic_log_path(),
+            env!("CARGO_PKG_VERSION"),
+        );
+    }
+
     fn watchdog_bridge_context(&self) -> anyhow::Result<BridgeContext> {
         self.bridge_context
             .lock()
@@ -324,6 +328,9 @@ async fn launcher_main(
     }
     if helper_only {
         let hooks = LauncherHooks::default();
+        // helper 是独立进程,不参与单实例锁;它自己起回传线程(与主实例互斥由
+        // 水位文件的「只推进已成功的字节」保证,helper 进程本来就只有一个)。
+        hooks.start_diagnostics_flush();
         // 用实际绑定端口:请求端口被占时会换一个,拿旧值去 shutdown 会关错对象。
         let helper_port = hooks.start_helper(options.helper_port).await?;
         // --helper-only 是让**外部**按约定端口来连的(协议代理的 base_url 就写在
@@ -341,16 +348,6 @@ async fn launcher_main(
         hooks.shutdown_helper(helper_port).await;
         return Ok(());
     }
-    // recodex-overlay: 让上游新出的模型自动生效。
-    // 位置有两个约束:必须在 key 刷新**之后**(拉 manifest 要带 key),
-    // 也必须在 helper_only 分支**之后** —— helper 进程根本不启动 Codex,
-    // 让它白等一次网络请求只会拖慢每一次 helper 拉起,还会和主进程抢着写
-    // 同一份 config.toml。
-    // recodex-overlay: 先同步服务端托管配置,再跟随推荐模型 —— 两者都写 config.toml,
-    // 顺序固定就不会互相冲掉;而且必须在拉起 Codex **之前**:Codex 是启动时读一次
-    // config.toml,后台线程写完时它已经拿着旧配置跑了,用户还得再重启一次。
-    sync_managed_config_from_server().await;
-    follow_upstream_recommended_model().await;
     // recodex-overlay: 由「切换模式/更新后重启」拉起时带 --await-guard —— 旧 launcher
     // 还要 1 秒左右才退出,不等的话会误判成「已有实例」而直接退出,页面就失去后端。
     let await_guard = args.iter().any(|arg| arg == "--await-guard");
@@ -380,6 +377,8 @@ async fn launcher_main(
             }
         }
     };
+    // 到这里才确定自己是主实例:诊断回传线程现在起,水位边车文件只有一个写者。
+    hooks.start_diagnostics_flush();
     // recodex-overlay: 旧 exe / 旧引用 / 卸载项版本号 / 旧数据残留的清理,后台线程做,不拖慢启动。
     // 必须在拿到单实例锁之后:只有锁的持有者能改快捷方式、删旧 exe;这里也是旧名接班的报到点。
     codex_plus_core::legacy_install::spawn_startup_housekeeping();
@@ -406,6 +405,17 @@ async fn launcher_main(
         &codex_plus_core::codex_sqlite::default_codex_home_dir(),
         &codex_plus_core::paths::default_app_state_dir().join("backups"),
     );
+    // recodex-overlay: 让上游新出的模型自动生效。
+    // 位置有三个约束:必须在 key 刷新**之后**(拉 manifest 要带 key);必须在
+    // helper_only 分支之后(helper 不启动 Codex,白等一次网络请求还会跟主进程抢着
+    // 写同一份 config.toml);**也必须在拿到单实例锁之后** —— 第二实例(用户多点了
+    // 一下图标)根本不拉 Codex,却会照着服务端配置重写一遍 config.toml,和正在跑的
+    // 主实例撞在同一个写入契约上(第三轮审计 12)。
+    // recodex-overlay: 先同步服务端托管配置,再跟随推荐模型 —— 两者都写 config.toml,
+    // 顺序固定就不会互相冲掉;而且必须在拉起 Codex **之前**:Codex 是启动时读一次
+    // config.toml,后台线程写完时它已经拿着旧配置跑了,用户还得再重启一次。
+    sync_managed_config_from_server().await;
+    follow_upstream_recommended_model().await;
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
     Ok(())
@@ -665,7 +675,9 @@ async fn activate_existing_codex_app<H: LaunchHooks>(
             "outcome": activation.label(),
             "activated": matches!(activation, ExistingActivation::WindowActivated { .. } | ExistingActivation::AppActivated { .. }),
             "helper_available": helper_available,
-            "activation_error": activation_error,
+            // 键名必须是 error:诊断回传按「detail 里有没有 error」挑要上报的条目,
+            // 叫 activation_error 就永远传不上来(第三轮审计 应修 3)。
+            "error": activation_error,
         }),
     );
     match activation_error {
@@ -679,16 +691,27 @@ async fn activate_existing_codex_app<H: LaunchHooks>(
 /// guard 必须活到进程结束,所以只能由这一层(launcher)持有;core 的系统实现
 /// 永远返回 false。接手时**不做**残留清理:这条路上「无 Codex 进程、无 CDP」是
 /// 常态(用户刚关掉 Codex),据此杀别的 launcher 正是第一轮审计 S2 要防的事。
+type GuardAcquire =
+    Box<dyn Fn() -> std::io::Result<codex_plus_core::ports::LoopbackPortGuard> + Send + Sync>;
+
 struct SecondInstanceEnv {
     inner: codex_plus_core::existing_instance::SystemExistingInstanceEnv,
     guard: Mutex<Option<codex_plus_core::ports::LoopbackPortGuard>>,
+    /// 抢锁这一下是注入的:测试要用自己的端口,而改环境变量会和同一个测试二进制里
+    /// 并发读 `CODEX_PLUS_GUARD_PORT` 的用例构成数据竞争(edition 2024 下是 UB)。
+    acquire: GuardAcquire,
 }
 
 impl SecondInstanceEnv {
     fn new() -> Self {
+        Self::with_acquire(Box::new(try_acquire_single_instance_guard))
+    }
+
+    fn with_acquire(acquire: GuardAcquire) -> Self {
         Self {
             inner: codex_plus_core::existing_instance::SystemExistingInstanceEnv,
             guard: Mutex::new(None),
+            acquire,
         }
     }
 
@@ -722,7 +745,7 @@ impl codex_plus_core::existing_instance::ExistingInstanceEnv for SecondInstanceE
         }
         // 直接试一次绑锁:走 acquire_guard_with 会每轮写一条 launcher.already_running
         // (等待期间每 500ms 一轮,几十条噪音),而且那里还带着残留清理。
-        match try_acquire_single_instance_guard() {
+        match (self.acquire)() {
             Ok(guard) => {
                 if let Some(fallback_lock_path) = guard.fallback_path() {
                     log_launcher_guard_fallback(fallback_lock_path);
@@ -2019,16 +2042,17 @@ mod tests {
 
     /// SecondInstanceEnv 真的能拿到锁并把 guard 交出来(锁空闲时)。
     ///
-    /// 用一个**测试专用**的守卫端口:默认端口上可能正跑着开发机上真实的 ReCodex,
-    /// 既会让用例随环境飘,也会在用例期间短暂占住真实用户的单实例锁。
+    /// 抢锁这一下走注入:不能改 `CODEX_PLUS_GUARD_PORT` —— 同一个测试二进制里
+    /// 别的用例会并发读它(log_launcher_already_running → launcher_guard_port),
+    /// `set_var` 与并发 getenv 在 edition 2024 下是 UB(第三轮审计 应修 2)。
+    /// 数据目录在测试里已重定向到临时目录,锁文件不会落进真实的 ~/.recodex。
     #[test]
     fn second_instance_env_hands_over_the_acquired_guard() {
         use codex_plus_core::existing_instance::ExistingInstanceEnv;
         let port = codex_plus_core::ports::find_available_loopback_port();
-        // SAFETY: 这个用例是本测试二进制里唯一读写该环境变量的。
-        unsafe { std::env::set_var("CODEX_PLUS_GUARD_PORT", port.to_string()) };
+        let acquire = move || codex_plus_core::ports::acquire_resilient_loopback_port_guard(port);
 
-        let env = SecondInstanceEnv::new();
+        let env = SecondInstanceEnv::with_acquire(Box::new(acquire));
         assert!(env.try_take_over(), "锁空闲时必须拿得到");
         assert!(env.try_take_over(), "已经拿到就直接复用");
         let guard = env.take_guard();
@@ -2036,16 +2060,12 @@ mod tests {
         assert!(env.take_guard().is_none(), "只能交出一次");
 
         // 还没放手之前,再来一个「第二实例」拿不到。
-        let other = SecondInstanceEnv::new();
+        let other = SecondInstanceEnv::with_acquire(Box::new(acquire));
         assert!(!other.try_take_over(), "锁被持有时不能拿到");
         drop(guard);
-        unsafe { std::env::remove_var("CODEX_PLUS_GUARD_PORT") };
-        // 锁文件落在真实的 ~/.recodex/locks 下(这一层没有测试隔离),清掉。
-        let _ = std::fs::remove_file(
-            codex_plus_core::paths::default_app_state_dir()
-                .join("locks")
-                .join(format!("loopback-port-{port}.lock")),
-        );
+        // 放手之后又能拿到 —— 这正是「主实例确认 Codex 退出后放锁」的那一刻。
+        let after = SecondInstanceEnv::with_acquire(Box::new(acquire));
+        assert!(after.try_take_over(), "主实例放锁后必须能接手");
     }
 
     #[test]
@@ -2142,6 +2162,35 @@ mod managed_config_sync_placement_tests {
             .expect("launcher_main 里没有拉起 Codex");
         assert!(sync < follow && follow < launch,
             "同步(@{sync})必须先于跟随模型(@{follow})、再先于拉起 Codex(@{launch})");
+        // 还必须在**拿到单实例锁之后**:第二实例不拉 Codex,却会照服务端配置重写
+        // config.toml,和正在跑的主实例撞同一个写入契约(第三轮审计 12)。
+        let guard = body
+            .find("acquire_guard_maybe_waiting(options.debug_port")
+            .expect("launcher_main 里没有抢单实例锁");
+        assert!(guard < sync, "托管配置同步(@{sync})必须在抢锁(@{guard})之后");
+        // 诊断回传线程同理:两个进程同时写一个水位边车文件会互相跳字节。
+        // 一共两处:helper_only 分支一处(helper 是独立进程,不抢锁),抢锁之后一处。
+        // 只在函数体内数:body 一直延伸到文件末尾,不切的话会把这条测试自己的
+        // 字面量也数进去。(按 LF 找结尾:Windows 上检出的可能是 CRLF。)
+        let normalized = source.replace("\r\n", "\n");
+        let function_body = &normalized[normalized.find("async fn launcher_main(").unwrap()..];
+        let function_body = &function_body[..function_body.find("\n}\n").expect("launcher_main 没有结尾")];
+        let flushes: Vec<_> = function_body
+            .match_indices("hooks.start_diagnostics_flush();")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(flushes.len(), 2, "诊断回传的起点只该有两处");
+        let helper_only = function_body
+            .find("if helper_only {")
+            .expect("launcher_main 里没有 helper_only 分支");
+        let guard_in_body = function_body
+            .find("acquire_guard_maybe_waiting(options.debug_port")
+            .expect("launcher_main 里没有抢单实例锁");
+        assert!(
+            flushes[0] > helper_only && flushes[0] < guard_in_body,
+            "第一处属于 helper_only 分支(helper 是独立进程,不抢锁)"
+        );
+        assert!(guard_in_body < flushes[1], "主实例的诊断回传必须在抢锁之后");
         // 两个 await 之间只允许注释和空白 —— 中间插别的步骤就可能把顺序约束绕开。
         let between = &body[sync..follow];
         assert!(

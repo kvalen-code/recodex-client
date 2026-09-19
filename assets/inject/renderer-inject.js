@@ -7464,12 +7464,18 @@
     refreshAnswerOutline();
   }
 
+  const scanFailureLogLimit = 50;
+
   function runScanStep(step) {
     try {
       step();
     } catch (error) {
-      window.__codexSessionDeleteScanFailures = window.__codexSessionDeleteScanFailures || [];
-      window.__codexSessionDeleteScanFailures.push(String(error?.stack || error));
+      // 上限:这个数组只给排查用,而 scan 是每次 DOM 变化都跑的 —— 有个必崩的
+      // step 时它会无限涨,把内存吃光。留最近 50 条足够看清是谁在崩。
+      const failures = window.__codexSessionDeleteScanFailures || [];
+      failures.push(String(error?.stack || error));
+      if (failures.length > scanFailureLogLimit) failures.splice(0, failures.length - scanFailureLogLimit);
+      window.__codexSessionDeleteScanFailures = failures;
     }
   }
 
@@ -7736,7 +7742,7 @@
   const answerOutlineTurnSelector = "div.contents[data-content-search-turn-key]";
   const answerOutlineMarkdownSelector = '[data-markdown-text-style="assistant-message"]';
   const answerOutlineStopLabels = /^(停止|Stop|Остановить)$/i;
-  let answerOutlineState = { signature: "", items: [], open: false, timer: 0, observer: null };
+  let answerOutlineState = { signature: "", items: [], open: false, timer: 0, observer: null, observed: null };
 
   function answerOutlineStyleText() {
     return `
@@ -7984,6 +7990,10 @@
     const items = latest ? answerOutlineCollect(latest.root) : [];
     if (items.length < answerOutlineMinItems) {
       answerOutlineRemove();
+      // 连对话区都没有(设置页、归档页……):没什么可观察的,把观察者也撤了。
+      // 有对话区时保留:正文还在流式变化,主 scan 只对侧边栏这类结构变化敏感,
+      // 撤了就要等下一次无关的 DOM 变化才会重新出现大纲。
+      if (!document.querySelector(".thread-scroll-container")) answerOutlineDisconnect();
       return;
     }
     const signature = `${codexPlusUiLang()}|${latest.turn.getAttribute("data-content-search-turn-key") || ""}|${items.map((item) => `${item.depth}:${item.text}`).join("\n")}`;
@@ -8011,14 +8021,26 @@
   // 所以大纲自己挂一个观察者。回调只做节流排期,真正的查询每 500ms 至多一次、只看最后一个轮次;
   // 大纲节点自身的变化只在渲染时发生一次,下一轮签名相同就不再渲染,不会自喂。
   function answerOutlineObserve() {
-    if (answerOutlineState.observer) return;
+    // 只盯对话滚动区:整个 body 的 characterData + subtree 会把侧边栏、设置面板、
+    // 甚至我们自己插的节点的每一次变化都算进来,而这里要的只是「最后一条回答变了」。
+    // 对话区还没挂上来时退回 body,等它出现再换过去(切换会话时容器会整块替换)。
+    const target = document.querySelector(".thread-scroll-container")
+      || document.body
+      || document.documentElement;
+    if (!target) return;
+    if (answerOutlineState.observer && answerOutlineState.observed === target && target.isConnected !== false) {
+      return;
+    }
+    answerOutlineState.observer?.disconnect();
     answerOutlineState.observer = new MutationObserver(scheduleAnswerOutlineRefresh);
-    answerOutlineState.observer.observe(document.body || document.documentElement, { childList: true, subtree: true, characterData: true });
+    answerOutlineState.observed = target;
+    answerOutlineState.observer.observe(target, { childList: true, subtree: true, characterData: true });
   }
 
   function answerOutlineDisconnect() {
     answerOutlineState.observer?.disconnect();
     answerOutlineState.observer = null;
+    answerOutlineState.observed = null;
     clearTimeout(answerOutlineState.timer);
     answerOutlineState.timer = 0;
   }
@@ -8046,6 +8068,9 @@
       looksLikeHeading: answerOutlineLooksLikeHeading,
       uiText: codexPlusUiText,
       state: () => answerOutlineState,
+      observe: answerOutlineObserve,
+      disconnect: answerOutlineDisconnect,
+      runScanStep,
     };
   }
 

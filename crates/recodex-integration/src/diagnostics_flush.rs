@@ -260,6 +260,12 @@ const ALWAYS_REPORT: &[&str] = &[
     "launcher.reserved_marketplace_config_cleaned",
     // 渲染层 app-server 请求补丁放弃重试(同 service_tier_dispatcher_patch_skipped)。
     "renderer.app_server_request_patch_skipped",
+    // 第二实例在等待期间接手了单实例锁(用户刚关掉 Codex 又马上点图标)。
+    //
+    // 这是 1.3.8 第二轮最核心的行为改动:不接手的话用户会空等二十多秒、最后什么都
+    // 打不开。它按定义不是错误(名字里也不该有 fail),detail 里只有 outcome ——
+    // 三条既有规则都放不过它,不显式白名单就等于这次修复在线上完全看不见。
+    "launcher.second_instance_took_over",
 ];
 
 /// 这些键的值是本机路径(带用户名),白名单事件上报前整键去掉。
@@ -318,11 +324,12 @@ pub(crate) fn redact_user_paths(input: &str) -> String {
             // 分隔符或引号**为止,而不是碰到空格就停 —— 那样 `John Smith` 只遮掉
             // `John`,姓还留在上报里。
             //
-            // 但「路径后面还接着一句话」(`open /home/bob failed`)同样常见:整段
-            // 吞掉会把信息抹光。所以看这一段怎么结束:
-            //   - 分隔符或引号结束 → 就是目录名(JSON 串里的路径几乎都以引号收尾),
-            //     整段遮掉,空格照遮;
-            //   - 行尾/串尾结束 → 后面可能跟着说明文字,退回到第一个空格为止。
+            // 但「路径后面还接着一句话」(`cwd /home/bob missing, see /var/log`)同样
+            // 常见:整段吞掉会把后面的信息一并抹掉,甚至把下一个路径粘进来。规则:
+            //   - 引号结束 → JSON 串里的路径就是这么收尾的,整段遮掉,空格照遮;
+            //   - 分隔符结束 → 这一段是目录名,**且看着像目录名**(不含逗号、至多
+            //     一个空格、不太长)才整段遮,否则退回第一个空格;
+            //   - 行尾/串尾结束 → 后面可能跟着说明文字,退回第一个空格。
             let start = i;
             let mut end = i;
             let mut spaced_end = None;
@@ -332,10 +339,14 @@ pub(crate) fn redact_user_paths(input: &str) -> String {
                 }
                 end += 1;
             }
-            let terminated_by_path_boundary = bytes
+            let terminated_by_quote = bytes.get(end) == Some(&b'"');
+            let terminated_by_separator = bytes
                 .get(end)
-                .is_some_and(|byte| matches!(byte, b'\\' | b'/' | b'"'));
-            let name_end = if terminated_by_path_boundary {
+                .is_some_and(|byte| matches!(byte, b'\\' | b'/'));
+            let segment = &input[start..end];
+            let name_end = if terminated_by_quote
+                || (terminated_by_separator && looks_like_directory_name(segment))
+            {
                 end
             } else {
                 spaced_end.unwrap_or(end)
@@ -409,6 +420,14 @@ pub(crate) fn redact(input: &str) -> String {
     }
     // 只增删了 ASCII 段,UTF-8 结构不会坏;保险起见还是走 lossy。
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 这一段像不像一个目录名(而不是「路径后面接的一句话」)。
+/// 判据故意保守:目录名里不会有逗号,带空格的用户名一般也就一个空格。
+fn looks_like_directory_name(segment: &str) -> bool {
+    !segment.contains(',')
+        && segment.chars().filter(|ch| *ch == ' ').count() <= 1
+        && segment.len() <= 64
 }
 
 fn is_token_byte(b: u8) -> bool {
@@ -697,25 +716,34 @@ mod tests {
         // 不是路径段的 users/home 不动
         assert_eq!(redact_user_paths("users home homepage"), "users home homepage");
         // 带空格的用户名要整段遮掉(之前只遮到空格,姓还在)
+        // 带空格的用户名:引号收尾(JSON 串里的路径就是这样)时整段遮掉
         assert_eq!(
-            redact_user_paths(r#"C:\Users\John Smith\AppData\Local"#),
-            r#"C:\Users\[user]\AppData\Local"#
+            redact_user_paths(r#"{"error":"open C:\Users\John Smith\AppData"}"#),
+            r#"{"error":"open C:\Users\[user]\AppData"}"#
         );
         assert_eq!(
             redact_user_paths("/Users/Jane Doe/Library/Application Support"),
             "/Users/[user]/Library/Application Support"
         );
+        assert_eq!(
+            redact_user_paths(r#"cd "C:\Users\Bo Li" now"#),
+            r#"cd "C:\Users\[user]" now"#
+        );
         // UNC 与正斜杠混排
         assert_eq!(
-            redact_user_paths(r#"\\nas\Users\Ann Lee\share"#),
+            redact_user_paths(r#"\\nas\Users\Ann\share"#),
             r#"\\nas\Users\[user]\share"#
         );
-        assert_eq!(redact_user_paths("//nas/home/Ann Lee/x"), "//nas/home/[user]/x");
-        // 路径后面还跟着一句话时,只遮到第一个空格,别把信息抹光
+        assert_eq!(redact_user_paths("//nas/home/ann/x"), "//nas/home/[user]/x");
+        // 路径后面还跟着一句话时,只遮到第一个空格:既别抹掉正文,也别把后面的
+        // 路径粘进来(第三轮审计 4)
         assert_eq!(redact_user_paths("open /home/bob failed"), "open /home/[user] failed");
+        assert_eq!(
+            redact_user_paths("cwd /home/bob missing, see /var/log"),
+            "cwd /home/[user] missing, see /var/log"
+        );
         // 结尾就是用户名(后面没有分隔符)
         assert_eq!(redact_user_paths("/home/carol"), "/home/[user]");
-        assert_eq!(redact_user_paths(r#"cd "C:\Users\Bo Li" now"#), r#"cd "C:\Users\[user]" now"#);
         let line = r#"{"timestamp_ms":0,"pid":1,"event":"launcher.spawn_failed","detail":{"error":"cannot open C:\\Users\\alice\\x"}}"#;
         let log = temp_log(&[line]);
         let t = FakeTransport::returning(&[202]);

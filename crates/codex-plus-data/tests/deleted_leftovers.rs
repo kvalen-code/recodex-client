@@ -242,10 +242,9 @@ fn sweep_removes_leftovers_only_for_threads_we_deleted_and_undo_still_restores_e
     }
     assert!(state["thread-writable-roots"].get("orphan").is_some());
 
-    // 残骸先并进了原删除备份：撤销原 token 能把库行、rollout、索引、侧边栏一起找回
-    let backup: Value =
-        serde_json::from_slice(&fs::read(fx.backups.join(format!("{token}.json"))).unwrap())
-            .unwrap();
+    // 残骸先写进了同 token 的 sidecar,读备份时合回来:撤销原 token 能把库行、
+    // rollout、索引、侧边栏一起找回。主备份文件本身没被改写(见 huge_backups_ 那条)。
+    let backup = BackupStore::new(&fx.backups).read_backup(&token).unwrap();
     assert_eq!(
         backup["tables"]["__session_index"]
             .as_array()
@@ -539,27 +538,42 @@ fn sweep_out_of_budget_defers_without_touching_anything() {
     assert!(!index_ids(&fx.home).contains(&"t1".to_string()));
 }
 
-/// 建议 B:限时清扫里,单份备份太大就顺延(不打标记),免得「整份读入 + pretty 重写」
-/// 把启动卡住几秒。不限时的整轮清扫不受上限约束,照样清。
+/// 第三轮 应修 1(回归修复):备份很大(rollout 以 base64 存在里面)时,启动期的
+/// **限时**清扫照样要把残骸清掉 —— 上一版为了不超时给它加了 32MB 上限,结果这些
+/// 线程的幽灵条目永远清不掉。现在残骸写进同 token 的 sidecar,清理不碰主备份,
+/// 撤销时再合回来。
 #[test]
-fn oversized_backups_are_deferred_by_the_startup_sweep_but_not_by_a_full_one() {
+fn huge_backups_are_still_cleaned_by_the_startup_sweep_and_undo_restores_everything() {
     let fx = fixture();
-    legacy_delete(&fx, "t1");
+    let token = legacy_delete(&fx, "t1");
+    // 把主备份撑到 40MB 以上(模拟带着整份 rollout 的真实备份)。
+    let backup_path = fx.backups.join(format!("{token}.json"));
+    let mut backup: Value = serde_json::from_slice(&fs::read(&backup_path).unwrap()).unwrap();
+    // 顶层加一段填充:只为把文件撑大,不参与恢复(恢复只看 tables)。
+    backup["pad"] = json!("A".repeat(40 * 1024 * 1024));
+    fs::write(&backup_path, serde_json::to_vec(&backup).unwrap()).unwrap();
+    let size_before = fs::metadata(&backup_path).unwrap().len();
+    assert!(size_before > 32 * 1024 * 1024);
 
-    let report = codex_plus_data::sweep_deleted_thread_leftovers_with_limits(
+    let report = codex_plus_data::sweep_deleted_thread_leftovers_within(
         &fx.home,
         &fx.backups,
         std::time::Duration::from_secs(30),
-        Some(16), // 任何真实备份都超过 16 字节
     )
     .unwrap();
 
-    assert_eq!(report.threads_oversized, 1, "{report:?}");
-    assert_eq!(report.threads_cleaned, 0);
-    assert!(index_ids(&fx.home).contains(&"t1".to_string()), "残骸还在");
-
-    // 下一轮(不限时)照样清掉,说明只是顺延、没有被标记成处理过。
-    let report = sweep_deleted_thread_leftovers(&fx.home, &fx.backups).unwrap();
     assert_eq!(report.threads_cleaned, 1, "{report:?}");
-    assert!(!index_ids(&fx.home).contains(&"t1".to_string()));
+    assert!(!index_ids(&fx.home).contains(&"t1".to_string()), "残骸必须清掉");
+    // 主备份一个字节都没动;残骸进了 sidecar。
+    assert_eq!(fs::metadata(&backup_path).unwrap().len(), size_before);
+    let sidecar = fx.backups.join(format!("{token}.leftovers.json"));
+    assert!(sidecar.exists(), "残骸应写进 sidecar");
+    assert!(fs::metadata(&sidecar).unwrap().len() < 64 * 1024, "sidecar 必须是小文件");
+
+    // 撤销原 token 仍能把库行、rollout、索引、侧边栏一起找回。
+    let undone = SQLiteStorageAdapter::new(&fx.state_db, BackupStore::new(&fx.backups))
+        .with_codex_home(&fx.home)
+        .undo(&token);
+    assert_eq!(undone.status, DeleteStatus::Undone, "{}", undone.message);
+    assert_thread_fully_present(&fx.home, "t1");
 }
