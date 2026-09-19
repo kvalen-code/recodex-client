@@ -1,0 +1,26 @@
+# 出货构建专用的 cargo 配置。用法(发布 CI 就是这么调的):
+#
+#     cargo build --release -p codex-plus-launcher --config .cargo/release.toml
+#
+# 作用:出货二进制里的源码路径去品牌。panic 信息、日志定位会把源文件路径编进 exe,
+# 原先 `strings recodex.exe` 能看到上百处 `crates\codex-plus-core\src\...`。
+#
+# 只需写相对前缀:cargo 编译工作区成员时传的是相对工作区根的路径;而下游 crate 里
+# 单态化出来的代码引用的是上游 crate 元数据里的路径 —— 那份路径在编译上游时就已经
+# 被这里改写过了,所以带本机绝对路径的那些(`D:\a\...\crates\codex-plus-core\...`)
+# 也一并消失。实测 1.3.7:改前 exe 里 113 处源码路径(其中 27 处带绝对路径),改后 0 处。
+#
+# 为什么不放进 .cargo/config.toml:--remap-path-prefix 同样改写**编译诊断**里的路径,
+# 放进默认配置后 rust-analyzer / cargo check 报错指向 `recodex/core\src\...`,
+# 编辑器找不到文件、IDE 里的报错全丢。stable 上没有「只在 release 生效」的写法
+# (profile.rustflags / trim-paths 仍是 nightly),所以单独成文件、只在出货构建时带上。
+#
+# 别在发布 CI 里设 RUSTFLAGS 环境变量:它会整体覆盖这里的值。发布 CI 在构建后有一步
+# 自检,exe 里再出现 `crates\codex-plus-*` 就失败。
+[build]
+rustflags = [
+    "--remap-path-prefix=crates/codex-plus-core=recodex/core",
+    "--remap-path-prefix=crates/codex-plus-data=recodex/data",
+    "--remap-path-prefix=crates/recodex-integration=recodex/integration",
+    "--remap-path-prefix=apps/codex-plus-launcher=recodex/launcher",
+]

@@ -66,7 +66,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: 构建
-        run: cargo build --release -p codex-plus-launcher
+        # --config .cargo/release.toml:出货专用,改写编进 exe 的源码路径(见该文件注释)
+        run: cargo build --release -p codex-plus-launcher --config .cargo/release.toml
 
       - name: 自检 —— exe 自报版本必须等于发布版本
         shell: pwsh
@@ -74,6 +75,23 @@ jobs:
           $v = (Get-Item target/release/recodex.exe).VersionInfo.FileVersion
           if ($v -ne "${{ steps.ver.outputs.version }}") {
             throw "exe 自报 $v,与发布版本 ${{ steps.ver.outputs.version }} 不一致"
+          }
+
+      # 去品牌的两道闸都在构建期,一旦失效不会有任何报错,只能在产物上查:
+      #   - 版本资源的 ProductName 由 apps/codex-plus-launcher/build.rs 设置;
+      #   - 源码路径由 .cargo/release.toml 的 --remap-path-prefix 改写(构建命令要带 --config)。
+      #     漏了 --config、或有人在 CI 里设了 RUSTFLAGS 把它整体覆盖掉,exe 里重新冒出上百处 crates\codex-plus-core\...
+      - name: 自检 —— exe 里不带上游品牌
+        shell: pwsh
+        run: |
+          $info = (Get-Item target/release/recodex.exe).VersionInfo
+          if ($info.ProductName -ne "ReCodex" -or $info.FileDescription -ne "ReCodex") {
+            throw "exe 版本资源名字不对:ProductName=$($info.ProductName) FileDescription=$($info.FileDescription)"
+          }
+          $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes("target/release/recodex.exe"))
+          $hits = [regex]::Matches($text, '(crates|apps)[\\/]codex-plus-').Count
+          if ($hits -gt 0) {
+            throw "exe 里还有 $hits 处 codex-plus 源码路径 —— .cargo/release.toml 的 remap 没生效(构建命令漏了 --config,或 CI 里设了 RUSTFLAGS?)"
           }
 
       - name: 装 NSIS
@@ -237,7 +255,14 @@ jobs:
         run: cargo test -p recodex-integration --target ${{ matrix.target }}
 
       - name: 构建
-        run: cargo build --release --target ${{ matrix.target }} -p codex-plus-launcher
+        run: cargo build --release --target ${{ matrix.target }} -p codex-plus-launcher --config .cargo/release.toml
+
+      - name: 自检 —— 二进制里不带上游源码路径
+        run: |
+          if grep -a -c -E '(crates|apps)[/\]codex-plus-' "target/${{ matrix.target }}/release/recodex"; then
+            echo "二进制里还有 codex-plus 源码路径 —— .cargo/release.toml 的 remap 没生效(构建命令漏了 --config,或 CI 里设了 RUSTFLAGS?)"
+            exit 1
+          fi
 
       - name: 打 DMG
         run: |
