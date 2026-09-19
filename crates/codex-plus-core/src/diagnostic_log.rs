@@ -88,7 +88,59 @@ pub fn diagnostic_log_path() -> PathBuf {
             }
         }
     }
+    if let Some(path) = test_harness_diagnostic_log_path() {
+        return path;
+    }
     crate::paths::default_diagnostic_log_path()
+}
+
+/// 测试进程**默认**不许碰真实的 `~/.recodex/recodex.log`。
+///
+/// 那份日志会被 diagnostics_flush 按水位上传到服务端当线上诊断用。原先只有少数
+/// 测试记得调 `set_diagnostic_log_path_for_tests`,其余走到 `append_diagnostic_log`
+/// 的测试(core 自己的单元测试:协议代理 / vlm / 日志压缩;tests/protocol_proxy 等)
+/// 全都写进了开发机的真实日志 —— 实测真实日志里有一整批只出现
+/// `protocol_proxy.*` / `vlm_*` / `diagnostics.log_compacted` 的 pid,就是测试进程,
+/// 其中 `diagnostics.log_compacted` 带 error 字段,会被当成线上故障传上去。
+///
+/// 靠「记得调」挡不住下一个新测试,所以反过来:识别出测试进程就默认落到临时目录。
+/// `cfg!(test)` 只覆盖本 crate 的单元测试,集成测试和下游 crate(launcher)的测试
+/// 编译的是普通的 core,所以再按可执行文件位置认:cargo 的测试/基准二进制一律在
+/// `target/<profile>/deps/` 下,doctest 在 `rustdoctest*` 临时目录下;出货的
+/// recodex.exe 永远不在这两类目录里。
+fn test_harness_diagnostic_log_path() -> Option<PathBuf> {
+    static TEST_HARNESS: OnceLock<Option<String>> = OnceLock::new();
+    let binary = TEST_HARNESS
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let is_test = cfg!(test) || is_test_harness_executable(&exe);
+            is_test.then(|| {
+                exe.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| stem.split('-').next().unwrap_or(stem).to_string())
+                    .unwrap_or_else(|| "test".to_string())
+            })
+        })
+        .as_ref()?;
+    Some(test_harness_log_dir().join(format!("{binary}.log")))
+}
+
+/// 当前进程是不是 cargo 的测试/doctest 二进制(判据见 `test_harness_diagnostic_log_path`)。
+/// 别的「测试时别碰用户真实数据」的地方也用它。
+pub fn running_under_test_harness() -> bool {
+    test_harness_diagnostic_log_path().is_some()
+}
+
+/// 测试进程的诊断日志落在这里(按测试二进制名分文件,便于看出是谁在写)。
+pub fn test_harness_log_dir() -> PathBuf {
+    std::env::temp_dir().join("recodex-test-diagnostics")
+}
+
+pub fn is_test_harness_executable(exe: &Path) -> bool {
+    exe.parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "deps" || name.starts_with("rustdoctest"))
 }
 
 #[doc(hidden)]
@@ -202,6 +254,32 @@ mod tests {
 
         let contents = std::fs::read_to_string(path).unwrap();
         assert_eq!(contents, "line-3\nline-4\n");
+    }
+
+    /// 测试进程绝不能写到真实的 ~/.recodex/recodex.log(它会被上传到服务端)。
+    #[test]
+    fn test_processes_never_write_the_real_diagnostic_log() {
+        let real = crate::paths::default_diagnostic_log_path();
+        let path = diagnostic_log_path();
+        assert_ne!(path, real);
+        assert!(path.starts_with(test_harness_log_dir()), "{}", path.display());
+        let exe = std::env::current_exe().unwrap();
+        assert!(is_test_harness_executable(&exe), "{}", exe.display());
+    }
+
+    #[test]
+    fn only_cargo_test_and_doctest_binaries_count_as_test_harness() {
+        let deps = Path::new("target").join("debug").join("deps");
+        assert!(is_test_harness_executable(&deps.join("codex_plus_core-0123abcd.exe")));
+        assert!(is_test_harness_executable(
+            &std::env::temp_dir().join("rustdoctestAbC123").join("rust_out")
+        ));
+        assert!(!is_test_harness_executable(
+            &Path::new("Programs").join("ReCodex").join("recodex.exe")
+        ));
+        assert!(!is_test_harness_executable(
+            &Path::new("target").join("release").join("recodex.exe")
+        ));
     }
 
     #[test]
