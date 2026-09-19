@@ -362,7 +362,7 @@ async fn launcher_main(
         None => {
             // latest-status.json 归主实例所有,这里不写:它记着主实例**实际**的调试/helper
             // 端口,拿本进程的请求值覆盖掉,下一个 launcher 就读不到真实端口了。
-            let env = Arc::new(SecondInstanceEnv::new(options.debug_port));
+            let env = Arc::new(SecondInstanceEnv::new());
             let outcome = activate_existing_codex_app(&hooks, env.clone(), &options)
                 .await
                 .map_err(LauncherFailure::secondary)?;
@@ -681,15 +681,13 @@ async fn activate_existing_codex_app<H: LaunchHooks>(
 /// 常态(用户刚关掉 Codex),据此杀别的 launcher 正是第一轮审计 S2 要防的事。
 struct SecondInstanceEnv {
     inner: codex_plus_core::existing_instance::SystemExistingInstanceEnv,
-    debug_port: u16,
     guard: Mutex<Option<codex_plus_core::ports::LoopbackPortGuard>>,
 }
 
 impl SecondInstanceEnv {
-    fn new(debug_port: u16) -> Self {
+    fn new() -> Self {
         Self {
             inner: codex_plus_core::existing_instance::SystemExistingInstanceEnv,
-            debug_port,
             guard: Mutex::new(None),
         }
     }
@@ -2020,14 +2018,34 @@ mod tests {
     }
 
     /// SecondInstanceEnv 真的能拿到锁并把 guard 交出来(锁空闲时)。
+    ///
+    /// 用一个**测试专用**的守卫端口:默认端口上可能正跑着开发机上真实的 ReCodex,
+    /// 既会让用例随环境飘,也会在用例期间短暂占住真实用户的单实例锁。
     #[test]
     fn second_instance_env_hands_over_the_acquired_guard() {
         use codex_plus_core::existing_instance::ExistingInstanceEnv;
-        let env = SecondInstanceEnv::new(codex_plus_core::ports::find_available_loopback_port());
+        let port = codex_plus_core::ports::find_available_loopback_port();
+        // SAFETY: 这个用例是本测试二进制里唯一读写该环境变量的。
+        unsafe { std::env::set_var("CODEX_PLUS_GUARD_PORT", port.to_string()) };
+
+        let env = SecondInstanceEnv::new();
         assert!(env.try_take_over(), "锁空闲时必须拿得到");
         assert!(env.try_take_over(), "已经拿到就直接复用");
-        assert!(env.take_guard().is_some(), "guard 必须交给调用方(要活到进程结束)");
+        let guard = env.take_guard();
+        assert!(guard.is_some(), "guard 必须交给调用方(要活到进程结束)");
         assert!(env.take_guard().is_none(), "只能交出一次");
+
+        // 还没放手之前,再来一个「第二实例」拿不到。
+        let other = SecondInstanceEnv::new();
+        assert!(!other.try_take_over(), "锁被持有时不能拿到");
+        drop(guard);
+        unsafe { std::env::remove_var("CODEX_PLUS_GUARD_PORT") };
+        // 锁文件落在真实的 ~/.recodex/locks 下(这一层没有测试隔离),清掉。
+        let _ = std::fs::remove_file(
+            codex_plus_core::paths::default_app_state_dir()
+                .join("locks")
+                .join(format!("loopback-port-{port}.lock")),
+        );
     }
 
     #[test]
