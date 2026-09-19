@@ -696,7 +696,9 @@ fn launcher_no_longer_contains_mobile_control_runtime() {
 fn launcher_plugin_marketplace_unlock_repairs_role_specific_plugins() {
     let launcher_source = include_str!("../src/launcher.rs");
 
-    assert!(launcher_source.contains("ensure_openai_curated_marketplace_config(&home)"));
+    // openai-* 是 Codex 保留名,启动时不再写,只清理以前写进去的(1.3.8)。
+    assert!(!launcher_source.contains("ensure_openai_curated_marketplace_config(&home)"));
+    assert!(launcher_source.contains("cleanup_recodex_reserved_marketplace_configs(&home)"));
     assert!(launcher_source.contains("ensure_role_specific_plugins_marketplace_config(&home)"));
 }
 

@@ -1249,31 +1249,34 @@ impl LaunchHooks for DefaultLaunchHooks {
         &self,
         settings: &BackendSettings,
     ) -> anyhow::Result<()> {
-        if !settings.codex_app_plugin_marketplace_unlock {
-            return Ok(());
-        }
         let home = crate::relay_config::default_codex_home_dir();
-        match crate::plugin_marketplace::ensure_openai_curated_marketplace_config(&home) {
-            Ok(configured) => {
-                if configured {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.openai_curated_marketplace_configured",
-                        serde_json::json!({
-                            "home": home,
-                        }),
-                    );
-                }
-            }
-            Err(error) => {
+        // 1.3.8 起不再往 config.toml 写 `[marketplaces.openai-curated]` /
+        // `[marketplaces.openai-api-curated]`:openai-* 是 Codex 的保留名,写了也被
+        // 忽略;解锁本身走注入脚本的桥补丁,不依赖这两条(详见
+        // cleanup_recodex_reserved_marketplace_configs)。以前写进去的顺手清掉 ——
+        // 不管解锁开没开,开关关掉之后留下的条目也是我们的。
+        match crate::plugin_marketplace::cleanup_recodex_reserved_marketplace_configs(&home) {
+            Ok(cleanup) if !cleanup.removed.is_empty() => {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "launcher.openai_curated_marketplace_config_failed",
+                    "launcher.reserved_marketplace_config_cleaned",
                     serde_json::json!({
-                        "home": home,
-                        "message": error.to_string(),
+                        "removed": cleanup.removed,
+                        "backup": cleanup.backup,
                     }),
                 );
             }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.reserved_marketplace_config_cleanup_failed",
+                    serde_json::json!({ "message": format!("{error:#}") }),
+                );
+            }
         }
+        if !settings.codex_app_plugin_marketplace_unlock {
+            return Ok(());
+        }
+        let _ = crate::plugin_marketplace::refresh_marketplace_branding(&home);
         match crate::plugin_marketplace::ensure_role_specific_plugins_marketplace_config(&home) {
             Ok(configured) => {
                 if configured {
