@@ -1,14 +1,20 @@
-name: Release assets
+name: Release assets (upstream, disabled)
 
+# 上游 Codex++ 的发布流水线:产出 CodexPlusPlus-* 安装包、装两个 exe(含已移除的管理工具),
+# 并往 GitHub Release 上传 latest.json。ReCodex 不用它 —— 我们的出包走 recodex-release.yml。
+#
+# 原先挂在 `release: published` 上,在我们的公开仓库里一发 Release 就会自动跑,
+# 把上游品牌的安装包传到 Release 页上。不删文件(与上游同步时少一处冲突),只摘掉触发器;
+# 手动触发也被下面每个 job 的 `if: false` 挡住。
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   windows-installer:
+    if: ${{ false }}
     runs-on: windows-latest
     steps:
       - name: Checkout release tag
@@ -73,6 +79,7 @@ jobs:
             dist/windows/*.zip
 
   macos-dmg:
+    if: ${{ false }}
     name: macOS DMG (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -151,6 +158,7 @@ jobs:
             dist/macos/*.zip
 
   latest-json:
+    if: ${{ false }}
     name: Upload static latest.json
     runs-on: ubuntu-latest
     needs:
