@@ -92,22 +92,45 @@ fn in_windows_apps(path: &Path) -> bool {
     })
 }
 
-/// `settings.json` 里 `codexPath` 应变成什么。`None` = 不动文件。
+/// `settings.json` 里 `codexPath` 应变成什么。`None` = 不动文件;`Some(None)` = 删掉该字段。
 ///
-/// - 找到了能用的 CLI → 写它(已是同值就不动);
-/// - 没找到:之前写过的路径还在就留着(可能是用户或命令行写的);已经不存在了就删掉,
-///   让运行时回落 PATH(运行时对不存在的路径也会回落,删掉只是免得留一条误导人的旧值)。
+/// 与命令行 planCodexPath 同一张表。规则:只在「没有」或「旧值指的文件已不存在」时才写,
+/// 旧值还有效就**永远不覆盖** —— 桌面客户端找的是官方 Codex 自带的 CLI,`recodex app` 找的是
+/// 终端 PATH 上的 `codex`(常是 npm 装的),两边各写各的就会来回改(flapping)。谁先写谁的算:
+///
+/// - 旧值有效(文件还在)→ 不动,哪怕这次找到的不一样;
+/// - 旧值没有或已失效、这次找到了 → 写找到的;
+/// - 旧值已失效、这次也没找到 → 删掉,让运行时回落 PATH;
+/// - 都没有 → 不动。
 pub fn plan_codex_path(
     existing: Option<&str>,
     found: Option<&Path>,
     exists: impl Fn(&str) -> bool,
 ) -> Option<Option<String>> {
-    match (existing, found) {
-        (Some(current), Some(found)) if current == found.to_string_lossy() => None,
-        (_, Some(found)) => Some(Some(found.to_string_lossy().into_owned())),
-        (Some(current), None) if !exists(current) => Some(None),
-        _ => None,
+    let existing = existing.filter(|value| !value.is_empty());
+    if existing.is_some_and(|value| exists(value)) {
+        return None;
     }
+    match (existing, found) {
+        (_, Some(found)) => Some(Some(found.to_string_lossy().into_owned())),
+        (Some(_), None) => Some(None),
+        (None, None) => None,
+    }
+}
+
+/// 同命令行 fileExists:存在且不是目录。
+fn is_existing_file(path: &str) -> bool {
+    Path::new(path).is_file()
+}
+
+/// 守护进程实际会用的 codexPath:settings.json 里有、且文件还在(同命令行 effectiveRemoteCodexPath)。
+/// 开机自启项的 PATH 以它为准(其所在目录通常也有 node,npm 装的 codex 要靠它跑)。
+pub fn effective_codex_path(home: &RemoteHome) -> Option<String> {
+    read_object(&home.settings_path())?
+        .get("codexPath")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty() && is_existing_file(path))
+        .map(str::to_string)
 }
 
 /// 把 `codexPath` 写进运行时的 settings.json,保留其它所有字段。
@@ -122,13 +145,17 @@ pub fn sync_codex_path(home: &RemoteHome, found: Option<&Path>) -> anyhow::Resul
         .and_then(|map| map.get("codexPath"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let Some(change) = plan_codex_path(current.as_deref(), found, |p| Path::new(p).exists()) else {
+    if plan_codex_path(current.as_deref(), found, is_existing_file).is_none() {
         return Ok(false);
-    };
+    }
     std::fs::create_dir_all(&home.root)?;
     let _lock = SettingsLock::acquire(&settings)?;
-    // 拿到锁之后重读:等锁期间运行时可能刚写过
+    // 拿到锁之后重读并重新决定:等锁期间运行时(或 recodex app)可能刚写过
     let mut map = read_object(&settings).unwrap_or_default();
+    let current = map.get("codexPath").and_then(Value::as_str).map(str::to_string);
+    let Some(change) = plan_codex_path(current.as_deref(), found, is_existing_file) else {
+        return Ok(false);
+    };
     match change {
         Some(path) => {
             map.insert("codexPath".into(), Value::String(path));
@@ -199,34 +226,57 @@ impl Drop for SettingsLock {
 mod tests {
     use super::*;
 
+    /// 与命令行 TestPlanCodexPath 同一张表。
     #[test]
-    fn codex_path_plan() {
-        let found = Path::new("/Applications/Codex.app/Contents/Resources/codex");
+    fn codex_path_plan_matches_the_cli() {
         let yes = |_: &str| true;
         let no = |_: &str| false;
+        let bin = Path::new("/bin/codex");
+        let write = |v: &str| Some(Some(v.to_string()));
+        assert_eq!(plan_codex_path(None, Some(bin), yes), write("/bin/codex"));
+        assert_eq!(plan_codex_path(Some("/bin/codex"), Some(bin), yes), None);
         assert_eq!(
-            plan_codex_path(None, Some(found), yes),
-            Some(Some(found.to_string_lossy().into_owned()))
-        );
-        assert_eq!(
-            plan_codex_path(Some(&found.to_string_lossy()), Some(found), yes),
-            None
-        );
-        assert_eq!(
-            plan_codex_path(Some("/old/codex"), Some(found), yes),
-            Some(Some(found.to_string_lossy().into_owned()))
-        );
-        assert_eq!(
-            plan_codex_path(Some("/old/codex"), None, yes),
+            plan_codex_path(Some("/old/codex"), Some(bin), yes),
             None,
-            "别人写的、还在的路径不动"
+            "旧值还有效:不覆盖(防桌面端与 recodex app 来回改)"
         );
         assert_eq!(
-            plan_codex_path(Some("/old/codex"), None, no),
-            Some(None),
-            "已经不存在就删"
+            plan_codex_path(Some("/old/codex"), Some(bin), no),
+            write("/bin/codex"),
+            "旧值已失效:换成找到的"
         );
+        assert_eq!(plan_codex_path(Some("/old/codex"), None, yes), None, "没找到但旧值还在:留着");
+        assert_eq!(plan_codex_path(Some("/old/codex"), None, no), Some(None), "旧值已不存在:删掉");
         assert_eq!(plan_codex_path(None, None, no), None);
+        assert_eq!(plan_codex_path(Some(""), Some(bin), yes), write("/bin/codex"));
+    }
+
+    /// 旧值有效时,即使这次找到的是另一份也不改写文件(字节不变)。
+    #[test]
+    fn a_valid_codex_path_written_by_the_cli_is_never_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = RemoteHome {
+            root: temp.path().join("home"),
+            custom: true,
+        };
+        std::fs::create_dir_all(&home.root).unwrap();
+        let kept = temp.path().join("npm-codex");
+        let found = temp.path().join("official-codex");
+        std::fs::write(&kept, b"x").unwrap();
+        std::fs::write(&found, b"x").unwrap();
+        let original = format!(
+            "{{\"machineId\":\"m-1\",\"codexPath\":{}}}",
+            serde_json::to_string(&kept.to_string_lossy()).unwrap()
+        );
+        std::fs::write(home.settings_path(), &original).unwrap();
+        assert!(!sync_codex_path(&home, Some(&found)).unwrap());
+        assert_eq!(std::fs::read_to_string(home.settings_path()).unwrap(), original);
+        assert_eq!(effective_codex_path(&home), Some(kept.to_string_lossy().into_owned()));
+        // 旧的那份被卸了:换成这次找到的
+        std::fs::remove_file(&kept).unwrap();
+        assert_eq!(effective_codex_path(&home), None);
+        assert!(sync_codex_path(&home, Some(&found)).unwrap());
+        assert_eq!(effective_codex_path(&home), Some(found.to_string_lossy().into_owned()));
     }
 
     #[test]

@@ -660,8 +660,16 @@ async fn ensure_daemon_and_autostart(generation: u64, rt: &Runtime) -> anyhow::R
     if !is_current(generation) {
         return Ok(());
     }
-    let entry = autostart::AutostartEntry::new(&rt.current, &rt.home, OS);
-    let installed = tokio::task::spawn_blocking(move || autostart::install(&entry)).await?;
+    // PATH 里拼的是守护进程实际会用的 codexPath(settings.json 里保留下来的那个,
+    // 不一定是这次找到的),同命令行 startDaemonAndAutostart。
+    let home = rt.home.clone();
+    let current = rt.current.clone();
+    let installed = tokio::task::spawn_blocking(move || {
+        let codex_path = host::effective_codex_path(&home);
+        let entry = autostart::AutostartEntry::new(&current, &home, OS, codex_path.as_deref());
+        autostart::install(&entry)
+    })
+    .await?;
     if let Err(error) = installed {
         // 不致命:守护进程已经在跑,只是重启后不会自动起来。
         log(
