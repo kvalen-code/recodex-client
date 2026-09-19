@@ -503,6 +503,9 @@ fn provider_api_key(
     }
 }
 
+/// 拉 `/models` 的整体超时(连接 + 响应体)。
+pub const MODEL_LIST_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn fetch_models_from_source(
     client: &reqwest::Client,
     source: &ModelSource,
@@ -523,8 +526,11 @@ async fn fetch_models_from_source(
         return (Vec::new(), safe_source);
     }
 
+    // 共用的 proxied_client 没有总超时(它也给流式的协议代理用,不能加),上游不响应时
+    // 这里会永久挂起 —— 面板的模型列表就一直转圈(上游 b498c4c)。超时只加在这一次请求上。
     let mut request = client
         .get(&endpoint)
+        .timeout(MODEL_LIST_REQUEST_TIMEOUT)
         .header(reqwest::header::ACCEPT, "application/json");
     if !source.api_key.is_empty() {
         request = request.bearer_auth(&source.api_key);
@@ -969,6 +975,19 @@ fn unquote_toml_string(value: &str) -> String {
 #[cfg(test)]
 mod models_endpoint_tests {
     use super::models_endpoint;
+
+    /// 拉模型列表必须有总超时(上游 b498c4c):共用 client 没有,漏了就会永久挂起。
+    #[test]
+    fn model_list_fetch_has_a_request_timeout() {
+        assert_eq!(
+            super::MODEL_LIST_REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(30)
+        );
+        let source = include_str!("model_catalog.rs");
+        let body = &source[source.find("async fn fetch_models_from_source(").unwrap()..];
+        let body = &body[..body.find("fn failed_source(").unwrap()];
+        assert!(body.contains(".timeout(MODEL_LIST_REQUEST_TIMEOUT)"));
+    }
 
     // 这个函数踩过两次拼接错:先是 ARK 的版本化 base 拼出 `/v3/v1/models`,
     // 后是 ReCodex 的 `/backend-api/codex` 拼出 `/codex/v1/models`(线上一天 404 了 88 次)。
