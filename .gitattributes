@@ -11,3 +11,4 @@
 assets/inject/upstream/**/*.js text eol=lf
 assets/inject/upstream/**/*.css text eol=lf
 assets/inject/upstream/skin-packs/packs/*/theme.json text eol=lf
+assets/inject/recodex-panel-inject.js text eol=lf
