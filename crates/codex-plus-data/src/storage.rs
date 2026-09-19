@@ -14,6 +14,7 @@ pub fn delete_local_from_paths(
     db_paths: impl IntoIterator<Item = PathBuf>,
     backup_store: BackupStore,
     session: &SessionRef,
+    codex_home: Option<&Path>,
 ) -> DeleteResult {
     let mut result = failed(
         &session.session_id,
@@ -21,8 +22,13 @@ pub fn delete_local_from_paths(
     );
     let mut deleted_count = 0usize;
     let mut backup_tokens = Vec::new();
-    for db_path in db_paths {
-        let adapter = SQLiteStorageAdapter::new(db_path, backup_store.clone());
+    let db_paths = db_paths.into_iter().collect::<Vec<_>>();
+    for db_path in db_paths.iter().cloned() {
+        let adapter = match codex_home {
+            Some(home) => SQLiteStorageAdapter::new(db_path, backup_store.clone())
+                .with_codex_home(home),
+            None => SQLiteStorageAdapter::new(db_path, backup_store.clone()),
+        };
         let candidate_result = adapter.delete_local(session);
         if matches!(candidate_result.status, DeleteStatus::LocalDeleted) {
             deleted_count += 1;
@@ -39,7 +45,126 @@ pub fn delete_local_from_paths(
         result.undo_token = Some(json!(backup_tokens).to_string());
         result.backup_path = None;
     }
+    // 纯 API 模式（model_provider = "custom"）下 threads 表是空的，上面每个库都查不到
+    // 记录，于是直接返回「Thread not found in local storage」而会话行仍留在列表里
+    // ——因为 UI 读的是 session_index.jsonl，那条记录没人清（#1998）。
+    //
+    // 数据库里没有不代表索引里没有，这里退一步清索引：真清掉了就算删除成功，
+    // 索引里也没有才是真的找不到。
+    if deleted_count == 0
+        && matches!(result.status, DeleteStatus::Failed)
+        && let Some(home) = codex_home
+    {
+        let thread_id = normalize_codex_thread_id(&session.session_id);
+        // ReCodex：这条退路原先删了索引/侧边栏却不留备份，撤销时无从恢复。
+        // 先把要删的东西写进一份只含 `__session_index`/`__sidebar` 的备份，
+        // 撤销走同一个 token。
+        match write_index_only_backup(&backup_store, &db_paths, home, &thread_id) {
+            Ok(Some((token, backup_path))) => {
+                result.undo_token = Some(token);
+                result.backup_path = Some(backup_path.to_string_lossy().to_string());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // 备份失败就不删：宁可留个幽灵条目，也不做撤销不了的删除。
+                result.message = format!("{}；索引备份失败，未清理：{error}", result.message);
+                return result;
+            }
+        }
+        match crate::provider_sync::remove_session_index_entry(home, &thread_id) {
+            Ok(removed) if removed > 0 => {
+                result.status = DeleteStatus::LocalDeleted;
+                result.message = format!("已从 session_index.jsonl 清理 {removed} 条记录");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                result.message =
+                    format!("{}；session_index.jsonl 清理失败：{error}", result.message);
+            }
+        }
+        match crate::provider_sync::remove_thread_sidebar_references(home, &thread_id) {
+            Ok(cleanup) if cleanup.global_state_entries_removed > 0
+                || cleanup.catalog_rows_removed > 0 =>
+            {
+                if matches!(result.status, DeleteStatus::Failed) {
+                    result.status = DeleteStatus::LocalDeleted;
+                    result.message = "已清理侧边栏索引".to_string();
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                result.message = format!("{}；侧边栏索引清理失败：{error}", result.message);
+            }
+        }
+        if matches!(result.status, DeleteStatus::Failed) {
+            // 什么都没清掉：别把撤销 token 留给界面，免得出现「可撤销」的假删除。
+            result.undo_token = None;
+            result.backup_path = None;
+        }
+    }
     result
+}
+
+/// 为「数据库里没有这条会话、只剩索引/侧边栏条目」的删除写备份。
+/// 什么都没有时返回 `None`（不写空备份）。
+fn write_index_only_backup(
+    backup_store: &BackupStore,
+    db_paths: &[PathBuf],
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<Option<(String, PathBuf)>> {
+    let mut tables = Map::new();
+    add_thread_sidebar_backup_tables(&mut tables, codex_home, thread_id)?;
+    if !sidebar_backup_has_content(&tables) {
+        return Ok(None);
+    }
+    let source_db = db_paths
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| codex_home.join("state_5.sqlite"));
+    let token = backup_store.write_backup(thread_id, &source_db, Value::Object(tables))?;
+    let path = backup_store.path_for(&token);
+    Ok(Some((token, path)))
+}
+
+/// 把线程在 session_index.jsonl 和侧边栏缓存里的条目写进备份表。
+pub(crate) fn add_thread_sidebar_backup_tables(
+    tables: &mut Map<String, Value>,
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<()> {
+    let session_index_lines =
+        crate::provider_sync::session_index_lines_for_thread(codex_home, thread_id)?;
+    if !session_index_lines.is_empty() {
+        tables.insert(
+            "__session_index".to_string(),
+            Value::Array(session_index_lines.into_iter().map(Value::String).collect()),
+        );
+    }
+    tables.insert(
+        "__sidebar".to_string(),
+        crate::provider_sync::snapshot_thread_sidebar_references(codex_home, thread_id)?,
+    );
+    Ok(())
+}
+
+/// 备份表里是否真有索引/侧边栏条目（`__sidebar` 总会写入，但可能是空快照）。
+pub(crate) fn sidebar_backup_has_content(tables: &Map<String, Value>) -> bool {
+    let index = tables
+        .get("__session_index")
+        .and_then(Value::as_array)
+        .is_some_and(|lines| !lines.is_empty());
+    let sidebar = tables.get("__sidebar");
+    let global = sidebar
+        .and_then(|value| value.get("global_state"))
+        .and_then(Value::as_object)
+        .is_some_and(|state| !state.is_empty());
+    let catalog = sidebar
+        .and_then(|value| value.get("catalog"))
+        .and_then(Value::as_array)
+        .is_some_and(|entries| !entries.is_empty());
+    index || global || catalog
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +172,7 @@ pub struct SQLiteStorageAdapter {
     db_path: PathBuf,
     backup_store: BackupStore,
     allowed_db_paths: Vec<PathBuf>,
+    codex_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +215,7 @@ impl SQLiteStorageAdapter {
             allowed_db_paths: vec![db_path.clone()],
             db_path,
             backup_store,
+            codex_home: None,
         }
     }
 
@@ -98,6 +225,11 @@ impl SQLiteStorageAdapter {
                 self.allowed_db_paths.push(db_path);
             }
         }
+        self
+    }
+
+    pub fn with_codex_home(mut self, codex_home: impl Into<PathBuf>) -> Self {
+        self.codex_home = Some(codex_home.into());
         self
     }
 
@@ -122,7 +254,32 @@ impl SQLiteStorageAdapter {
                 )),
             }
         })();
-        result.unwrap_or_else(|err| failed(&session.session_id, err.to_string()))
+        let mut result = result.unwrap_or_else(|err| failed(&session.session_id, err.to_string()));
+        // 删成功就一并清 session_index.jsonl。
+        //
+        // 放在这个统一出口而不是各个 delete_* 里：三种 schema 里原先只有
+        // delete_codex_thread 清了索引，另外两种删掉数据库行却把索引条目留着，
+        // 于是重启后 UI 从索引读，会话又冒出来，再删再冒（#1979）。放在出口
+        // 处理，将来加新 schema 也不会漏。
+        //
+        // delete_codex_thread 里那次调用保留：它需要把清理失败并进自己那条
+        // 「数据库已删但文件删除失败」的消息里；这里对已清理过的再调一次是幂等的
+        // （条目已不在，返回 0）。
+        if matches!(result.status, DeleteStatus::LocalDeleted)
+            && let Some(home) = self.codex_home.as_deref()
+        {
+            let thread_id = normalize_codex_thread_id(&session.session_id);
+            if let Err(error) = crate::provider_sync::remove_session_index_entry(home, &thread_id) {
+                result.message =
+                    format!("{}；session_index.jsonl 清理失败：{error}", result.message);
+            }
+            if let Err(error) =
+                crate::provider_sync::remove_thread_sidebar_references(home, &thread_id)
+            {
+                result.message = format!("{}；侧边栏索引清理失败：{error}", result.message);
+            }
+        }
+        result
     }
 
     pub fn list_local_sessions(&self) -> anyhow::Result<Vec<LocalSession>> {
@@ -256,7 +413,12 @@ impl SQLiteStorageAdapter {
         let result = (|| -> anyhow::Result<DeleteResult> {
             let backups = undo_backups(&self.backup_store, token)?;
             let session_id = backups[0]["session_id"].as_str().unwrap_or("").to_string();
-            restore_backups(&backups, &self.db_path, &self.allowed_db_paths)?;
+            restore_backups(
+                &backups,
+                &self.db_path,
+                &self.allowed_db_paths,
+                self.codex_home.as_deref(),
+            )?;
             Ok(DeleteResult {
                 status: DeleteStatus::Undone,
                 session_id,
@@ -378,10 +540,14 @@ impl SQLiteStorageAdapter {
         } else {
             Vec::new()
         };
+        let mut tables = Map::new();
+        tables.insert("sessions".to_string(), Value::Array(sessions));
+        tables.insert("messages".to_string(), Value::Array(messages));
+        self.add_thread_sidebar_backups(&mut tables, &session.session_id)?;
         let token = self.backup_store.write_backup(
             &session.session_id,
             &self.db_path,
-            json!({"sessions": sessions, "messages": messages}),
+            Value::Object(tables),
         )?;
         let backup_path = self.backup_store.path_for(&token);
         let delete_result = (|| -> anyhow::Result<()> {
@@ -461,6 +627,7 @@ impl SQLiteStorageAdapter {
         if !file_backups.is_empty() {
             tables.insert("__files".to_string(), Value::Array(file_backups.clone()));
         }
+        self.add_thread_sidebar_backups(&mut tables, &thread_id)?;
         let token =
             self.backup_store
                 .write_backup(&thread_id, &self.db_path, Value::Object(tables))?;
@@ -506,19 +673,43 @@ impl SQLiteStorageAdapter {
                 }
             }
         }
+        let session_index_note = self
+            .codex_home
+            .as_deref()
+            .and_then(|home| {
+                crate::provider_sync::remove_session_index_entry(home, &thread_id)
+                    .err()
+                    .map(|error| format!("session_index.jsonl 清理失败：{error}"))
+            });
         if !file_errors.is_empty() {
+            let mut message = format!("本地数据库已删除，但文件删除失败：{}", file_errors.join("; "));
+            if let Some(note) = session_index_note.as_deref() {
+                message = format!("{message}；{note}");
+            }
             return Ok(DeleteResult {
                 status: DeleteStatus::Failed,
                 session_id: thread_id,
-                message: format!(
-                    "本地数据库已删除，但文件删除失败：{}",
-                    file_errors.join("; ")
-                ),
+                message,
                 undo_token: Some(token.clone()),
                 backup_path: Some(backup_path.to_string_lossy().to_string()),
             });
         }
-        Ok(local_deleted(&thread_id, &token, &backup_path))
+        let mut result = local_deleted(&thread_id, &token, &backup_path);
+        if let Some(note) = session_index_note.as_deref() {
+            result.message = format!("{}；{}", result.message, note);
+        }
+        Ok(result)
+    }
+
+    fn add_thread_sidebar_backups(
+        &self,
+        tables: &mut Map<String, Value>,
+        thread_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(home) = self.codex_home.as_deref() else {
+            return Ok(());
+        };
+        add_thread_sidebar_backup_tables(tables, home, thread_id)
     }
 
     fn delete_codex_automation_run(
@@ -542,6 +733,7 @@ impl SQLiteStorageAdapter {
             "thread_id = ?1",
             &[&thread_id],
         )?;
+        self.add_thread_sidebar_backups(&mut tables, &thread_id)?;
         if tables.values().all(|rows| {
             rows.as_array()
                 .map(|items| items.is_empty())
@@ -746,28 +938,39 @@ fn restore_backups(
     backups: &[Value],
     fallback_db_path: &Path,
     allowed_db_paths: &[PathBuf],
+    codex_home: Option<&Path>,
 ) -> anyhow::Result<()> {
     for backup in backups {
         let Some(tables) = backup["tables"].as_object() else {
             continue;
         };
-        let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
-        let db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         validate_restore_tables(tables)?;
-        detect_restore_conflicts(&db, tables)?;
+        if backup_has_db_rows(tables) {
+            let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
+            let db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            detect_restore_conflicts(&db, tables)?;
+            preflight_restore_rows(&db, tables)?;
+        }
         detect_file_restore_conflicts(tables)?;
-        preflight_restore_rows(&db, tables)?;
+        if let Some(sidebar) = tables.get("__sidebar") {
+            let home = codex_home
+                .ok_or_else(|| anyhow::anyhow!("sidebar restore requires a Codex home"))?;
+            crate::provider_sync::validate_thread_sidebar_snapshot(home, sidebar)?;
+        }
     }
 
     for backup in backups {
         let Some(tables) = backup["tables"].as_object() else {
             continue;
         };
-        let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
-        let mut db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        let tx = db.transaction()?;
-        restore_rows(&tx, tables)?;
-        tx.commit()?;
+        if backup_has_db_rows(tables) {
+            let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
+            let mut db =
+                Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            let tx = db.transaction()?;
+            restore_rows(&tx, tables)?;
+            tx.commit()?;
+        }
         if let Some(files) = tables.get("__files").and_then(Value::as_array) {
             for file in files {
                 let Some(path) = file.get("path").and_then(Value::as_str) else {
@@ -784,8 +987,31 @@ fn restore_backups(
                 fs::write(path, bytes)?;
             }
         }
+        if let Some(entries) = tables.get("__session_index").and_then(Value::as_array) {
+            let lines = entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                if let Some(home) = codex_home {
+                    let _ = crate::provider_sync::restore_session_index_entries(home, &lines);
+                }
+            }
+        }
+        if let Some(sidebar) = tables.get("__sidebar") {
+            if let Some(home) = codex_home {
+                let _ = crate::provider_sync::restore_thread_sidebar_references(home, sidebar)?;
+            }
+        }
     }
     Ok(())
+}
+
+/// 备份里除 `__` 开头的附属表（文件、索引、侧边栏）外是否还有数据库表。
+/// 只含索引/侧边栏的备份（数据库里本就没有这条会话）撤销时不必碰数据库。
+fn backup_has_db_rows(tables: &Map<String, Value>) -> bool {
+    tables.keys().any(|table| !table.starts_with("__"))
 }
 
 fn preflight_restore_rows(db: &Connection, tables: &Map<String, Value>) -> anyhow::Result<()> {
@@ -862,7 +1088,7 @@ fn schema_kind(db: &Connection) -> anyhow::Result<Option<SchemaKind>> {
     Ok(None)
 }
 
-fn has_table(db: &Connection, table: &str) -> anyhow::Result<bool> {
+pub(crate) fn has_table(db: &Connection, table: &str) -> anyhow::Result<bool> {
     Ok(db
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -886,7 +1112,11 @@ fn table_columns(db: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn select_dicts(db: &Connection, sql: &str, params: &[&dyn ToSql]) -> anyhow::Result<Vec<Value>> {
+pub(crate) fn select_dicts(
+    db: &Connection,
+    sql: &str,
+    params: &[&dyn ToSql],
+) -> anyhow::Result<Vec<Value>> {
     let mut stmt = db.prepare(sql)?;
     let columns: Vec<String> = stmt
         .column_names()
@@ -916,6 +1146,8 @@ fn validate_restore_tables(tables: &Map<String, Value>) -> anyhow::Result<()> {
         "automation_runs",
         "inbox_items",
         "__files",
+        "__session_index",
+        "__sidebar",
     ];
     for table in tables.keys() {
         if !allowed.contains(&table.as_str()) {
@@ -1156,7 +1388,7 @@ fn sql_value_to_json(value: ValueRef<'_>) -> Value {
     }
 }
 
-fn json_to_sql_value(value: &Value) -> SqlValue {
+pub(crate) fn json_to_sql_value(value: &Value) -> SqlValue {
     match value {
         Value::Null => SqlValue::Null,
         Value::Bool(value) => SqlValue::Integer(i64::from(*value)),

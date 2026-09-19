@@ -337,6 +337,12 @@ async fn launcher_main(
     // recodex-overlay: 手机远程「跟随账号」开着就自动接入:没配对则发起配对(手机弹窗),
     // 已配对则保证守护进程在跑。与微信一样放在单实例锁之后,后台进行、不拖慢启动。
     codex_plus_core::phone_remote::start_from_saved_settings();
+    // recodex: 扫掉「会话删除」留在索引/侧边栏里的残骸。放在单实例锁之后(只由持锁者做)、
+    // 拉起 Codex 之前(Codex 运行中会把内存里的全局状态整份写回);Codex 已在跑则顺延。
+    codex_plus_data::sweep_deleted_thread_leftovers_at_startup(
+        &codex_plus_core::codex_sqlite::default_codex_home_dir(),
+        &codex_plus_core::paths::default_app_state_dir().join("backups"),
+    );
     let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
@@ -859,7 +865,12 @@ impl BridgeDataService for LauncherDataService {
         let db_paths = self.candidate_db_paths();
         let backup_store = codex_plus_data::BackupStore::new(self.backup_dir.clone());
         tokio::task::spawn_blocking(move || {
-            codex_plus_data::delete_local_from_paths(db_paths, backup_store, &session)
+            codex_plus_data::delete_local_from_paths(
+                db_paths,
+                backup_store,
+                &session,
+                Some(&codex_plus_core::codex_sqlite::default_codex_home_dir()),
+            )
         })
         .await
         .map_err(|error| anyhow::anyhow!("delete task failed: {error}"))
@@ -987,6 +998,7 @@ impl LauncherDataService {
             codex_plus_data::BackupStore::new(self.backup_dir.clone()),
         )
         .with_allowed_db_paths(allowed_db_paths)
+        .with_codex_home(codex_plus_core::codex_sqlite::default_codex_home_dir())
     }
 }
 

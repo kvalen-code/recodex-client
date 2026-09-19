@@ -1,4 +1,5 @@
-use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as SqlValue};
+use crate::storage::{has_table, json_to_sql_value, select_dicts};
+use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -1659,6 +1660,634 @@ pub fn apply_session_index_cleanup(
     })();
     let _ = release_lock(&lock_dir);
     result
+}
+
+/// Return the `session_index.jsonl` lines (without trailing newline) that
+/// reference `thread_id`. Used by the delete flow to keep a backup of the
+/// entries it is about to remove.
+pub fn session_index_lines_for_thread(
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let path = codex_home.join("session_index.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path)?;
+    let mut lines = Vec::new();
+    for segment in text.split_inclusive('\n') {
+        let (line, _) = split_line_ending(segment);
+        if known_session_index_candidate(line).is_some_and(|candidate| candidate.id == thread_id) {
+            lines.push(line.to_string());
+        }
+    }
+    Ok(lines)
+}
+
+/// Remove every `session_index.jsonl` entry for `thread_id` and write the
+/// result back atomically. Returns the number of removed entries.
+///
+/// Best-effort: returns `Ok(0)` without writing when the file is missing or
+/// changed since it was read, so a delete flow never clobbers fresh entries.
+pub fn remove_session_index_entry(
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<usize> {
+    let path = codex_home.join("session_index.jsonl");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let original_bytes = fs::read(&path)?;
+    let original_text = String::from_utf8(original_bytes.clone())?;
+    let plan = SessionIndexPlan {
+        path,
+        snapshot_sha256: sha256_hex(&original_bytes),
+        original_bytes,
+        original_text,
+        candidates: Vec::new(),
+    };
+    let selected_ids = HashSet::from([thread_id.to_string()]);
+    let (next_text, removed_entries) = filtered_session_index_text(&plan, &selected_ids);
+    if removed_entries == 0 {
+        return Ok(0);
+    }
+    if fs::read(&plan.path)? != plan.original_bytes {
+        return Ok(0);
+    }
+    codex_plus_core::settings::atomic_write(&plan.path, next_text.as_bytes())?;
+    Ok(removed_entries)
+}
+
+/// 删除 Codex 侧边栏对线程的本地引用。
+///
+/// 线程正文由 `state_5.sqlite`/rollout 文件保存，而侧边栏还会从全局状态和
+/// `sqlite/codex-dev.db` 的目录缓存读取条目。删除正文时必须同步清理这些缓存，
+/// 否则重启后仍会显示一个无法恢复的“幽灵会话”。该操作按 thread id 精确匹配，
+/// 可重复执行；缓存不存在或目标不存在均视为成功。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThreadSidebarCleanupResult {
+    pub global_state_entries_removed: usize,
+    pub catalog_rows_removed: usize,
+}
+
+/// Capture the thread-specific sidebar data that is about to be removed.
+/// The snapshot is embedded in the normal delete backup so undo can restore only
+/// this thread's entries without replacing unrelated global state.
+pub fn snapshot_thread_sidebar_references(
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<Value> {
+    let thread_id = thread_id.strip_prefix("local:").unwrap_or(thread_id);
+    let global_state = snapshot_thread_from_global_state(codex_home, thread_id)?;
+    let catalog = snapshot_thread_from_catalog_dbs(codex_home, thread_id)?;
+    Ok(json!({
+        "thread_id": thread_id,
+        "global_state": global_state,
+        "catalog": catalog,
+    }))
+}
+
+/// Restore a previously captured sidebar snapshot. Existing values are kept so
+/// an undo cannot overwrite changes made after deletion.
+pub fn restore_thread_sidebar_references(
+    codex_home: &Path,
+    snapshot: &Value,
+) -> anyhow::Result<usize> {
+    validate_thread_sidebar_snapshot(codex_home, snapshot)?;
+    let thread_id = snapshot
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut restored = restore_thread_to_global_state(codex_home, thread_id, snapshot)?;
+    restored += restore_thread_to_catalog_dbs(codex_home, thread_id, snapshot)?;
+    Ok(restored)
+}
+
+pub fn validate_thread_sidebar_snapshot(
+    codex_home: &Path,
+    snapshot: &Value,
+) -> anyhow::Result<()> {
+    let thread_id = snapshot
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("sidebar snapshot is missing thread_id"))?;
+    if let Some(catalog) = snapshot.get("catalog") {
+        let entries = catalog
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("sidebar snapshot catalog must be an array"))?;
+        let allowed_paths = sidebar_catalog_db_paths(codex_home)?;
+        for entry in entries {
+            let table = entry
+                .get("table")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("sidebar catalog entry is missing table"))?;
+            if !SIDEBAR_CATALOG_TABLES.contains(&table) {
+                anyhow::bail!("unsupported sidebar catalog table: {table}");
+            }
+            let path = entry
+                .get("db_path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("sidebar catalog entry is missing db_path"))?;
+            let canonical = fs::canonicalize(&path)?;
+            if !allowed_paths.contains(&canonical) {
+                anyhow::bail!("sidebar catalog database is not an allowed Codex database");
+            }
+            let rows = entry
+                .get("rows")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("sidebar catalog entry rows must be an array"))?;
+            for row in rows {
+                let row_id = row
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("sidebar catalog row is missing thread_id"))?;
+                if row_id != thread_id {
+                    anyhow::bail!("sidebar catalog row thread_id does not match snapshot");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 全局状态里「按 thread id 列出」的数组。上游只处理 projectless-thread-ids；
+/// ReCodex 实测还有 pinned-thread-ids，置顶过的会话删掉后同样会残留。
+const SIDEBAR_THREAD_ID_ARRAYS: [&str; 2] = ["projectless-thread-ids", "pinned-thread-ids"];
+
+/// 全局状态里「以 thread id 为键」的对象。thread-project-assignments 是 ReCodex
+/// 追加的：实测删除后它仍把会话挂在项目下，侧边栏据此继续显示。
+const SIDEBAR_THREAD_MAPS: [&str; 4] = [
+    "thread-projectless-output-directories",
+    "thread-workspace-root-hints",
+    "thread-writable-roots",
+    "thread-project-assignments",
+];
+
+/// electron-persisted-atom-state 里以 `<前缀>:<thread id>` 为键的条目。
+const SIDEBAR_ATOM_KEY_PREFIXES: [&str; 3] = [
+    "thread-client-id-v1",
+    "thread-reference-capability",
+    "thread-tab-routes-v1",
+];
+
+const SIDEBAR_CATALOG_TABLES: [&str; 3] = [
+    "local_thread_catalog",
+    "thread_timeline_ledger",
+    "local_thread_catalog_scan_entries",
+];
+
+fn snapshot_thread_from_global_state(
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<Value> {
+    let path = codex_home.join(".codex-global-state.json");
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let Some(root) = value.as_object() else {
+        return Ok(json!({}));
+    };
+    let mut snapshot = Map::new();
+    for key in SIDEBAR_THREAD_ID_ARRAYS {
+        if let Some(ids) = root.get(key).and_then(Value::as_array) {
+            let values = ids
+                .iter()
+                .filter(|value| thread_value_matches(value, thread_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !values.is_empty() {
+                snapshot.insert(key.to_string(), Value::Array(values));
+            }
+        }
+    }
+    let mut maps = Map::new();
+    for key in SIDEBAR_THREAD_MAPS {
+        if let Some(map) = root.get(key).and_then(Value::as_object) {
+            let entries = map
+                .iter()
+                .filter(|(key, _)| thread_key_matches(key, thread_id))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Map<_, _>>();
+            if !entries.is_empty() {
+                maps.insert(key.to_string(), Value::Object(entries));
+            }
+        }
+    }
+    if !maps.is_empty() {
+        snapshot.insert("thread_maps".to_string(), Value::Object(maps));
+    }
+    if let Some(atom) = root
+        .get("electron-persisted-atom-state")
+        .and_then(Value::as_object)
+    {
+        let entries = atom
+            .iter()
+            .filter(|(key, _)| sidebar_atom_key_matches(key, thread_id))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Map<_, _>>();
+        if !entries.is_empty() {
+            snapshot.insert("atom_entries".to_string(), Value::Object(entries));
+        }
+    }
+    Ok(Value::Object(snapshot))
+}
+
+fn snapshot_thread_from_catalog_dbs(
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<Value> {
+    let mut entries = Vec::new();
+    for path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(codex_home)
+    {
+        if !path.exists() {
+            continue;
+        }
+        let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        for table in SIDEBAR_CATALOG_TABLES {
+            let columns = table_columns(&db, table)?;
+            if !columns.contains("thread_id") {
+                continue;
+            }
+            let rows = select_dicts(
+                &db,
+                &format!("SELECT * FROM {table} WHERE thread_id = ?1"),
+                &[&thread_id],
+            )?;
+            if !rows.is_empty() {
+                entries.push(json!({
+                    "db_path": path.to_string_lossy(),
+                    "table": table,
+                    "rows": rows,
+                }));
+            }
+        }
+    }
+    Ok(Value::Array(entries))
+}
+
+fn restore_thread_to_global_state(
+    codex_home: &Path,
+    _thread_id: &str,
+    snapshot: &Value,
+) -> anyhow::Result<usize> {
+    let global = snapshot.get("global_state").unwrap_or(&Value::Null);
+    if !global.is_object() {
+        return Ok(0);
+    }
+    let path = codex_home.join(".codex-global-state.json");
+    let original_bytes = if path.exists() {
+        fs::read(&path)?
+    } else {
+        Vec::new()
+    };
+    let mut state = if original_bytes.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice::<Value>(&original_bytes)?
+    };
+    let Some(root) = state.as_object_mut() else {
+        return Ok(0);
+    };
+    let mut restored = 0usize;
+    for key in SIDEBAR_THREAD_ID_ARRAYS {
+        let Some(values) = global.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        let ids = root
+            .entry(key)
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(ids) = ids.as_array_mut() {
+            for value in values {
+                if !ids.iter().any(|existing| existing == value) {
+                    ids.push(value.clone());
+                    restored += 1;
+                }
+            }
+        }
+    }
+    if let Some(maps) = global.get("thread_maps").and_then(Value::as_object) {
+        restored += restore_missing_map_entries(root, maps);
+    }
+    if let Some(entries) = global.get("atom_entries").and_then(Value::as_object) {
+        let atom = root
+            .entry("electron-persisted-atom-state")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(atom) = atom.as_object_mut() {
+            for (key, value) in entries {
+                if !atom.contains_key(key) {
+                    atom.insert(key.clone(), value.clone());
+                    restored += 1;
+                }
+            }
+        }
+    }
+    if restored == 0 {
+        return Ok(0);
+    }
+    if path.exists() && fs::read(&path)? != original_bytes {
+        anyhow::bail!(".codex-global-state.json changed while restoring sidebar state");
+    }
+    codex_plus_core::settings::atomic_write(&path, serde_json::to_string_pretty(&state)?.as_bytes())?;
+    Ok(restored)
+}
+
+fn restore_missing_map_entries(root: &mut Map<String, Value>, maps: &Map<String, Value>) -> usize {
+    let mut restored = 0usize;
+    for (key, entries) in maps {
+        let value = root
+            .entry(key.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let (Some(target), Some(entries)) = (value.as_object_mut(), entries.as_object()) {
+            for (entry_key, entry_value) in entries {
+                if !target.contains_key(entry_key) {
+                    target.insert(entry_key.clone(), entry_value.clone());
+                    restored += 1;
+                }
+            }
+        }
+    }
+    restored
+}
+
+fn restore_thread_to_catalog_dbs(
+    codex_home: &Path,
+    _thread_id: &str,
+    snapshot: &Value,
+) -> anyhow::Result<usize> {
+    let Some(entries) = snapshot.get("catalog").and_then(Value::as_array) else {
+        return Ok(0);
+    };
+    let allowed_paths = sidebar_catalog_db_paths(codex_home)?;
+    let mut restored_total = 0usize;
+    for entry in entries {
+        let path = PathBuf::from(entry["db_path"].as_str().unwrap_or_default());
+        let canonical = fs::canonicalize(&path)?;
+        if !allowed_paths.contains(&canonical) {
+            anyhow::bail!("sidebar catalog database is not an allowed Codex database");
+        }
+        let table = entry["table"].as_str().unwrap_or_default();
+        let rows = entry["rows"].as_array().cloned().unwrap_or_default();
+        let mut db = Connection::open(&path)?;
+        let tx = db.transaction()?;
+        if !has_table(&tx, table)? {
+            tx.commit()?;
+            continue;
+        }
+        let columns = table_columns(&tx, table)?;
+        if !columns.contains("thread_id") {
+            tx.commit()?;
+            continue;
+        }
+        let mut restored = 0usize;
+        for row in rows {
+            if let Some(row) = row.as_object() {
+                restored += insert_row_ignore(&tx, table, row)?;
+            }
+        }
+        if restored > 0 {
+            let metadata_columns = table_columns(&tx, "local_thread_catalog_metadata")?;
+            update_local_catalog_metadata(&tx, &metadata_columns, restored)?;
+        }
+        tx.commit()?;
+        restored_total += restored;
+    }
+    Ok(restored_total)
+}
+
+fn insert_row_ignore(db: &Connection, table: &str, row: &Map<String, Value>) -> anyhow::Result<usize> {
+    let columns: Vec<&String> = row.keys().collect();
+    if columns.is_empty() {
+        return Ok(0);
+    }
+    let quoted = columns
+        .iter()
+        .map(|column| format!("\"{}\"", column.replace('\"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let marks = (0..columns.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = columns
+        .iter()
+        .map(|column| json_to_sql_value(&row[*column]))
+        .collect::<Vec<_>>();
+    let refs = values
+        .iter()
+        .map(|value| value as &dyn ToSql)
+        .collect::<Vec<_>>();
+    Ok(db.execute(
+        &format!("INSERT OR IGNORE INTO \"{table}\" ({quoted}) VALUES ({marks})"),
+        refs.as_slice(),
+    )?)
+}
+
+fn sidebar_catalog_db_paths(codex_home: &Path) -> anyhow::Result<HashSet<PathBuf>> {
+    Ok(codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(codex_home)
+        .into_iter()
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .collect())
+}
+
+fn thread_value_matches(value: &Value, thread_id: &str) -> bool {
+    value
+        .as_str()
+        .is_some_and(|value| value == thread_id || value == format!("local:{thread_id}"))
+}
+
+fn thread_key_matches(key: &str, thread_id: &str) -> bool {
+    key == thread_id || key == format!("local:{thread_id}")
+}
+
+fn sidebar_atom_key_matches(key: &str, thread_id: &str) -> bool {
+    let encoded_local = format!("local%3A{thread_id}");
+    SIDEBAR_ATOM_KEY_PREFIXES.iter().any(|prefix| {
+        key.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .is_some_and(|rest| rest == thread_id || rest == encoded_local)
+    })
+}
+
+pub fn remove_thread_sidebar_references(
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<ThreadSidebarCleanupResult> {
+    let thread_id = thread_id.strip_prefix("local:").unwrap_or(thread_id);
+    let (global_state_entries_removed, global_error) =
+        match remove_thread_from_global_state(codex_home, thread_id) {
+            Ok(count) => (count, None),
+            Err(error) => (0, Some(error)),
+        };
+    let (catalog_rows_removed, catalog_error) =
+        match remove_thread_from_catalog_dbs(codex_home, thread_id) {
+            Ok(count) => (count, None),
+            Err(error) => (0, Some(error)),
+        };
+    if let Some(error) = global_error {
+        return Err(error);
+    }
+    if let Some(error) = catalog_error {
+        return Err(error);
+    }
+    Ok(ThreadSidebarCleanupResult {
+        global_state_entries_removed,
+        catalog_rows_removed,
+    })
+}
+
+fn remove_thread_from_global_state(codex_home: &Path, thread_id: &str) -> anyhow::Result<usize> {
+    let path = codex_home.join(".codex-global-state.json");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let original_bytes = fs::read(&path)?;
+    let mut state: Value = serde_json::from_slice(&original_bytes)?;
+    let Some(root) = state.as_object_mut() else {
+        return Ok(0);
+    };
+    let mut removed = 0usize;
+    for key in SIDEBAR_THREAD_ID_ARRAYS {
+        if let Some(ids) = root.get_mut(key).and_then(Value::as_array_mut) {
+            let before = ids.len();
+            ids.retain(|value| !thread_value_matches(value, thread_id));
+            removed += before.saturating_sub(ids.len());
+        }
+    }
+    for key in SIDEBAR_THREAD_MAPS {
+        if let Some(map) = root.get_mut(key).and_then(Value::as_object_mut) {
+            for candidate in [thread_id, &format!("local:{thread_id}")] {
+                if map.remove(candidate).is_some() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    if let Some(atom) = root
+        .get_mut("electron-persisted-atom-state")
+        .and_then(Value::as_object_mut)
+    {
+        let keys = atom
+            .keys()
+            .filter(|key| sidebar_atom_key_matches(key, thread_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            atom.remove(&key);
+            removed += 1;
+        }
+    }
+    if removed == 0 {
+        return Ok(0);
+    }
+    // 先比对再写：读到写之间文件被别人（通常是正在运行的 Codex）改过就放弃，
+    // 绝不拿旧快照覆盖对方的新内容。
+    //
+    // 已知局限（与上游一致）：Codex 运行时把全局状态放在内存里，之后会整份写回
+    // 这个文件，可能把刚删掉的条目又写回来。删除当下无法阻止；ReCodex 的补救是
+    // 启动器下次启动、Codex 尚未运行时由 deleted_leftovers 再扫一遍。
+    if fs::read(&path)? != original_bytes {
+        anyhow::bail!(".codex-global-state.json changed while deleting thread {thread_id}");
+    }
+    codex_plus_core::settings::atomic_write(&path, serde_json::to_string_pretty(&state)?.as_bytes())?;
+    Ok(removed)
+}
+
+fn remove_thread_from_catalog_dbs(codex_home: &Path, thread_id: &str) -> anyhow::Result<usize> {
+    let mut removed_total = 0usize;
+    for path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(codex_home) {
+        if !path.exists() {
+            continue;
+        }
+        let mut db = Connection::open(&path)?;
+        db.busy_timeout(std::time::Duration::from_millis(500))?;
+        let tx = db.transaction()?;
+        let mut removed = 0usize;
+        for table in [
+            "local_thread_catalog",
+            "thread_timeline_ledger",
+            "local_thread_catalog_scan_entries",
+        ] {
+            let columns = table_columns(&tx, table)?;
+            if !columns.contains("thread_id") {
+                continue;
+            }
+            removed += tx.execute(
+                &format!("DELETE FROM {table} WHERE thread_id = ?1"),
+                [thread_id],
+            )?;
+        }
+        if removed > 0 {
+            let metadata_columns = table_columns(&tx, "local_thread_catalog_metadata")?;
+            if metadata_columns.contains("catalog_revision") {
+                tx.execute(
+                    "UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + ?1",
+                    [removed as i64],
+                )?;
+            }
+        }
+        tx.commit()?;
+        removed_total += removed;
+    }
+    Ok(removed_total)
+}
+
+/// Append previously removed `session_index.jsonl` lines back (undo flow).
+/// Lines whose `id` already exists are skipped. Returns the number of
+/// appended lines. Best-effort: returns `Ok(0)` without writing when the
+/// file changed since it was read.
+pub fn restore_session_index_entries(
+    codex_home: &Path,
+    lines: &[String],
+) -> anyhow::Result<usize> {
+    if lines.is_empty() {
+        return Ok(0);
+    }
+    let path = codex_home.join("session_index.jsonl");
+    let original_bytes = if path.exists() {
+        fs::read(&path)?
+    } else {
+        Vec::new()
+    };
+    let original_text = String::from_utf8(original_bytes.clone())?;
+    let mut existing_ids = HashSet::new();
+    for segment in original_text.split_inclusive('\n') {
+        let (line, _) = split_line_ending(segment);
+        if let Some(candidate) = known_session_index_candidate(line) {
+            existing_ids.insert(candidate.id);
+        }
+    }
+    let mut next_text = original_text;
+    if !next_text.is_empty() && !next_text.ends_with('\n') {
+        next_text.push('\n');
+    }
+    let mut appended = 0usize;
+    for line in lines {
+        if let Some(candidate) = known_session_index_candidate(line) {
+            if existing_ids.contains(&candidate.id) {
+                continue;
+            }
+            existing_ids.insert(candidate.id);
+        }
+        next_text.push_str(line);
+        next_text.push('\n');
+        appended += 1;
+    }
+    if appended == 0 {
+        return Ok(0);
+    }
+    let current_bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if current_bytes != original_bytes {
+        return Ok(0);
+    }
+    codex_plus_core::settings::atomic_write(&path, next_text.as_bytes())?;
+    Ok(appended)
 }
 
 fn ensure_codex_app_stopped(
