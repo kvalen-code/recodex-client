@@ -279,6 +279,28 @@ impl ReCodexState {
     }
 }
 
+impl ReCodexState {
+    /// 一份带登录令牌的请求客户端(fork,不占全局锁)。没登录 → `Unauthorized`,
+    /// state 没建起来 → `InvalidConfiguration`。给 remote_pair 那几条跨 crate 的调用用。
+    pub fn authenticated_adapter(&self) -> Result<Adapter<HttpTransport>, AdapterError> {
+        let guard = self
+            .adapter
+            .lock()
+            .map_err(|_| AdapterError::InvalidConfiguration("ReCodex state is unavailable".into()))?;
+        let Some(adapter) = guard.as_ref() else {
+            return Err(AdapterError::InvalidConfiguration(
+                self.init_error
+                    .clone()
+                    .unwrap_or_else(|| "ReCodex is not configured".to_owned()),
+            ));
+        };
+        if !adapter.is_authenticated() {
+            return Err(AdapterError::Unauthorized);
+        }
+        Ok(adapter.fork())
+    }
+}
+
 fn error(code: &str, message: impl Into<String>) -> Value {
     json!({"status":"error", "error":{"code":code,"message":message.into()}})
 }
