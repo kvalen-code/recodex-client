@@ -6,7 +6,8 @@
 //! ```
 //!
 //! 解压走客户端自己的安全解压;数据目录是临时目录(不碰 ~/.recodex/remote、不登记开机自启)。
-//! `pair --json` 只读到第一条 waiting 就杀掉 —— **不会完成真实配对**(中继上只留一条没人确认的请求)。
+//! `pair --json --bind-approver` 只读到第一条 waiting 就杀掉 —— **不会完成真实配对**
+//! (中继上只留一条没人确认的请求),同时核对这份运行时会不会做批准方核对(§2.4.1)。
 
 use std::time::Duration;
 
@@ -48,7 +49,7 @@ async fn real_runtime_installs_reports_status_and_starts_pairing() {
     assert!(!status.paired, "临时目录里不该有凭据");
     assert!(!status.daemon.running);
 
-    let mut cmd = rt.command(&["pair", "--json"]);
+    let mut cmd = rt.command(&["pair", "--json", "--bind-approver"]);
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().expect("pair --json");
@@ -66,7 +67,17 @@ async fn real_runtime_installs_reports_status_and_starts_pairing() {
     .expect("60 秒内没有配对事件");
     let _ = child.kill().await;
     match event {
-        Some(runtime::PairEvent::Waiting { public_key, qr }) => {
+        Some(runtime::PairEvent::Waiting {
+            public_key,
+            qr,
+            approver_check,
+        }) => {
+            // 真运行时必须认 --bind-approver:不认就说明它是老版本,
+            // 桌面端会退回「只扫码」,批准方核对根本不生效(§2.4.1)。
+            assert!(
+                approver_check,
+                "waiting 里没有 approverCheck:这份远程组件不会核对批准方"
+            );
             let key =
                 code::decode_public_key(&public_key).expect("公钥是带填充的标准 base64、32 字节");
             let c = code::confirm_code(&key);

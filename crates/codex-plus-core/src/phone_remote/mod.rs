@@ -5,12 +5,27 @@
 //!
 //!   1. 保证运行时(install.rs:按账号取 channel=remote 清单 → 校验 → 解压 → current.json);
 //!   2. 把官方 Codex 命令行的位置写进运行时 settings.json 的 `codexPath`(host.rs);
-//!   3. 跑 `pair --json`:拿到一次性公钥 → 本机算确认码、登记到后台(跟随账号,手机弹窗)
-//!      → 同时把二维码给面板(扫码兜底)→ 轮询后台看手机是拒绝还是过期;
+//!   3. 跑 `pair --json --bind-approver`:拿到一次性公钥 → 本机算确认码、登记到后台
+//!      (跟随账号,手机弹窗)→ 同时把二维码给面板(扫码兜底)→ 轮询后台看手机是拒绝还是过期;
 //!   4. 配好后 `daemon start`(独立常驻,Codex/客户端退出后照跑)+ 登记开机自启。
 //!
 //! 面板经 CDP 桥 `/remote/*` 调用(routes.rs)。所有状态放在进程内的一个控制器里;
 //! 一次只跑一个流程,新流程/取消都会让旧流程作废(generation)。
+//!
+//! ── 批准方绑定(2026-09-20 审计:抢答劫持;完整协议见 docs/remote-app-plan.md §2.4.1)──
+//!
+//! 中继对「谁来批准」是先写者赢:拿到这台电脑一次性公钥(二维码、后台库、中继库里都有)的人,
+//! 可以用**他自己的**中继账号抢先批准,这台电脑就连到他身上(等于远程执行)。
+//! 所以运行时以 `--bind-approver` 启动,登记请求时声明 `approver_check`,这里把后台记下的批准方
+//! (手机的内容公钥 + 中继账号 id)经 **stdin** 交给运行时,由它核对中继交来的身份:
+//!
+//!   - 后台登记成功 → 二维码内容加 `&bind=1`;等后台 approved 后递一行
+//!     `{"account":…,"key":…,"type":"approver"}`;
+//!   - approved 却没有批准方 → 中止(后台或手机 App 是旧版),绝不降级成不核对;
+//!   - 后台**明确**说这条路不可用(400/401/403/404/429/501、未登录)→ 递 `{"type":"unbound"}`,只能扫码;
+//!   - 网络错误 / 5xx:后台可能已经建好了记录,不能静默降级 —— 退避重试 3 次,仍失败就中止(审计 S2);
+//!   - 运行时是老版本(waiting 里没有 `approverCheck`)→ 它不会核对,这里就**不登记**后台请求,
+//!     只给二维码,并提示更新远程组件。
 
 pub mod autostart;
 pub mod code;
@@ -23,8 +38,9 @@ pub mod runtime;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use recodex_integration::remote_pair::{PairApiError, RemotePairCreated, RemotePairStatus};
 use serde_json::{Value, json};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use self::layout::{RemoteHome, RuntimeCurrent};
 use self::runtime::{PairEvent, Runtime};
@@ -35,6 +51,12 @@ const ARCH: &str = std::env::consts::ARCH;
 /// 运行时自己 10 分钟超时;多给 30 秒让它先把自己的结论说出来。
 const PAIR_TIMEOUT: Duration = Duration::from_secs(10 * 60 + 30);
 const PAIR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// 登记跟随账号请求的重试次数与退避(同命令行:间隔 1s、2s)。
+/// 同一台设备重新登记会顶替旧的,所以重试是安全的。
+const PAIR_REGISTER_ATTEMPTS: u32 = 3;
+const PAIR_REGISTER_BACKOFF: Duration = Duration::from_secs(1);
+/// 登记成功后二维码末尾加这个,手机扫到就知道这台电脑会核对批准方(§2.4.1)。
+const PAIR_QR_BIND_SUFFIX: &str = "&bind=1";
 
 // ── 状态机(纯逻辑,单测覆盖)────────────────────────────────────────────
 
@@ -90,6 +112,55 @@ pub const MSG_EXPIRED: &str = "确认已过期(10 分钟内没有完成),请重�
 pub const MSG_TIMED_OUT: &str = "10 分钟内没有在手机上完成确认,已取消。请重新连接。";
 /// 与命令行 errPairSuperseded 同义(桌面端的说法)。
 pub const MSG_SUPERSEDED: &str = "这次配对已在别处重新发起(这台电脑上运行了 recodex app,或在别处打开了手机远程),这里的确认码已作废。请以最新显示的确认码为准;要在这里继续,点「连接手机」。";
+
+// ── 批准方核对失败的文案(§2.4.1 的四个机读码 + 两种「批准方缺失」)────────────
+
+/// `approver_mismatch`:中继交来的身份不是后台记下的批准方 —— 被别人抢先确认了。
+pub const MSG_APPROVER_MISMATCH: &str = "安全检查未通过:批准这次连接的不是你手机上的 ReCodex 账号(有人抢先确认了这台电脑),已拒绝,没有保存任何凭据。请点「重新配对」,并在手机弹窗里核对确认码后点允许。如果反复出现,请联系 ReCodex 客服。";
+/// `approver_missing`:中继上有答复,但一直没有对应的账号批准记录。
+pub const MSG_APPROVER_MISSING: &str = "安全检查未通过:中继上的这次确认没有对应的账号批准记录,已拒绝,没有保存任何凭据。可能是被他人抢先确认,也可能是扫码的手机 App 版本较旧、或登录的不是这个 ReCodex 账号。请把手机 ReCodex App 更新到最新版、登录与电脑相同的账号,然后重新连接并在手机弹窗里点允许。";
+/// `approver_check_failed`:查不到中继令牌属于哪个账号(网络问题),为安全起见没落盘。
+pub const MSG_APPROVER_CHECK_FAILED: &str =
+    "无法向中继核实是哪部手机批准的这次连接,为安全起见没有保存任何凭据。请检查网络后重新连接。";
+/// `relay_answer_consumed`:中继上的配对结果已被别的程序取走(只发一次)。
+pub const MSG_RELAY_ANSWER_CONSUMED: &str = "安全检查未通过:中继上的配对结果已经被别的程序取走,本次配对作废,没有保存任何凭据。请重新连接;如果反复出现,请联系 ReCodex 客服。";
+/// 后台是 approved 却没回批准方,且登记时后台连 `approver_binding` 都没回 → 只可能是后台旧。
+pub const MSG_APPROVER_ABSENT_SERVER: &str = "手机已允许,但 ReCodex 服务端版本较旧,不支持安全核对,为安全起见已中止连接。请稍后再试,或先用手机 App 扫描二维码连接。";
+/// 后台支持绑定却没回批准方 → 分不清是后台被回滚还是手机 App 旧,两个都提(审计 S4)。
+pub const MSG_APPROVER_ABSENT_BOTH: &str = "手机已允许,但没有收到安全核对所需的批准方信息(ReCodex 服务端或手机 App 版本较旧),为安全起见已中止连接。请把手机 ReCodex App 更新到最新版后重新连接;如果手机已是最新版,请稍后再试或联系 ReCodex 客服。";
+
+/// 运行时 `error` 事件里的机读码 → 面板上的中文说明。不认识的码返回 None(按普通失败处理)。
+pub fn approver_error_message(code: &str, detail: &str) -> Option<String> {
+    let detail = detail.trim();
+    let message = match code {
+        runtime::PAIR_ERR_APPROVER_MISMATCH => MSG_APPROVER_MISMATCH.to_string(),
+        runtime::PAIR_ERR_APPROVER_MISSING => MSG_APPROVER_MISSING.to_string(),
+        runtime::PAIR_ERR_APPROVER_CHECK_FAILED => {
+            let mut message = MSG_APPROVER_CHECK_FAILED.to_string();
+            if !detail.is_empty() {
+                message.push_str(&format!("(远程组件:{detail})"));
+            }
+            message
+        }
+        runtime::PAIR_ERR_RELAY_ANSWER_CONSUMED => MSG_RELAY_ANSWER_CONSUMED.to_string(),
+        _ => return None,
+    };
+    Some(message)
+}
+
+/// 后台是 approved 但没给批准方:分清「只有服务端旧」与「服务端或手机 App 旧」。
+pub fn approver_absent_message(backend_binding: bool) -> &'static str {
+    if backend_binding {
+        MSG_APPROVER_ABSENT_BOTH
+    } else {
+        MSG_APPROVER_ABSENT_SERVER
+    }
+}
+
+/// 登记这条请求失败、又不能降级(网络错误 / 5xx / 回包解不开):中止,不静默变成不核对。
+pub fn register_failed_message(note: &str) -> String {
+    format!("无法在 ReCodex 服务端登记这次连接({note}),为安全起见已中止。请检查网络后重新连接。")
+}
 
 pub fn reduce(phase: &Phase, event: FlowEvent) -> Phase {
     match event {
@@ -152,6 +223,55 @@ pub fn describe_api_error(error: &recodex_integration::AdapterError) -> String {
         E::Forbidden => "当前账号不能使用手机远程".into(),
         E::Unavailable | E::ServiceUnavailable => "暂时连不上 ReCodex 服务,或服务端尚未开放".into(),
         other => other.to_string(),
+    }
+}
+
+/// 配对接口失败时给用户的一句话(状态码优先,同命令行 describePairAPIError)。
+pub fn describe_pair_error(error: &PairApiError) -> String {
+    match error {
+        PairApiError::Http(400) => "服务端暂不支持手机弹窗确认(版本较旧)".into(),
+        PairApiError::Http(401) => "登录已失效,请到「账号」页重新登录".into(),
+        PairApiError::Http(403) => "当前账号不能使用手机远程".into(),
+        PairApiError::Http(404) | PairApiError::Http(501) => "服务端尚未开放".into(),
+        PairApiError::Http(429) => "待确认的电脑太多,请先在手机上处理".into(),
+        PairApiError::Http(status) => format!("服务端返回 HTTP {status}"),
+        PairApiError::Adapter(error) => describe_api_error(error),
+    }
+}
+
+/// 后台**明确**表示没建记录、这条路不可用 —— 只有这些才降级成只扫码(§2.4.1 第 3 条)。
+/// 网络错误与 5xx 不在其中:那时后台可能已经建好了记录,降级就等于把核对悄悄关掉。
+pub fn pair_unavailable(error: &PairApiError) -> bool {
+    use recodex_integration::AdapterError as E;
+    match error {
+        PairApiError::Http(status) => matches!(status, 400 | 401 | 403 | 404 | 429 | 501),
+        // 本机就没有登录态:请求根本没发出去。
+        PairApiError::Adapter(E::Unauthorized) | PairApiError::Adapter(E::InvalidConfiguration(_)) => true,
+        PairApiError::Adapter(_) => false,
+    }
+}
+
+/// 跟随账号(手机弹窗)这条路为什么走不通。三种都降级成只扫码,只是提示语不同。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptUnavailable {
+    /// 运行时不认 `--bind-approver`:它不会核对批准方,所以**不登记**后台请求。
+    RuntimeTooOld,
+    /// 后台没把这条登记成「会核对批准方」(已撤回)。
+    BackendTooOld,
+    /// 后台明确拒绝(401/403/404/429/…)或本机未登录。
+    Api(PairApiError),
+}
+
+impl PromptUnavailable {
+    pub fn note(&self) -> String {
+        match self {
+            Self::RuntimeTooOld => {
+                "远程组件版本较旧、不支持安全核对,这次只能扫码;请稍后重新连接,让客户端把远程组件更新到最新版"
+                    .into()
+            }
+            Self::BackendTooOld => "服务端暂不支持手机弹窗确认(版本较旧)".into(),
+            Self::Api(error) => describe_pair_error(error),
+        }
     }
 }
 
@@ -476,16 +596,21 @@ async fn pair(
     force: bool,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<bool> {
-    let mut args = vec!["pair", "--json"];
+    let mut args = vec!["pair", "--json", "--bind-approver"];
     if force {
         args.push("--force");
     }
     let mut cmd = rt.command(&args);
-    cmd.stdout(std::process::Stdio::piped())
+    // stdin 接管道:批准方要等手机点了允许才知道,只能在运行时起来之后经 stdin 递进去(§2.4.1)。
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let mut child = cmd
         .spawn()
         .map_err(|error| anyhow::anyhow!("无法启动远程组件:{error}"))?;
+    let mut directives = Directives {
+        stdin: child.stdin.take(),
+    };
     // 启动器被直接结束(process::exit / 任务管理器)时 kill_on_drop 不会执行:
     // Windows 上把配对进程放进「句柄关闭即杀」的作业对象兜底,不留孤儿进程。
     runtime::contain_child(&child);
@@ -500,8 +625,12 @@ async fn pair(
     let mut poll = tokio::time::interval(PAIR_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pair_id: Option<String> = None;
-    // 后台那条请求已经有结论(手机拒绝 / 过期),不用再撤回。
+    // 后台那条请求已经有结论(手机拒绝 / 过期 / 已批准),不用再撤回。
     let mut settled_on_server = false;
+    // 登记时后台回了 approver_binding:它支持批准方绑定(用来分清是后台旧还是手机 App 旧)。
+    let mut backend_binding = false;
+    // 后台已 approved,批准方已经递给运行时(只递一次)。
+    let mut approved_on_server = false;
 
     // Ok(Some(true)) = 已配对;Ok(None) = 没配成(原因已写进状态);Err = 出错。
     let outcome: anyhow::Result<Option<bool>> = loop {
@@ -525,12 +654,20 @@ async fn pair(
                     }
                 };
                 match runtime::parse_pair_event_line(&line) {
-                    Some(PairEvent::Waiting { public_key, qr }) => {
-                        match on_waiting(&public_key, &qr, &machine_name).await {
-                            Ok((info, id)) => {
+                    Some(PairEvent::Waiting { public_key, qr, approver_check }) => {
+                        match on_waiting(&public_key, &qr, &machine_name, approver_check).await {
+                            Ok((info, registered)) => {
                                 // 运行时换了一把公钥重来:旧的那条请求撤掉
+                                let id = registered.as_ref().map(|r| r.id.clone());
                                 if let Some(old) = std::mem::replace(&mut pair_id, id) {
                                     cancel_pair_request(old);
+                                }
+                                settled_on_server = false;
+                                approved_on_server = false;
+                                backend_binding = registered.as_ref().is_some_and(|r| r.approver_binding);
+                                if registered.is_none() {
+                                    // 明确没有后台记录:告诉运行时这次不做批准方绑定(只扫码)。
+                                    directives.unbound().await;
                                 }
                                 apply(generation, FlowEvent::Waiting(info));
                             }
@@ -538,7 +675,14 @@ async fn pair(
                         }
                     }
                     Some(PairEvent::Authorized { .. }) | Some(PairEvent::AlreadyPaired { .. }) => break Ok(Some(true)),
-                    Some(PairEvent::Error { message }) => {
+                    Some(PairEvent::Error { message, code }) => {
+                        if let Some(message) = approver_error_message(&code, &message) {
+                            // 批准方核对没过:运行时没有保存任何凭据,照 §2.4.1 的表给说明,
+                            // 不能说成「手机没把凭据交给中继」。
+                            log("phone_remote.approver_check_failed", json!({ "code": code }));
+                            apply(generation, FlowEvent::RuntimeError(message));
+                            break Ok(None);
+                        }
                         let message = if message.trim().is_empty() { "未知错误".to_string() } else { message };
                         apply(generation, FlowEvent::RuntimeError(format!("配对失败:{message}")));
                         break Ok(None);
@@ -549,38 +693,65 @@ async fn pair(
             _ = poll.tick(), if pair_id.is_some() => {
                 let id = pair_id.clone().unwrap_or_default();
                 let status = tokio::task::spawn_blocking(move || {
-                    recodex_integration::remote_pair::remote_pair_status(&id)
+                    backend().status(&id)
                 })
                 .await;
                 // 网络抖动不算失败:运行时那边还在等,扫码也还能完成
+                let status = status.map(|inner| inner.map(|st| (st.status.clone(), st)));
                 match status {
-                    Ok(Ok(s)) if s == recodex_integration::remote_pair::REMOTE_PAIR_REJECTED => {
+                    Ok(Ok((s, st))) if s == recodex_integration::remote_pair::REMOTE_PAIR_APPROVED => {
+                        if !approved_on_server {
+                            approved_on_server = true;
+                            // approved 是终态,撤回没有意义。
+                            settled_on_server = true;
+                            match approver_directive_for(&st) {
+                                Some((key, account)) => {
+                                    directives.approver(&key, &account).await;
+                                    apply(generation, FlowEvent::PhoneApproved);
+                                }
+                                None => {
+                                    // 不知道批准方是谁 = 没法核对中继上的答复是不是它给的:中止。
+                                    log(
+                                        "phone_remote.approver_absent",
+                                        json!({ "backend_binding": backend_binding }),
+                                    );
+                                    apply(
+                                        generation,
+                                        FlowEvent::RuntimeError(
+                                            approver_absent_message(backend_binding).to_string(),
+                                        ),
+                                    );
+                                    break Ok(None);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Ok((s, _))) if s == recodex_integration::remote_pair::REMOTE_PAIR_REJECTED => {
                         settled_on_server = true;
                         apply(generation, FlowEvent::Rejected);
                         // 用户在手机上明确拒绝了:别在下次启动时再弹
                         let _ = set_follow_account(false);
                         break Ok(None);
                     }
-                    Ok(Ok(s)) if s == recodex_integration::remote_pair::REMOTE_PAIR_EXPIRED => {
+                    Ok(Ok((s, _))) if s == recodex_integration::remote_pair::REMOTE_PAIR_EXPIRED => {
                         settled_on_server = true;
                         apply(generation, FlowEvent::Expired);
                         break Ok(None);
                     }
-                    Ok(Ok(s)) if s == recodex_integration::remote_pair::REMOTE_PAIR_CANCELLED => {
+                    Ok(Ok((s, _))) if s == recodex_integration::remote_pair::REMOTE_PAIR_CANCELLED => {
                         // 被顶替(或已撤回):后台已是终态,不用再撤;别处那次配对照常进行,
                         // 开关保持打开。
                         settled_on_server = true;
                         apply(generation, FlowEvent::Superseded);
                         break Ok(None);
                     }
-                    Ok(Ok(s)) if s == recodex_integration::remote_pair::REMOTE_PAIR_APPROVED => {
-                        apply(generation, FlowEvent::PhoneApproved);
-                    }
                     _ => {}
                 }
             }
         }
     };
+    // 关掉 stdin(已经收到的指示仍然有效,§2.4.1):别让运行时因为管道还开着而一直等下去。
+    directives.stdin = None;
     if matches!(outcome, Ok(Some(_))) {
         // 正常结束时运行时会自己退出;卡住的话 10 秒后再杀。
         if tokio::time::timeout(Duration::from_secs(10), child.wait())
@@ -602,7 +773,7 @@ async fn pair(
 /// 撤回后台那条配对请求(发出去就不管,失败只记日志:过期后后台自己会清)。
 fn cancel_pair_request(id: String) {
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = recodex_integration::remote_pair::remote_pair_cancel(&id) {
+        if let Err(error) = backend().cancel(&id) {
             log(
                 "phone_remote.pair_cancel_failed",
                 json!({ "error": error.to_string() }),
@@ -611,53 +782,225 @@ fn cancel_pair_request(id: String) {
     });
 }
 
-/// 处理运行时给出的一次性公钥:本机算确认码 → 登记到后台 → 与后台的码核对 → 画二维码。
+// ── 后台那三条配对接口(可替换,给集成测试用)──────────────────────────
+
+/// `POST remote/pair` / `GET remote/pair/{id}` / `POST remote/pair/{id}/cancel`。
+/// 生产是 recodex-integration 的真实实现;集成测试换成假后台,好把「后台已批准却缺批准方」
+/// 这类只在服务端侧出现的分支跑出来(都是阻塞调用,调用方放 spawn_blocking)。
+pub trait PairBackend: Send + Sync {
+    /// `approver_check` 原样进 body:声明「这台电脑会核对批准方」。
+    fn create(
+        &self,
+        public_key: &str,
+        machine_name: &str,
+        approver_check: bool,
+    ) -> Result<RemotePairCreated, PairApiError>;
+    fn status(&self, id: &str) -> Result<RemotePairStatus, PairApiError>;
+    fn cancel(&self, id: &str) -> Result<(), recodex_integration::AdapterError>;
+}
+
+struct LiveBackend;
+
+impl PairBackend for LiveBackend {
+    fn create(
+        &self,
+        public_key: &str,
+        machine_name: &str,
+        approver_check: bool,
+    ) -> Result<RemotePairCreated, PairApiError> {
+        recodex_integration::remote_pair::remote_pair_create(
+            public_key,
+            machine_name,
+            host::platform_name(),
+            approver_check,
+        )
+    }
+
+    fn status(&self, id: &str) -> Result<RemotePairStatus, PairApiError> {
+        recodex_integration::remote_pair::remote_pair_status(id)
+    }
+
+    fn cancel(&self, id: &str) -> Result<(), recodex_integration::AdapterError> {
+        recodex_integration::remote_pair::remote_pair_cancel(id)
+    }
+}
+
+fn backend_slot() -> &'static Mutex<Option<std::sync::Arc<dyn PairBackend>>> {
+    static SLOT: OnceLock<Mutex<Option<std::sync::Arc<dyn PairBackend>>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// 集成测试用:换掉后台(与 paths / autostart 的 *_for_tests 同一做法)。传 None 恢复真实后台。
+pub fn set_pair_backend_for_tests(backend: Option<std::sync::Arc<dyn PairBackend>>) {
+    if let Ok(mut slot) = backend_slot().lock() {
+        *slot = backend;
+    }
+}
+
+fn backend() -> std::sync::Arc<dyn PairBackend> {
+    backend_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(|| std::sync::Arc::new(LiveBackend))
+}
+
+/// 往运行时 stdin 写批准方指示(§2.4.1)。写失败(运行时已退出)不管。
+struct Directives {
+    stdin: Option<tokio::process::ChildStdin>,
+}
+
+impl Directives {
+    async fn send(&mut self, line: String) {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return;
+        };
+        if stdin.write_all(line.as_bytes()).await.is_err() {
+            self.stdin = None;
+            return;
+        }
+        let _ = stdin.flush().await;
+    }
+
+    async fn approver(&mut self, public_key: &str, account_id: &str) {
+        self.send(runtime::approver_directive(public_key, account_id))
+            .await;
+    }
+
+    async fn unbound(&mut self) {
+        self.send(runtime::unbound_directive()).await;
+    }
+}
+
+/// 后台登记成功的那条请求。
+struct Registered {
+    id: String,
+    /// 后台回了 `approver_binding`:它支持批准方绑定。
+    approver_binding: bool,
+}
+
+/// 后台 approved 时回的批准方 → 交给运行时的两个值。
+/// 公钥这里**再严格解一次**(带填充的标准 base64、32 字节):解不开就当没有,按「缺失」中止。
+fn approver_directive_for(status: &RemotePairStatus) -> Option<(String, String)> {
+    let (public_key, account_id) = status.approver()?;
+    let key = code::decode_public_key(public_key)?;
+    Some((code::encode_public_key(&key), account_id.to_string()))
+}
+
+/// 登记跟随账号请求。网络错误与 5xx 退避重试(同一设备重新登记会顶替旧的,重试是安全的);
+/// 后台明确表示不可用时立刻返回,不重试。
+async fn register_pair(
+    public_key: String,
+    machine_name: String,
+) -> Result<RemotePairCreated, PairApiError> {
+    let mut last = PairApiError::Adapter(recodex_integration::AdapterError::Unavailable);
+    for attempt in 0..PAIR_REGISTER_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(PAIR_REGISTER_BACKOFF * attempt).await;
+        }
+        let (key, name) = (public_key.clone(), machine_name.clone());
+        // 声明这台电脑会核对批准方(§2.4.1):老后台不认这个字段会 400,那正是降级信号。
+        let result =
+            tokio::task::spawn_blocking(move || backend().create(&key, &name, true)).await;
+        match result {
+            Ok(Ok(created)) => return Ok(created),
+            Ok(Err(error)) => {
+                if pair_unavailable(&error) {
+                    return Err(error);
+                }
+                last = error;
+            }
+            Err(error) => {
+                last = PairApiError::Adapter(recodex_integration::AdapterError::InvalidResponse(
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    Err(last)
+}
+
+/// 处理运行时给出的一次性公钥:本机算确认码 → 登记到后台(声明会核对批准方)
+/// → 与后台的码核对 → 画二维码(登记成功的加 `&bind=1`)。
+///
+/// 返回的 `Registered` 为 None = 这次只能扫码,调用方要往 stdin 递 `unbound`。
 async fn on_waiting(
     public_key: &str,
     qr: &str,
     machine_name: &str,
-) -> anyhow::Result<(WaitingInfo, Option<String>)> {
+    approver_check: bool,
+) -> anyhow::Result<(WaitingInfo, Option<Registered>)> {
     let key = code::decode_public_key(public_key)
         .ok_or_else(|| anyhow::anyhow!("远程组件给出的公钥格式不对"))?;
     let local_code = code::confirm_code(&key);
     let canonical = code::encode_public_key(&key);
-    let name = machine_name.to_string();
-    let registered = tokio::task::spawn_blocking(move || {
-        recodex_integration::remote_pair::remote_pair_create(
-            &canonical,
-            &name,
-            host::platform_name(),
-        )
-    })
-    .await?;
-    let (phone_prompt, phone_note, id) = match registered {
-        Ok(created) => {
-            if created.code != local_code {
-                log(
-                    "phone_remote.confirm_code_mismatch",
-                    json!({ "error": "server code differs from the locally computed one" }),
-                );
-                anyhow::bail!(
-                    "安全检查未通过:服务端返回的确认码与本机从公钥算出的不一致,已中止配对。\
-                     请不要在手机上允许任何待确认的电脑,并联系 ReCodex 客服。"
-                );
+
+    let registered = if approver_check {
+        match register_pair(canonical, machine_name.to_string()).await {
+            Ok(created) => {
+                if created.code != local_code {
+                    log(
+                        "phone_remote.confirm_code_mismatch",
+                        json!({ "error": "server code differs from the locally computed one" }),
+                    );
+                    cancel_pair_request(created.id);
+                    anyhow::bail!(
+                        "安全检查未通过:服务端返回的确认码与本机从公钥算出的不一致,已中止配对。\
+                         请不要在手机上允许任何待确认的电脑,并联系 ReCodex 客服。"
+                    );
+                }
+                if !created.approver_binding || !created.approver_check {
+                    // 后台没把它登记成「会核对批准方」:这条记录会被下发给手机、却没有批准方可核对。
+                    // 撤回它,只用扫码(理论上旧后台直接 400,走不到这里)。
+                    log(
+                        "phone_remote.pair_registered_without_binding",
+                        json!({
+                            "approver_binding": created.approver_binding,
+                            "approver_check": created.approver_check,
+                        }),
+                    );
+                    cancel_pair_request(created.id);
+                    Err(PromptUnavailable::BackendTooOld)
+                } else {
+                    Ok(Registered {
+                        id: created.id,
+                        approver_binding: created.approver_binding,
+                    })
+                }
             }
-            (true, None, Some(created.id))
+            Err(error) if pair_unavailable(&error) => Err(PromptUnavailable::Api(error)),
+            // 网络错误 / 5xx / 回包解不开:后台可能已经建好了记录,不能悄悄降级成不核对(审计 S2)。
+            Err(error) => {
+                log(
+                    "phone_remote.pair_register_failed",
+                    json!({ "error": error.to_string() }),
+                );
+                anyhow::bail!("{}", register_failed_message(&describe_pair_error(&error)));
+            }
         }
-        // 跟随账号这条路走不通(没登录、服务端未开放、待确认太多……)不致命:扫码照样能连。
-        Err(error) => (false, Some(describe_api_error(&error)), None),
+    } else {
+        // 老运行时不会核对批准方:不登记跟随账号请求,只给二维码。
+        log("phone_remote.runtime_without_approver_check", json!({}));
+        Err(PromptUnavailable::RuntimeTooOld)
     };
-    let qr_svg = crate::connect::weixin::render_qr_svg(qr).unwrap_or_default();
+
+    // 登记成功的二维码带 `&bind=1`:手机扫到它就知道这台电脑会核对批准方,必须经后台记录批准。
+    let qr_content = match &registered {
+        Ok(_) => format!("{qr}{PAIR_QR_BIND_SUFFIX}"),
+        Err(_) => qr.to_string(),
+    };
+    let qr_svg = crate::connect::weixin::render_qr_svg(&qr_content).unwrap_or_default();
+    let phone_note = registered.as_ref().err().map(PromptUnavailable::note);
     Ok((
         WaitingInfo {
             code: local_code,
             qr_svg,
             machine_name: machine_name.to_string(),
-            phone_prompt,
+            phone_prompt: registered.is_ok(),
             phone_note,
             approved: false,
         },
-        id,
+        registered.ok(),
     ))
 }
 
@@ -1059,6 +1402,136 @@ mod tests {
         assert!(describe_api_error(&E::Unauthorized).contains("登录"));
         assert!(describe_api_error(&E::RateLimited).contains("太多"));
         assert!(describe_api_error(&E::Unavailable).contains("尚未开放"));
+    }
+
+    /// §2.4.1 的四个机读码各有自己的说法,且都不能说成「手机没把凭据交给中继」。
+    #[test]
+    fn approver_error_codes_map_to_their_own_wording() {
+        let mismatch = approver_error_message(runtime::PAIR_ERR_APPROVER_MISMATCH, "").unwrap();
+        assert!(mismatch.contains("抢先确认") && mismatch.contains("没有保存任何凭据"));
+        let missing = approver_error_message(runtime::PAIR_ERR_APPROVER_MISSING, "x").unwrap();
+        assert!(missing.contains("没有对应的账号批准记录") && missing.contains("更新到最新版"));
+        let consumed =
+            approver_error_message(runtime::PAIR_ERR_RELAY_ANSWER_CONSUMED, "").unwrap();
+        assert!(consumed.contains("被别的程序取走"));
+        // check_failed 把运行时那句原话附在后面,便于排障
+        let failed =
+            approver_error_message(runtime::PAIR_ERR_APPROVER_CHECK_FAILED, "  profile 502  ")
+                .unwrap();
+        assert!(failed.starts_with(MSG_APPROVER_CHECK_FAILED));
+        assert!(failed.contains("profile 502"));
+        assert_eq!(
+            approver_error_message(runtime::PAIR_ERR_APPROVER_CHECK_FAILED, ""),
+            Some(MSG_APPROVER_CHECK_FAILED.to_string())
+        );
+        // 四个以外的码按普通失败处理
+        assert_eq!(approver_error_message("", "boom"), None);
+        assert_eq!(approver_error_message("relay_unreachable", "boom"), None);
+        for message in [
+            MSG_APPROVER_MISMATCH,
+            MSG_APPROVER_MISSING,
+            MSG_APPROVER_CHECK_FAILED,
+            MSG_RELAY_ANSWER_CONSUMED,
+        ] {
+            assert!(!message.contains("没把凭据交给中继"), "{message}");
+        }
+    }
+
+    /// 审计 S4:后台回了 approver_binding 却没给批准方 → 分不清谁旧,两个都提。
+    #[test]
+    fn absent_approver_tells_apart_old_server_from_old_app() {
+        assert_eq!(approver_absent_message(false), MSG_APPROVER_ABSENT_SERVER);
+        assert!(!MSG_APPROVER_ABSENT_SERVER.contains("App 版本较旧"));
+        assert_eq!(approver_absent_message(true), MSG_APPROVER_ABSENT_BOTH);
+        assert!(MSG_APPROVER_ABSENT_BOTH.contains("服务端或手机 App 版本较旧"));
+    }
+
+    /// 审计 S2:只有「后台明确没建记录」才降级成只扫码;网络错误与 5xx 必须重试/中止。
+    #[test]
+    fn only_explicit_refusals_downgrade_to_qr_only() {
+        use recodex_integration::AdapterError as E;
+        for status in [400u16, 401, 403, 404, 429, 501] {
+            assert!(
+                pair_unavailable(&PairApiError::Http(status)),
+                "HTTP {status} 应降级"
+            );
+        }
+        for status in [409u16, 500, 502, 503, 504] {
+            assert!(
+                !pair_unavailable(&PairApiError::Http(status)),
+                "HTTP {status} 不能降级"
+            );
+        }
+        // 本机没有登录态:请求根本没发出去
+        assert!(pair_unavailable(&PairApiError::Adapter(E::Unauthorized)));
+        assert!(pair_unavailable(&PairApiError::Adapter(
+            E::InvalidConfiguration("no state".into())
+        )));
+        // 连不上 / 回包解不开:后台可能已经建好了记录
+        assert!(!pair_unavailable(&PairApiError::Adapter(E::Unavailable)));
+        assert!(!pair_unavailable(&PairApiError::Adapter(
+            E::InvalidResponse("bad json".into())
+        )));
+    }
+
+    #[test]
+    fn prompt_unavailable_notes_say_which_side_is_old() {
+        assert!(
+            PromptUnavailable::RuntimeTooOld
+                .note()
+                .contains("远程组件版本较旧")
+        );
+        assert!(
+            PromptUnavailable::BackendTooOld
+                .note()
+                .contains("服务端暂不支持")
+        );
+        assert!(
+            PromptUnavailable::Api(PairApiError::Http(401))
+                .note()
+                .contains("登录")
+        );
+        assert!(
+            PromptUnavailable::Api(PairApiError::Http(503))
+                .note()
+                .contains("503")
+        );
+        assert!(register_failed_message("网络连接失败").contains("为安全起见已中止"));
+    }
+
+    /// 递给运行时的批准方必须是**规范写法**的公钥;解不开就当没有(按缺失中止)。
+    #[test]
+    fn approver_directive_needs_both_fields_and_a_real_key() {
+        let good = RemotePairStatus {
+            status: "approved".into(),
+            approver_public_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".into(),
+            approver_account_id: "acc_1-x".into(),
+        };
+        assert_eq!(
+            approver_directive_for(&good),
+            Some((
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".to_string(),
+                "acc_1-x".to_string()
+            ))
+        );
+        // 少一个字段
+        for status in [
+            RemotePairStatus {
+                approver_account_id: String::new(),
+                ..good.clone()
+            },
+            RemotePairStatus {
+                approver_public_key: String::new(),
+                ..good.clone()
+            },
+            // 33 字节:形状像但不是内容公钥
+            RemotePairStatus {
+                approver_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                ..good.clone()
+            },
+        ] {
+            assert_eq!(approver_directive_for(&status), None, "{status:?}");
+        }
     }
 
     #[tokio::test]
