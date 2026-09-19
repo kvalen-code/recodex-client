@@ -367,7 +367,16 @@
     #recodex-panel .rcx-opt.off{color:#7c8598;cursor:default}
     #recodex-panel .rcx-opt.off:hover{background:transparent}
     #recodex-panel .rcx-toggle{display:flex;justify-content:space-between;align-items:center;padding:5px 0}
-    #recodex-panel .rcx-toggle input{width:34px;height:18px;cursor:pointer}
+    #recodex-panel .rcx-toggle{gap:12px}
+    #recodex-panel .rcx-toggle input{-webkit-appearance:none;appearance:none;flex:0 0 auto;position:relative;
+      width:34px;height:18px;margin:0;border:0;border-radius:999px;background:#4b5260;cursor:pointer;
+      transition:background .12s ease}
+    #recodex-panel .rcx-toggle input::before{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;
+      border-radius:999px;background:#fff;transition:transform .12s ease}
+    #recodex-panel .rcx-toggle input:checked{background:#10a37f}
+    #recodex-panel .rcx-toggle input:checked::before{transform:translateX(16px)}
+    #recodex-panel .rcx-toggle input:disabled{opacity:.55;cursor:not-allowed}
+    #recodex-panel .rcx-toggle input:focus-visible{outline:2px solid #10a37f;outline-offset:2px}
     #recodex-panel .rcx-qr{background:#fff;border-radius:8px;padding:8px;margin-top:8px}
     #recodex-panel .rcx-qr svg{width:100%;height:auto;display:block}
     #recodex-panel .rcx-field{margin-top:8px}
