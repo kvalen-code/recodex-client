@@ -3167,6 +3167,90 @@ pub fn bridge_watchdog_elapsed_secs(consecutive_failures: u32) -> u64 {
         .sum()
 }
 
+/// 第二个 launcher 发现已有实例时,主实例实际在用的端口。
+///
+/// 主实例的 helper / Codex 调试端口都可能被换过(默认端口被占时退到随机端口),
+/// 真实值只记在它写的 latest-status.json 里。第二个 launcher 手上的
+/// `options.*_port` 只是**请求值**,拿它去激活/探测会得出错误结论:
+///   - 调试端口:拿 9229 去 `launch_codex`,而 Codex 实际开在 24690 —— 那段
+///     「Codex 在跑但没 CDP → 先退掉再拉起」的逻辑会把用户正在用的 Codex 杀掉;
+///   - helper 端口:探 57321 不通就误报「增强功能未启动」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingInstancePorts {
+    pub debug_port: u16,
+    /// 按优先级排好的 helper 端口候选(去重),任意一个能连上就算主实例 helper 活着。
+    pub helper_ports: Vec<u16>,
+}
+
+pub fn existing_instance_ports(
+    status: Option<&LaunchStatus>,
+    requested_debug_port: u16,
+    requested_helper_port: u16,
+    cdp_available: impl Fn(u16) -> bool,
+) -> ExistingInstancePorts {
+    // 只有 CDP 真在那个端口上时才信状态文件里的调试端口:状态文件可能是上一轮、
+    // 甚至是某次失败写下的。不通就退回请求值(与旧行为一致)。
+    let debug_port = status
+        .and_then(|status| status.debug_port)
+        .filter(|port| *port != requested_debug_port && cdp_available(*port))
+        .unwrap_or(requested_debug_port);
+    let mut helper_ports = Vec::new();
+    for port in status
+        .and_then(|status| status.helper_port)
+        .into_iter()
+        .chain(std::iter::once(requested_helper_port))
+    {
+        if port != 0 && !helper_ports.contains(&port) {
+            helper_ports.push(port);
+        }
+    }
+    ExistingInstancePorts {
+        debug_port,
+        helper_ports,
+    }
+}
+
+/// `existing_instance_ports` 的实用入口:读主实例的 latest-status.json、用真实 CDP 探测。
+pub fn resolve_existing_instance_ports(
+    status_store: &StatusStore,
+    requested_debug_port: u16,
+    requested_helper_port: u16,
+) -> ExistingInstancePorts {
+    let status = status_store.load_latest().ok().flatten();
+    existing_instance_ports(
+        status.as_ref(),
+        requested_debug_port,
+        requested_helper_port,
+        crate::cdp::endpoint_available,
+    )
+}
+
+/// 轮询等主实例的 helper 出现,最多 `timeout`。返回能连上的那个端口。
+///
+/// 要等而不是探一次:用户连点两下图标时,第二个 launcher 走到这里,主实例可能
+/// 还在同步托管配置、helper 还没绑上 —— 探一次就会误报「增强功能未启动」。
+pub async fn wait_for_existing_helper(
+    ports: &[u16],
+    timeout: std::time::Duration,
+) -> Option<u16> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let candidates = ports.to_vec();
+        let found = tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .find(|port| crate::ports::can_connect_loopback_port(*port))
+        })
+        .await
+        .ok()
+        .flatten();
+        if found.is_some() || std::time::Instant::now() >= deadline {
+            return found;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 /// helper 换端口之后还能不能继续跑。
 ///
 /// helper 端口有两种截然不同的语义,不能一视同仁:
@@ -3987,6 +4071,58 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    fn status_with_ports(debug_port: Option<u16>, helper_port: Option<u16>) -> LaunchStatus {
+        LaunchStatus {
+            status: "running".to_string(),
+            message: "ReCodex launcher ready".to_string(),
+            started_at_ms: 1,
+            debug_port,
+            helper_port,
+            codex_app: None,
+            aumid: None,
+        }
+    }
+
+    #[test]
+    fn existing_instance_ports_prefer_the_primary_status_when_cdp_is_there() {
+        let status = status_with_ports(Some(24690), Some(13951));
+        let ports = existing_instance_ports(Some(&status), 9229, 57321, |port| port == 24690);
+        assert_eq!(ports.debug_port, 24690);
+        assert_eq!(ports.helper_ports, vec![13951, 57321]);
+    }
+
+    #[test]
+    fn existing_instance_ports_fall_back_to_requested_values() {
+        // 状态文件里的调试端口上没有 CDP(上一轮留下的)→ 退回请求值。
+        let stale = status_with_ports(Some(24690), Some(57321));
+        let ports = existing_instance_ports(Some(&stale), 9229, 57321, |_| false);
+        assert_eq!(ports.debug_port, 9229);
+        assert_eq!(ports.helper_ports, vec![57321]);
+
+        let ports = existing_instance_ports(None, 9229, 57321, |_| true);
+        assert_eq!(ports.debug_port, 9229);
+        assert_eq!(ports.helper_ports, vec![57321]);
+    }
+
+    #[tokio::test]
+    async fn wait_for_existing_helper_finds_a_live_port_and_gives_up_on_dead_ones() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let live = listener.local_addr().unwrap().port();
+        let dead = {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        assert_eq!(
+            wait_for_existing_helper(&[dead, live], std::time::Duration::from_millis(10)).await,
+            Some(live)
+        );
+        drop(listener);
+        assert_eq!(
+            wait_for_existing_helper(&[dead], std::time::Duration::from_millis(10)).await,
+            None
+        );
+    }
 
     /// 协议代理端口写死 57321,任意网页都能拿它烧用户的额度。这里钉住三件事:
     /// 拒恶意页面、放行 Codex 本体(不发 Origin)、不误伤只读路径。
