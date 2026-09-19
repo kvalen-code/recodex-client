@@ -255,8 +255,9 @@ pub struct BackendSettings {
     pub enhancements_enabled: bool,
     #[serde(rename = "codexAppPluginMarketplaceUnlock", default = "default_true")]
     pub codex_app_plugin_marketplace_unlock: bool,
-    #[serde(rename = "codexAppModelWhitelistUnlock", default = "default_true")]
-    pub codex_app_model_whitelist_unlock: bool,
+    // recodex-overlay: 模型白名单解锁(codexAppModelWhitelistUnlock)与服务模式控件
+    // (codexAppServiceTierControls)1.3.8 起永久下线。老用户设置文件里残留的这两个键
+    // 反序列化时直接忽略(本结构不拒绝未知字段),写回时自然消失。
     #[serde(rename = "codexAppSessionDelete", default = "default_true")]
     pub codex_app_session_delete: bool,
     #[serde(rename = "codexAppMarkdownExport", default = "default_true")]
@@ -293,8 +294,6 @@ pub struct BackendSettings {
     // 处理用户凭据的应用多传一个 `--inspect`,而换不回任何功能。
     #[serde(rename = "codexAppNativeMenuLocalization", default)]
     pub codex_app_native_menu_localization: bool,
-    #[serde(rename = "codexAppServiceTierControls", default)]
-    pub codex_app_service_tier_controls: bool,
     #[serde(rename = "codexAppPetRealMouseLook", default)]
     pub codex_app_pet_real_mouse_look: bool,
     // recodex-overlay: Stepwise 已下线,10 个配置项一并移除
@@ -381,7 +380,6 @@ impl Default for BackendSettings {
             relay_profiles_enabled: true,
             enhancements_enabled: true,
             codex_app_plugin_marketplace_unlock: true,
-            codex_app_model_whitelist_unlock: true,
             codex_app_session_delete: true,
             codex_app_markdown_export: true,
             codex_app_paste_fix: false,
@@ -398,7 +396,6 @@ impl Default for BackendSettings {
             codex_app_native_menu_placement: true,
             // fuse 关死了这条路,默认不开(理由见字段上的注释)
             codex_app_native_menu_localization: false,
-            codex_app_service_tier_controls: false,
             codex_app_pet_real_mouse_look: false,
             codex_app_image_overlay_enabled: false,
             codex_app_image_overlay_path: String::new(),
@@ -761,7 +758,6 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert("enhancementsEnabled".to_string(), Value::Bool(value));
     }
     merge_bool_setting(target, source, "codexAppPluginMarketplaceUnlock");
-    merge_bool_setting(target, source, "codexAppModelWhitelistUnlock");
     merge_bool_setting(target, source, "codexAppSessionDelete");
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppPasteFix");
@@ -782,7 +778,6 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppUpstreamWorktreeCreate");
     merge_bool_setting(target, source, "codexAppNativeMenuPlacement");
     merge_bool_setting(target, source, "codexAppNativeMenuLocalization");
-    merge_bool_setting(target, source, "codexAppServiceTierControls");
     merge_bool_setting(target, source, "codexAppPetRealMouseLook");
 
     merge_bool_setting(target, source, "codexAppImageOverlayEnabled");

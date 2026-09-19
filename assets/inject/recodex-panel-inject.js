@@ -101,11 +101,9 @@
       "临时改用官方账号;登录状态会保留,可随时切回。": "暫時改用官方帳號;登入狀態會保留,可隨時切回。",
       "连接中断": "連線中斷", "无法连接": "無法連線", "额度已用尽": "額度已用盡",
       "正常": "正常", "官方模式": "官方模式",
-      "居中宽度(px)": "置中寬度(px)", "继承": "繼承", "全局 Standard": "全域 Standard",
-      "全局 Fast": "全域 Fast", "自定义": "自訂", "继承 config.toml": "繼承 config.toml",
-      "服务模式引擎未就绪": "服務模式引擎未就緒",
+      "居中宽度(px)": "置中寬度(px)",
       "对话居中宽度": "對話置中寬度", "切换对话保留位置": "切換對話保留位置",
-      "强制中文界面": "強制中文介面", "服务模式控件": "服務模式控件",
+      "强制中文界面": "強制中文介面",
       "系统集成": "系統整合", "原生菜单栏位置": "原生選單列位置",
       "原生菜单本地化": "原生選單在地化", "原生菜单本地化(仅 Codex 151 及更早)": "原生選單在地化(僅 Codex 151 及更早)", "Zed Remote 打开": "Zed Remote 開啟",
       "上游 worktree 创建": "上游 worktree 建立",
@@ -154,8 +152,8 @@
       "✅ 登录成功": "✅ 登入成功",
       "我已重启,刷新状态": "我已重啟,重新整理狀態",
       "会话删除": "工作階段刪除", "Markdown 导出": "Markdown 匯出", "会话 ID 标识": "工作階段 ID 標識",
-      "粘贴修复(需重启)": "貼上修復(需重啟)", "Fast 按钮": "Fast 按鈕",
-      "模型白名单解锁": "模型白名單解鎖", "插件市场解锁": "外掛市集解鎖",
+      "粘贴修复(需重启)": "貼上修復(需重啟)", "快速启动(需重启)": "快速啟動(需重啟)",
+      "插件市场解锁": "外掛市集解鎖",
       "桌宠跟随真实鼠标": "桌寵跟隨真實滑鼠",
       "状态": "狀態", "账号": "帳號", "已处理": "已處理", "条": "條",
       "运行中": "運行中", "启动中": "啟動中", "重连中": "重連中",
@@ -220,11 +218,9 @@
       "临时改用官方账号;登录状态会保留,可随时切回。": "Временно используйте официальный аккаунт; вход сохранится, вернуться можно в любой момент.",
       "连接中断": "Нет связи", "无法连接": "Не удалось подключиться", "额度已用尽": "Квота исчерпана",
       "正常": "Всё в порядке", "官方模式": "Официальный режим",
-      "居中宽度(px)": "Ширина по центру (px)", "继承": "Наследовать", "全局 Standard": "Везде Standard",
-      "全局 Fast": "Везде Fast", "自定义": "Свой", "继承 config.toml": "Из config.toml",
-      "服务模式引擎未就绪": "Движок режима сервиса не готов",
+      "居中宽度(px)": "Ширина по центру (px)",
       "对话居中宽度": "Ширина диалога по центру", "切换对话保留位置": "Сохранять позицию прокрутки",
-      "强制中文界面": "Принудительный китайский интерфейс", "服务模式控件": "Переключатель режима сервиса",
+      "强制中文界面": "Принудительный китайский интерфейс",
       "系统集成": "Интеграция с системой", "原生菜单栏位置": "Положение системного меню",
       "原生菜单本地化": "Локализация системного меню", "原生菜单本地化(仅 Codex 151 及更早)": "Локализация системного меню (только Codex 151 и старше)", "Zed Remote 打开": "Открывать в Zed Remote",
       "上游 worktree 创建": "Создание upstream worktree",
@@ -268,8 +264,8 @@
       "✅ 登录成功": "✅ Вход выполнен",
       "我已重启,刷新状态": "Я перезапустил — обновить",
       "会话删除": "Удаление диалогов", "Markdown 导出": "Экспорт в Markdown", "会话 ID 标识": "Показывать ID диалога",
-      "粘贴修复(需重启)": "Исправление вставки (нужен перезапуск)", "Fast 按钮": "Кнопка Fast",
-      "模型白名单解锁": "Разблокировать модели", "插件市场解锁": "Разблокировать плагины",
+      "粘贴修复(需重启)": "Исправление вставки (нужен перезапуск)", "快速启动(需重启)": "Быстрый запуск (нужен перезапуск)",
+      "插件市场解锁": "Разблокировать плагины",
       "桌宠跟随真实鼠标": "Питомец следит за курсором",
       "状态": "Статус", "账号": "Аккаунт", "已处理": "Обработано", "条": "шт.",
       "运行中": "Работает", "启动中": "Запуск", "重连中": "Переподключение",
@@ -922,8 +918,9 @@
     ["codexAppConversationView", "对话居中宽度"],
     ["codexAppThreadIdBadge", "会话 ID 标识"],
     ["codexAppPasteFix", "粘贴修复(需重启)"],
-    ["codexAppFastStartup", "Fast 按钮"],
-    ["codexAppModelWhitelistUnlock", "模型白名单解锁"],
+    // 这个键是「快速启动」(Statsig 初始化快速失败,无 VPN 时缩短启动时间),旧标签「Fast 按钮」是误标,
+    // 和已下线的 Fast 服务模式无关。
+    ["codexAppFastStartup", "快速启动(需重启)"],
     ["codexAppPluginMarketplaceUnlock", "插件市场解锁"],
     ["codexAppPetRealMouseLook", "桌宠跟随真实鼠标"],
     ["codexAppThreadScrollRestore", "切换对话保留位置"],
@@ -974,13 +971,6 @@
     return s && typeof s === "object" && !s.error ? s : {};
   }
 
-  const TIER_MODES = [
-    ["inherit", "继承"],
-    ["global-standard", "全局 Standard"],
-    ["global-fast", "全局 Fast"],
-    ["custom", "自定义"],
-  ];
-
   // ── 桥不可用时的统一降级 ────────────────────────────────────
   // 桥断了(launcher 没起来 / CDP binding 掉了)时,各页签原先各自"就地编造":
   //   增强页照常画出 11 个开关 —— 点了没反应,也不说为什么;
@@ -1007,15 +997,15 @@
   async function renderEnhancements() {
     const c = panel.querySelector("#recodex-enh");
     if (!c) return;
-    const probe = await bridge("/backend/settings", {});
+    // 探桥直接读一次设置:/settings/get 是真实路径,读不到(超时/桥断)就走统一降级。
+    // 原来探的 /backend/settings 并不存在,每次打开增强页都在日志里留一条 bridge.unknown_path。
+    const probe = await bridge("/settings/get", {});
     if (bridgeUnavailable(probe)) { renderBridgeDown(c, renderEnhancements, probe); return; }
     const settings = await readSettings();
     c.innerHTML = `<div id="rcx-enh-toggles"></div>` +
-      `<div id="rcx-enh-width" style="margin-top:10px"></div>` +
-      `<div id="rcx-enh-tier" style="margin-top:14px;border-top:1px solid #23272f;padding-top:10px"></div>`;
+      `<div id="rcx-enh-width" style="margin-top:10px"></div>`;
     renderToggleList(c.querySelector("#rcx-enh-toggles"), ENH, settings);
     renderWidthField(c.querySelector("#rcx-enh-width"), settings);
-    renderServiceTier(c.querySelector("#rcx-enh-tier"), settings);
   }
 
   // 对话居中宽度:数值没有后端键(存在 renderer 的 localStorage),走它暴露的 setter。
@@ -1045,43 +1035,8 @@
     };
   }
 
-  // 服务模式:四选一 + 当前 config.toml 值回显。逻辑全在 renderer 侧(含 Fast 可用性校验),
-  // 面板只负责画 UI 和转发,不复刻判断。
-  function renderServiceTier(box, settings) {
-    if (!box) return;
-    if (!settings.codexAppServiceTierControls) {
-      box.innerHTML = `<label class="rcx-toggle"><span>${esc(t("服务模式控件"))}</span>` +
-        `<input type="checkbox" data-k="codexAppServiceTierControls"></label>`;
-      bindToggles(box);
-      return;
-    }
-    const api = window.__codexPlusServiceTier;
-    const st = api && typeof api.get === "function" ? api.get() : null;
-    let html = `<label class="rcx-toggle"><span>${esc(t("服务模式控件"))}</span>` +
-      `<input type="checkbox" data-k="codexAppServiceTierControls" checked></label>`;
-    if (st) {
-      html += `<div class="rcx-muted" style="margin:6px 0 4px;font-size:12px">` +
-        `${t("继承 config.toml")}: ${esc(st.configServiceTier || "—")}</div>`;
-      html += `<div style="display:flex;flex-wrap:wrap;gap:4px">` +
-        TIER_MODES.map(([m, label]) =>
-          `<button class="rcx-act sec" data-tier="${m}" style="flex:1 1 46%;margin-top:0;padding:5px 4px;font-size:12px${
-            st.controlMode === m ? ";background:#10a37f;color:#fff" : ""}">${esc(t(label))}</button>`
-        ).join("") + `</div>`;
-    } else {
-      html += `<div class="rcx-muted" style="font-size:12px;margin-top:6px">${t("服务模式引擎未就绪")}</div>`;
-    }
-    box.innerHTML = html;
-    bindToggles(box);
-    box.querySelectorAll("button[data-tier]").forEach((b) => {
-      b.onclick = () => {
-        if (api && typeof api.setMode === "function") api.setMode(b.dataset.tier);
-        setTimeout(renderEnhancements, 600);
-      };
-    });
-  }
-
   // 开关写入的**唯一**实现。这里一度有两份:`renderToggleList` 里一份、`bindToggles`
-  // 里一份,修了前者漏了后者 —— 服务模式那个开关走的正是后者,还留着老毛病。
+  // 里一份,修了前者漏了后者 —— 当时的服务模式开关(已下线)走的正是后者,还留着老毛病。
   // 合成一个,新增调用点自然带上校验。
   function bindToggles(box) {
     box.querySelectorAll("input[data-k]").forEach((inp) => {
@@ -1105,8 +1060,8 @@
           inp.disabled = false;
         }
         toggleNote(box, ok ? "" : t("设置没有生效,请重试"));
-        // 这两个开关会改变页面结构(宽度框显隐 / 服务模式面板),生效了才重绘
-        if (ok && (k === "codexAppConversationView" || k === "codexAppServiceTierControls")) {
+        // 这个开关会改变页面结构(宽度框显隐),生效了才重绘
+        if (ok && k === "codexAppConversationView") {
           setTimeout(renderEnhancements, 500);
         }
       };
