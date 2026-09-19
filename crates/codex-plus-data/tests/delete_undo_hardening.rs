@@ -137,7 +137,8 @@ fn partially_deleted_thread_keeps_its_full_undo_token() {
     );
     drop(lock);
 
-    assert_eq!(result.status, DeleteStatus::Failed, "{}", result.message);
+    // 状态是 Partial 而不是 Failed:索引/侧边栏已经清掉,界面必须给撤销按钮。
+    assert_eq!(result.status, DeleteStatus::Partial, "{}", result.message);
     let token = result.undo_token.clone().expect("必须保留原撤销 token");
     let tables = backup_tables(&h.backups, &token);
     assert!(tables.get("threads").is_some(), "token 必须是带整行的那份: {tables}");
@@ -296,4 +297,133 @@ fn thread_description_is_removed_with_the_thread_and_restored_by_undo() {
     assert_eq!(descriptions["t1"], "描述 t1");
     assert_eq!(descriptions["keep"], "描述 keep");
     assert_eq!(state["electron-persisted-atom-state"]["sidebar-width"], 296);
+}
+
+/// 应修 3:纯 API 会话(备份里没有数据库行)撤销时,索引写不进去(这里把
+/// session_index.jsonl 换成目录,模拟被占/权限问题)——撤销必须报失败,
+/// 而不是静默吞掉再报 Undone。
+#[test]
+fn index_only_undo_fails_loudly_when_the_index_cannot_be_written() {
+    let h = home_with_thread();
+    let mut index = fs::read_to_string(h.home.join("session_index.jsonl")).unwrap();
+    index.push_str("{\"id\":\"api1\",\"thread_name\":\"API\",\"updated_at\":\"2026-09-20T00:00:00Z\"}
+");
+    fs::write(h.home.join("session_index.jsonl"), index).unwrap();
+    let deleted = delete_local_from_paths(
+        vec![h.db.clone()],
+        BackupStore::new(&h.backups),
+        &session("api1"),
+        Some(h.home.as_path()),
+    );
+    assert_eq!(deleted.status, DeleteStatus::LocalDeleted, "{}", deleted.message);
+    let token = deleted.undo_token.unwrap();
+    // 索引文件读不了 → 恢复这一步必然失败。
+    fs::remove_file(h.home.join("session_index.jsonl")).unwrap();
+    fs::create_dir(h.home.join("session_index.jsonl")).unwrap();
+
+    let undone = SQLiteStorageAdapter::new(&h.db, BackupStore::new(&h.backups))
+        .with_codex_home(&h.home)
+        .undo(&token);
+
+    assert_eq!(undone.status, DeleteStatus::Failed, "{}", undone.message);
+    assert_eq!(undone.undo_token.as_deref(), Some(token.as_str()), "还能再撤一次");
+    // 没恢复成功就不能记 undone 标记,否则启动清扫会跳过它。
+    let recorded = fs::read_to_string(h.backups.join(".leftover-sweep.json")).unwrap_or_default();
+    assert!(!recorded.contains("undone"), "{recorded}");
+}
+
+/// 应修 3 的兜底检查:撤销做完之后这条会话必须真的回到索引/侧边栏里。
+/// 这里用一份**对不上号**的备份(索引行属于别的会话)模拟「写了但没恢复到它」。
+#[test]
+fn index_only_undo_verifies_the_thread_is_actually_back() {
+    let h = home_with_thread();
+    let token = BackupStore::new(&h.backups)
+        .write_backup(
+            "ghost",
+            &h.db,
+            json!({
+                "__session_index": ["{\"id\":\"someone-else\",\"thread_name\":\"X\",\"updated_at\":\"2026-09-20T00:00:00Z\"}"],
+                "__sidebar": { "thread_id": "ghost", "global_state": {}, "catalog": [] }
+            }),
+        )
+        .unwrap();
+
+    let undone = SQLiteStorageAdapter::new(&h.db, BackupStore::new(&h.backups))
+        .with_codex_home(&h.home)
+        .undo(&token);
+
+    assert_eq!(undone.status, DeleteStatus::Failed, "{}", undone.message);
+    assert!(undone.message.contains("索引/侧边栏"), "{}", undone.message);
+}
+
+/// 反面:索引没被动过时,纯 API 会话的撤销照常成功,重试也成功(幂等)。
+#[test]
+fn index_only_undo_succeeds_and_can_be_retried() {
+    let h = home_with_thread();
+    let mut index = fs::read_to_string(h.home.join("session_index.jsonl")).unwrap();
+    index.push_str("{\"id\":\"api1\",\"thread_name\":\"API\",\"updated_at\":\"2026-09-20T00:00:00Z\"}\n");
+    fs::write(h.home.join("session_index.jsonl"), index).unwrap();
+    let token = delete_local_from_paths(
+        vec![h.db.clone()],
+        BackupStore::new(&h.backups),
+        &session("api1"),
+        Some(h.home.as_path()),
+    )
+    .undo_token
+    .unwrap();
+    let adapter = SQLiteStorageAdapter::new(&h.db, BackupStore::new(&h.backups))
+        .with_codex_home(&h.home);
+
+    let first = adapter.undo(&token);
+    assert_eq!(first.status, DeleteStatus::Undone, "{}", first.message);
+    assert!(index_has(&h.home, "api1"));
+    let second = adapter.undo(&token);
+    assert_eq!(second.status, DeleteStatus::Undone, "{}", second.message);
+}
+
+/// E:表结构认不出来(Codex 改了列)时报失败,不能当成「查无此会话」去清索引。
+#[test]
+fn unsupported_schema_does_not_fall_back_to_index_cleanup() {
+    let h = home_with_thread();
+    // 把 threads 表换成一个缺列的版本:schema_kind 认不出来。
+    let conn = Connection::open(&h.db).unwrap();
+    conn.execute_batch("DROP TABLE threads; CREATE TABLE threads (id TEXT PRIMARY KEY, blob TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO threads VALUES ('t1', 'x')", []).unwrap();
+    drop(conn);
+
+    let result = delete_local_from_paths(
+        vec![h.db.clone()],
+        BackupStore::new(&h.backups),
+        &session("local:t1"),
+        Some(h.home.as_path()),
+    );
+
+    assert_eq!(result.status, DeleteStatus::Failed, "{}", result.message);
+    assert!(result.undo_token.is_none());
+    assert!(index_has(&h.home, "t1"), "索引不能被兜底清掉");
+}
+
+/// 但完全不相干的库(候选里按文件名扫进来的)仍算「这里没有」,不挡住纯 API 兜底。
+#[test]
+fn unrelated_database_still_allows_the_index_fallback() {
+    let h = home_with_thread();
+    let unrelated = h.home.join("sqlite").join("unrelated.sqlite");
+    Connection::open(&unrelated)
+        .unwrap()
+        .execute_batch("CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT);")
+        .unwrap();
+    let mut index = fs::read_to_string(h.home.join("session_index.jsonl")).unwrap();
+    index.push_str("{\"id\":\"api2\",\"thread_name\":\"API\",\"updated_at\":\"2026-09-20T00:00:00Z\"}\n");
+    fs::write(h.home.join("session_index.jsonl"), index).unwrap();
+
+    let result = delete_local_from_paths(
+        vec![unrelated, h.db.clone()],
+        BackupStore::new(&h.backups),
+        &session("api2"),
+        Some(h.home.as_path()),
+    );
+
+    assert_eq!(result.status, DeleteStatus::LocalDeleted, "{}", result.message);
+    assert!(!index_has(&h.home, "api2"));
 }

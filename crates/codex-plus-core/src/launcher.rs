@@ -685,13 +685,49 @@ pub async fn activate_packaged_app_with_retry(
     arguments: &str,
     delays_ms: &[u64],
 ) -> Result<(u32, String), PackagedActivationFailure> {
+    activate_packaged_app_with_retry_using(
+        app_dir,
+        app_user_model_id,
+        arguments,
+        delays_ms,
+        |aumid, arguments| async move { activate_packaged_app(&aumid, &arguments).await },
+        |app_dir| {
+            let resolved = crate::app_paths::reresolve_packaged_app_dir(app_dir)?;
+            let aumid = crate::app_paths::packaged_app_user_model_id(&resolved)?;
+            Some((resolved, aumid))
+        },
+        |delay_ms| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        },
+    )
+    .await
+}
+
+/// 可注入版本(激活 / 重新解析包 / 等待都由调用方给),让退避重试本身能被测试:
+/// 真实激活要 COM + 已注册的 MSIX 包,测试里根本走不到。
+pub async fn activate_packaged_app_with_retry_using<Activate, ActivateFut, Reresolve, Sleep, SleepFut>(
+    app_dir: &Path,
+    app_user_model_id: &str,
+    arguments: &str,
+    delays_ms: &[u64],
+    activate: Activate,
+    reresolve: Reresolve,
+    sleep: Sleep,
+) -> Result<(u32, String), PackagedActivationFailure>
+where
+    Activate: Fn(String, String) -> ActivateFut,
+    ActivateFut: std::future::Future<Output = anyhow::Result<u32>>,
+    Reresolve: Fn(&Path) -> Option<(PathBuf, String)>,
+    Sleep: Fn(u64) -> SleepFut,
+    SleepFut: std::future::Future<Output = ()>,
+{
     let mut current_dir = app_dir.to_path_buf();
     let mut current_aumid = app_user_model_id.to_string();
     let mut attempts = 0usize;
     let mut history = Vec::new();
     loop {
         attempts += 1;
-        let error = match activate_packaged_app(&current_aumid, arguments).await {
+        let error = match activate(current_aumid.clone(), arguments.to_string()).await {
             Ok(process_id) => {
                 if attempts > 1 {
                     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -751,12 +787,11 @@ pub async fn activate_packaged_app_with_retry(
                 "delay_ms": delay,
             }),
         );
-        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-        if let Some(resolved) = crate::app_paths::reresolve_packaged_app_dir(&current_dir) {
-            if let Some(aumid) = crate::app_paths::packaged_app_user_model_id(&resolved) {
-                current_aumid = aumid;
-                current_dir = resolved;
-            }
+        sleep(delay).await;
+        // 每次重试前重新解析:商店更新完成后注册的是新版本目录,AUMID 的应用段也变了。
+        if let Some((resolved, aumid)) = reresolve(&current_dir) {
+            current_aumid = aumid;
+            current_dir = resolved;
         }
     }
 }

@@ -245,3 +245,138 @@ fn registered_package_lookup_is_not_cached_for_the_process_lifetime() {
         .unwrap();
     assert!(registered < scanned);
 }
+
+// ---- 退避重试的行为测试(第二轮审计 F):激活/重新解析/等待都注入,不碰真实 COM ----
+
+use std::cell::RefCell;
+
+/// 记录每次激活用的 AUMID 与每次等待的时长;按预设结果依次返回。
+#[derive(Default)]
+struct ActivationSpy {
+    attempts: RefCell<Vec<String>>,
+    delays: RefCell<Vec<u64>>,
+    reresolves: RefCell<usize>,
+}
+
+fn hresult_error(code: u32) -> anyhow::Error {
+    anyhow::anyhow!("ActivateApplication failed 0x{code:08X}")
+}
+
+async fn run_retry(
+    spy: &ActivationSpy,
+    results: Vec<anyhow::Result<u32>>,
+    delays_ms: &[u64],
+    reresolve_to: Option<(&str, &str)>,
+) -> Result<(u32, String), codex_plus_core::launcher::PackagedActivationFailure> {
+    let results = RefCell::new(results.into_iter().collect::<std::collections::VecDeque<_>>());
+    codex_plus_core::launcher::activate_packaged_app_with_retry_using(
+        Path::new(r"C:\pkg\OpenAI.Codex_26.915.3509.0_x64__abc\app"),
+        "OpenAI.Codex_abc!App",
+        "--args",
+        delays_ms,
+        |aumid, _arguments| {
+            spy.attempts.borrow_mut().push(aumid);
+            let next = results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| Err(hresult_error(0x8007_3D28)));
+            async move { next }
+        },
+        |_app_dir| {
+            *spy.reresolves.borrow_mut() += 1;
+            reresolve_to.map(|(dir, aumid)| (PathBuf::from(dir), aumid.to_string()))
+        },
+        |delay_ms| {
+            spy.delays.borrow_mut().push(delay_ms);
+            async move {}
+        },
+    )
+    .await
+}
+
+/// 瞬时错误(商店正在注册包)按整条退避序列重试,中途成功就返回;每次重试前重新解析包,
+/// 用的是新解析出来的 AUMID。
+#[tokio::test]
+async fn transient_activation_errors_retry_with_the_reresolved_aumid() {
+    let spy = ActivationSpy::default();
+    let outcome = run_retry(
+        &spy,
+        vec![
+            Err(hresult_error(0x8007_3D28)),
+            Err(hresult_error(0x8027_0254)),
+            Ok(4242),
+        ],
+        &[1500, 3000, 5000],
+        Some((r"C:\pkg\OpenAI.Codex_26.915.4065.0_x64__abc\app", "OpenAI.Codex_abc!ChatGPT")),
+    )
+    .await;
+
+    let (process_id, aumid) = outcome.expect("第三次应当成功");
+    assert_eq!(process_id, 4242);
+    assert_eq!(aumid, "OpenAI.Codex_abc!ChatGPT");
+    assert_eq!(
+        *spy.attempts.borrow(),
+        vec![
+            "OpenAI.Codex_abc!App",
+            "OpenAI.Codex_abc!ChatGPT",
+            "OpenAI.Codex_abc!ChatGPT",
+        ]
+    );
+    assert_eq!(*spy.delays.borrow(), vec![1500, 3000], "按退避序列等待");
+    assert_eq!(*spy.reresolves.borrow(), 2, "每次重试前都重新解析包");
+}
+
+/// 非瞬时错误只再试一次(刚杀完进程时 COM 侧的激活锁),不走完整条序列。
+#[tokio::test]
+async fn non_transient_activation_errors_retry_only_once() {
+    let spy = ActivationSpy::default();
+    let outcome = run_retry(
+        &spy,
+        vec![
+            Err(anyhow::anyhow!("ActivateApplication failed 0x80004005")),
+            Err(anyhow::anyhow!("ActivateApplication failed 0x80004005")),
+        ],
+        &[1500, 3000, 5000],
+        None,
+    )
+    .await;
+
+    let failure = outcome.expect_err("两次都失败");
+    assert_eq!(failure.attempts, 2);
+    assert_eq!(spy.attempts.borrow().len(), 2);
+    assert_eq!(*spy.delays.borrow(), vec![1500]);
+}
+
+/// 瞬时错误一直不好:用完整条序列后放弃,次数 = 序列长度 + 1,错误里带 AUMID 和错误码。
+#[tokio::test]
+async fn transient_activation_errors_give_up_after_the_whole_backoff() {
+    let spy = ActivationSpy::default();
+    let outcome = run_retry(&spy, Vec::new(), &[1, 2, 3], None).await;
+
+    let failure = outcome.expect_err("一直失败");
+    assert_eq!(failure.attempts, 4);
+    assert_eq!(failure.error_code, Some(0x8007_3D28));
+    assert_eq!(*spy.delays.borrow(), vec![1, 2, 3]);
+    let message = format!("{:#}", failure.into_error());
+    assert!(message.contains("OpenAI.Codex_abc!App"), "{message}");
+    assert!(message.contains("0x80073D28"), "{message}");
+}
+
+/// 重新解析失败(包还没注册回来)时保持原 AUMID 继续重试,不会把目录/AUMID 弄丢。
+#[tokio::test]
+async fn activation_keeps_the_original_aumid_when_reresolve_fails() {
+    let spy = ActivationSpy::default();
+    let outcome = run_retry(
+        &spy,
+        vec![Err(hresult_error(0x8007_3D28)), Ok(7)],
+        &[1],
+        None,
+    )
+    .await;
+
+    assert_eq!(outcome.expect("第二次成功").1, "OpenAI.Codex_abc!App");
+    assert_eq!(
+        *spy.attempts.borrow(),
+        vec!["OpenAI.Codex_abc!App", "OpenAI.Codex_abc!App"]
+    );
+}

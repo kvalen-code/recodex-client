@@ -59,6 +59,11 @@ pub fn windows_activate_process_window(process_id: u32) -> bool {
 }
 
 #[cfg(windows)]
+pub fn windows_process_has_window(process_id: u32) -> bool {
+    windows_integration::process_has_window(process_id)
+}
+
+#[cfg(windows)]
 pub fn windows_apply_codexplusplus_icon_to_process_window(
     process_id: u32,
     icon_resource_path: std::path::PathBuf,

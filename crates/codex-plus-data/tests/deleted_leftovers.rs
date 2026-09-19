@@ -538,3 +538,28 @@ fn sweep_out_of_budget_defers_without_touching_anything() {
     assert_eq!(report.threads_cleaned, 1);
     assert!(!index_ids(&fx.home).contains(&"t1".to_string()));
 }
+
+/// 建议 B:限时清扫里,单份备份太大就顺延(不打标记),免得「整份读入 + pretty 重写」
+/// 把启动卡住几秒。不限时的整轮清扫不受上限约束,照样清。
+#[test]
+fn oversized_backups_are_deferred_by_the_startup_sweep_but_not_by_a_full_one() {
+    let fx = fixture();
+    legacy_delete(&fx, "t1");
+
+    let report = codex_plus_data::sweep_deleted_thread_leftovers_with_limits(
+        &fx.home,
+        &fx.backups,
+        std::time::Duration::from_secs(30),
+        Some(16), // 任何真实备份都超过 16 字节
+    )
+    .unwrap();
+
+    assert_eq!(report.threads_oversized, 1, "{report:?}");
+    assert_eq!(report.threads_cleaned, 0);
+    assert!(index_ids(&fx.home).contains(&"t1".to_string()), "残骸还在");
+
+    // 下一轮(不限时)照样清掉,说明只是顺延、没有被标记成处理过。
+    let report = sweep_deleted_thread_leftovers(&fx.home, &fx.backups).unwrap();
+    assert_eq!(report.threads_cleaned, 1, "{report:?}");
+    assert!(!index_ids(&fx.home).contains(&"t1".to_string()));
+}

@@ -314,12 +314,35 @@ pub(crate) fn redact_user_paths(input: &str) -> String {
                 out.push(bytes[i] as char);
                 i += 1;
             }
+            // 用户名可以带空格(`C:\Users\John Smith\...`),所以扫到**下一个路径
+            // 分隔符或引号**为止,而不是碰到空格就停 —— 那样 `John Smith` 只遮掉
+            // `John`,姓还留在上报里。
+            //
+            // 但「路径后面还接着一句话」(`open /home/bob failed`)同样常见:整段
+            // 吞掉会把信息抹光。所以看这一段怎么结束:
+            //   - 分隔符或引号结束 → 就是目录名(JSON 串里的路径几乎都以引号收尾),
+            //     整段遮掉,空格照遮;
+            //   - 行尾/串尾结束 → 后面可能跟着说明文字,退回到第一个空格为止。
             let start = i;
-            while i < bytes.len() && !matches!(bytes[i], b'\\' | b'/' | b'"' | b'\'' | b' ') {
-                i += 1;
+            let mut end = i;
+            let mut spaced_end = None;
+            while end < bytes.len() && !matches!(bytes[end], b'\\' | b'/' | b'"' | b'\n' | b'\r') {
+                if bytes[end] == b' ' && spaced_end.is_none() {
+                    spaced_end = Some(end);
+                }
+                end += 1;
             }
-            if i > start {
+            let terminated_by_path_boundary = bytes
+                .get(end)
+                .is_some_and(|byte| matches!(byte, b'\\' | b'/' | b'"'));
+            let name_end = if terminated_by_path_boundary {
+                end
+            } else {
+                spaced_end.unwrap_or(end)
+            };
+            if name_end > start {
                 out.push_str("[user]");
+                i = name_end;
             }
             continue;
         }
@@ -673,6 +696,26 @@ mod tests {
         assert_eq!(redact_user_paths("/home/carol/.codex"), "/home/[user]/.codex");
         // 不是路径段的 users/home 不动
         assert_eq!(redact_user_paths("users home homepage"), "users home homepage");
+        // 带空格的用户名要整段遮掉(之前只遮到空格,姓还在)
+        assert_eq!(
+            redact_user_paths(r#"C:\Users\John Smith\AppData\Local"#),
+            r#"C:\Users\[user]\AppData\Local"#
+        );
+        assert_eq!(
+            redact_user_paths("/Users/Jane Doe/Library/Application Support"),
+            "/Users/[user]/Library/Application Support"
+        );
+        // UNC 与正斜杠混排
+        assert_eq!(
+            redact_user_paths(r#"\\nas\Users\Ann Lee\share"#),
+            r#"\\nas\Users\[user]\share"#
+        );
+        assert_eq!(redact_user_paths("//nas/home/Ann Lee/x"), "//nas/home/[user]/x");
+        // 路径后面还跟着一句话时,只遮到第一个空格,别把信息抹光
+        assert_eq!(redact_user_paths("open /home/bob failed"), "open /home/[user] failed");
+        // 结尾就是用户名(后面没有分隔符)
+        assert_eq!(redact_user_paths("/home/carol"), "/home/[user]");
+        assert_eq!(redact_user_paths(r#"cd "C:\Users\Bo Li" now"#), r#"cd "C:\Users\[user]" now"#);
         let line = r#"{"timestamp_ms":0,"pid":1,"event":"launcher.spawn_failed","detail":{"error":"cannot open C:\\Users\\alice\\x"}}"#;
         let log = temp_log(&[line]);
         let t = FakeTransport::returning(&[202]);

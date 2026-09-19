@@ -2872,21 +2872,36 @@ fn windows_activation_failure_retries_before_giving_up() {
             && body.contains("PACKAGED_ACTIVATION_RETRY_DELAYS_MS,"),
         "launch_codex 没走带重试的激活 —— 刚杀完进程 COM 侧可能还持着激活锁,商店更新时包在注册中"
     );
-    let retry = source
+    // 重试循环本身是可注入的(activate_packaged_app_with_retry_using),行为由
+    // tests/packaged_activation.rs 的四条用例覆盖:瞬时错误走完退避、非瞬时只再试
+    // 一次、每次重新解析包、次数上限。这里只钉「真实入口确实接的是真激活 + 真解析」。
+    let wiring = source
         .split_once("pub async fn activate_packaged_app_with_retry(")
         .expect("找不到 activate_packaged_app_with_retry")
         .1;
-    let retry = &retry[..retry.find("pub fn direct_launch_fallback_is_sensible").unwrap_or(retry.len())];
+    let wiring = &wiring[..wiring
+        .find("pub async fn activate_packaged_app_with_retry_using")
+        .expect("找不到可注入版本")];
     assert!(
-        retry.contains("activate_packaged_app(&current_aumid, arguments).await")
-            && retry.contains("loop {"),
-        "激活只调了一次"
+        wiring.contains("activate_packaged_app(&aumid, &arguments).await"),
+        "真实入口没接上真正的激活"
     );
+    assert!(
+        wiring.contains("reresolve_packaged_app_dir") && wiring.contains("packaged_app_user_model_id"),
+        "真实入口没接上「每次重新解析包目录与 AUMID」"
+    );
+    let retry = source
+        .split_once("pub async fn activate_packaged_app_with_retry_using")
+        .expect("找不到可注入版本")
+        .1;
+    let retry = &retry[..retry
+        .find("pub fn direct_launch_fallback_is_sensible")
+        .unwrap_or(retry.len())];
+    assert!(retry.contains("loop {"), "激活只调了一次");
     assert!(
         retry.contains("launcher.windows_activation_failed"),
         "激活彻底失败没有任何上报 —— 这条路径刚从「谁也走不到」变成「所有 Windows 用户都走」"
     );
-    assert!(retry.contains("reresolve_packaged_app_dir"), "重试没有重新解析包");
     assert!(
         PACKAGED_ACTIVATION_RETRY_DELAYS_MS.len() >= 3
             && PACKAGED_ACTIVATION_RETRY_DELAYS_MS.iter().sum::<u64>() <= 25_000,

@@ -48,6 +48,15 @@ const MARKER_VERSION: u64 = 1;
 /// 启动期清扫最多占用的时间。它挡在拉起 Codex 前面,超出部分顺延到下次启动。
 pub const STARTUP_SWEEP_BUDGET: Duration = Duration::from_millis(1500);
 
+/// 限时清扫里单份备份的大小上限。
+///
+/// 预算只在**备份之间**检查,而清理一条线程要把残骸并回它最新的那份备份:那一步是
+/// 「整份读进内存 → pretty 重新序列化 → 原子写回」,几百 MB 的备份(rollout 以
+/// base64 存在里面)一次就能超时好几秒,正好卡在拉起 Codex 前面。超过上限的这一轮
+/// 直接顺延(不打标记,下次还会再来),并记在报告里,好知道现实里到底有没有发生。
+/// 不限时的整轮清扫(`sweep_deleted_thread_leftovers`)不受这个上限约束。
+pub const MAX_MERGE_BACKUP_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeftoverSweepStatus {
@@ -71,6 +80,8 @@ pub struct LeftoverSweepReport {
     pub catalog_rows_removed: usize,
     /// 这一轮没下结论、留到下次的线程数（库查不了/清理中途失败/超时）。
     pub threads_deferred: usize,
+    /// 因为备份太大(见 `MAX_MERGE_BACKUP_BYTES`)而顺延的线程数。
+    pub threads_oversized: usize,
     pub errors: Vec<String>,
 }
 
@@ -85,6 +96,7 @@ impl LeftoverSweepReport {
             global_state_entries_removed: 0,
             catalog_rows_removed: 0,
             threads_deferred: 0,
+            threads_oversized: 0,
             errors: Vec::new(),
         }
     }
@@ -108,6 +120,7 @@ pub fn sweep_deleted_thread_leftovers_at_startup(codex_home: &Path, backup_dir: 
     let nothing_happened = report.status == LeftoverSweepStatus::Completed
         && report.threads_cleaned == 0
         && report.threads_deferred == 0
+        && report.threads_oversized == 0
         && report.errors.is_empty();
     if !nothing_happened {
         // 只上报计数与状态;错误信息里可能带本机路径,只报条数。
@@ -119,6 +132,7 @@ pub fn sweep_deleted_thread_leftovers_at_startup(codex_home: &Path, backup_dir: 
                 "threads_cleaned": report.threads_cleaned,
                 "threads_still_present": report.threads_still_present,
                 "threads_deferred": report.threads_deferred,
+                "threads_oversized": report.threads_oversized,
                 "session_index_lines_removed": report.session_index_lines_removed,
                 "global_state_entries_removed": report.global_state_entries_removed,
                 "catalog_rows_removed": report.catalog_rows_removed,
@@ -143,6 +157,19 @@ pub fn sweep_deleted_thread_leftovers_within(
     codex_home: &Path,
     backup_dir: &Path,
     budget: Duration,
+) -> anyhow::Result<LeftoverSweepReport> {
+    // 不限时的整轮清扫不设大小上限(没人在等它);限时的启动清扫要躲开巨型备份。
+    let merge_size_cap = (budget != Duration::MAX).then_some(MAX_MERGE_BACKUP_BYTES);
+    sweep_deleted_thread_leftovers_with_limits(codex_home, backup_dir, budget, merge_size_cap)
+}
+
+/// 限时 + 单份备份大小上限。上限单独暴露出来是为了能测:真造一份 32MB 的备份
+/// 只会让测试变慢,证明不了别的。
+pub fn sweep_deleted_thread_leftovers_with_limits(
+    codex_home: &Path,
+    backup_dir: &Path,
+    budget: Duration,
+    merge_size_cap: Option<u64>,
 ) -> anyhow::Result<LeftoverSweepReport> {
     let deadline = Instant::now().checked_add(budget);
     let out_of_time = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
@@ -252,6 +279,15 @@ pub fn sweep_deleted_thread_leftovers_within(
             Presence::Absent => {}
         }
         let newest = token_ids.last().expect("每个线程至少一份备份").clone();
+        let newest_path = backup_dir.join(format!("{newest}.json"));
+        if let Some(cap) = merge_size_cap {
+            let too_big = fs::metadata(&newest_path).map(|meta| meta.len() > cap).unwrap_or(false);
+            if too_big {
+                // 不打标记:下次启动(或不限时的整轮清扫)还会再处理它。
+                report.threads_oversized += 1;
+                continue;
+            }
+        }
         match clean_thread(codex_home, backup_dir, &newest, &thread_id) {
             Ok(None) => mark_all(&mut marker, &token_ids, "no_leftovers"),
             Ok(Some(cleaned)) => {

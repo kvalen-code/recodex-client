@@ -1,3 +1,4 @@
+use anyhow::Context;
 use crate::BackupStore;
 use codex_plus_core::models::{DeleteResult, DeleteStatus, SessionRef};
 use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
@@ -318,12 +319,26 @@ impl SQLiteStorageAdapter {
                     self.delete_codex_automation_run(&mut db, session)?
                 }
                 None => {
+                    // 认不出表结构 ≠ 库里没有这条会话:Codex 改了列之后每个库都会走到
+                    // 这里,当成「查无此会话」就会去清索引/侧边栏并报成功,而会话其实
+                    // 还在库里,重启后照样回来(第二轮审计 E)。
+                    //
+                    // 只有**确实带着会话表**(列对不上)才算没下结论;完全不相干的库
+                    // (候选里按文件名扫进来的)仍然是「这里没有」,否则纯 API 会话的
+                    // 索引兜底会被一个不相干的库永久挡住。
+                    let has_session_tables = has_table(&db, "threads")?
+                        || has_table(&db, "sessions")?
+                        || has_table(&db, "automation_runs")?;
                     return Ok((
                         failed(
                             &session.session_id,
                             "Unsupported local storage schema".to_string(),
                         ),
-                        DeleteOutcome::NotFound,
+                        if has_session_tables {
+                            DeleteOutcome::Failed
+                        } else {
+                            DeleteOutcome::NotFound
+                        },
                     ));
                 }
             };
@@ -775,10 +790,11 @@ impl SQLiteStorageAdapter {
                 message = format!("{message}；{note}");
             }
             // 数据库行已经删了:这把 token(整行 + rollout + 索引 + 侧边栏)是唯一
-            // 能完整撤销的凭据,调用方不能拿别的备份把它换掉。
+            // 能完整撤销的凭据,调用方不能拿别的备份把它换掉。状态报 Partial 而不是
+            // Failed:索引/侧边栏随后会被清掉(重启后会话就不见了),界面必须给出撤销按钮。
             return Ok(Some((
                 DeleteResult {
-                    status: DeleteStatus::Failed,
+                    status: DeleteStatus::Partial,
                     session_id: thread_id,
                     message,
                     undo_token: Some(token.clone()),
@@ -1089,6 +1105,11 @@ fn restore_backups(
                 fs::write(path, bytes)?;
             }
         }
+        // 备份里有没有数据库行,决定了索引/侧边栏这两步是「尽力而为」还是「命根子」:
+        //   - 有 DB 行:行和 rollout 已经恢复了,缓存少一条 Codex 会自己补回来,
+        //     这两步失败不该让整次撤销报错(否则重试又撞上刚恢复的行,再也撤不回);
+        //   - 没有 DB 行(纯 API 会话):撤销**只有**这两步,静默吞掉失败就是谎报成功。
+        let requires_sidebar_restore = !backup_has_db_rows(tables);
         if let Some(entries) = tables.get("__session_index").and_then(Value::as_array) {
             let lines = entries
                 .iter()
@@ -1097,7 +1118,21 @@ fn restore_backups(
                 .collect::<Vec<_>>();
             if !lines.is_empty() {
                 if let Some(home) = codex_home {
-                    let _ = crate::provider_sync::restore_session_index_entries(home, &lines);
+                    let restored =
+                        crate::provider_sync::restore_session_index_entries_detailed(home, &lines);
+                    match restored {
+                        Ok(restored) => {
+                            if requires_sidebar_restore && restored.file_changed {
+                                anyhow::bail!(
+                                    "session_index.jsonl 在撤销期间被改过,这条会话没有恢复,请重试"
+                                );
+                            }
+                        }
+                        Err(error) if requires_sidebar_restore => {
+                            return Err(error).context("restore session_index.jsonl");
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -1107,7 +1142,30 @@ fn restore_backups(
         // 行 —— 半成功、再也撤不回。缓存缺一条,Codex 重建目录时会从会话库补回。
         if let Some(sidebar) = tables.get("__sidebar") {
             if let Some(home) = codex_home {
-                let _ = crate::provider_sync::restore_thread_sidebar_references(home, sidebar);
+                if let Err(error) =
+                    crate::provider_sync::restore_thread_sidebar_references(home, sidebar)
+                {
+                    if requires_sidebar_restore {
+                        return Err(error).context("restore sidebar references");
+                    }
+                }
+            }
+        }
+        // 纯 API 会话:撤销**只有**这两步,做完必须真的看得见这条会话 —— 光看
+        // 「恢复了几条」分不清「本来就在」(重试)和「文件被改过所以放弃写入」
+        // (什么都没恢复)。这里直接查最终状态:索引或侧边栏里有它才算撤销成功。
+        if requires_sidebar_restore {
+            if let Some(home) = codex_home {
+                let thread_id = normalize_codex_thread_id(
+                    backup["session_id"].as_str().unwrap_or_default(),
+                );
+                let mut present = Map::new();
+                add_thread_sidebar_backup_tables(&mut present, home, &thread_id)?;
+                if !sidebar_backup_has_content(&present) {
+                    anyhow::bail!(
+                        "撤销没有把这条会话放回索引/侧边栏(期间可能被 Codex 改写),请刷新后重试"
+                    );
+                }
             }
         }
     }

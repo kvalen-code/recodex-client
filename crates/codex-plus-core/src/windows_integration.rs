@@ -539,6 +539,15 @@ pub fn terminate_process(process_id: u32) -> bool {
     unsafe { TerminateProcess(handle, 0) }.is_ok()
 }
 
+/// 这个进程名下还有没有窗口(包含隐藏到托盘的)。
+///
+/// 「有进程但一个窗口都没有」= Codex 正在退出的残留进程:此时 Electron 的单实例锁
+/// 多半已经放开,再去做系统激活会**新起**一个不带调试端口的 Codex。
+#[cfg(windows)]
+pub fn process_has_window(process_id: u32) -> bool {
+    process_window(process_id, false).is_some()
+}
+
 #[cfg(windows)]
 pub fn activate_process_window(process_id: u32) -> bool {
     let Some(hwnd) = process_window(process_id, false) else {

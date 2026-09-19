@@ -354,18 +354,31 @@ async fn launcher_main(
     // recodex-overlay: 由「切换模式/更新后重启」拉起时带 --await-guard —— 旧 launcher
     // 还要 1 秒左右才退出,不等的话会误判成「已有实例」而直接退出,页面就失去后端。
     let await_guard = args.iter().any(|arg| arg == "--await-guard");
-    let Some(_guard) = acquire_guard_maybe_waiting(options.debug_port, await_guard)? else {
-        // latest-status.json 归主实例所有,这里不写:它记着主实例**实际**的调试/helper
-        // 端口,拿本进程的请求值覆盖掉,下一个 launcher 就读不到真实端口了。
-        let hooks = LauncherHooks::default();
-        activate_existing_codex_app(
-            &hooks,
-            Arc::new(codex_plus_core::existing_instance::SystemExistingInstanceEnv),
-            &options,
-        )
-        .await
-        .map_err(LauncherFailure::secondary)?;
-        return Ok(());
+    // 两条路都要用它(第二实例可能在等待期间接手成主实例),只建一次:
+    // LauncherHooks::default() 会起诊断回传线程,建两次就有两条线程抢同一个水位文件。
+    let hooks = LauncherHooks::default();
+    let _guard = match acquire_guard_maybe_waiting(options.debug_port, await_guard)? {
+        Some(guard) => guard,
+        None => {
+            // latest-status.json 归主实例所有,这里不写:它记着主实例**实际**的调试/helper
+            // 端口,拿本进程的请求值覆盖掉,下一个 launcher 就读不到真实端口了。
+            let env = Arc::new(SecondInstanceEnv::new(options.debug_port));
+            let outcome = activate_existing_codex_app(&hooks, env.clone(), &options)
+                .await
+                .map_err(LauncherFailure::secondary)?;
+            // 等待期间主实例放开了锁(用户刚关掉 Codex 又马上点图标):接手它,
+            // 按主实例继续往下走,而不是空等到超时。
+            match env.take_guard() {
+                Some(guard) => {
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "launcher.second_instance_took_over",
+                        json!({ "outcome": outcome.label() }),
+                    );
+                    guard
+                }
+                None => return Ok(()),
+            }
+        }
     };
     // recodex-overlay: 旧 exe / 旧引用 / 卸载项版本号 / 旧数据残留的清理,后台线程做,不拖慢启动。
     // 必须在拿到单实例锁之后:只有锁的持有者能改快捷方式、删旧 exe;这里也是旧名接班的报到点。
@@ -393,7 +406,6 @@ async fn launcher_main(
         &codex_plus_core::codex_sqlite::default_codex_home_dir(),
         &codex_plus_core::paths::default_app_state_dir().join("backups"),
     );
-    let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
     Ok(())
@@ -554,7 +566,7 @@ async fn activate_existing_codex_app<H: LaunchHooks>(
     hooks: &H,
     env: Arc<dyn codex_plus_core::existing_instance::ExistingInstanceEnv>,
     options: &LaunchOptions,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<codex_plus_core::existing_instance::ExistingActivation> {
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
@@ -593,6 +605,18 @@ async fn activate_existing_codex_app<H: LaunchHooks>(
         .map_err(|error| anyhow::anyhow!("existing Codex activation task failed: {error}"))?
     };
     use codex_plus_core::existing_instance::ExistingActivation;
+    // 接手成锁的持有者:后面按主实例正常启动,helper 由本进程自己起,这里什么都不用等、
+    // 不用提示。
+    if activation == ExistingActivation::BecamePrimary {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.activate_existing_codex",
+            json!({
+                "outcome": activation.label(),
+                "requested_debug_port": options.debug_port,
+            }),
+        );
+        return Ok(activation);
+    }
     let no_codex = activation == ExistingActivation::NoCodexProcess;
     let primary_helper_port = if settings.enhancements_enabled && !no_codex {
         codex_plus_core::launcher::wait_for_existing_helper(
@@ -626,7 +650,7 @@ async fn activate_existing_codex_app<H: LaunchHooks>(
         ExistingActivation::AppActivationFailed { process_ids, error } => {
             (process_ids.clone(), Some(error.clone()))
         }
-        ExistingActivation::NoCodexProcess => (Vec::new(), None),
+        ExistingActivation::NoCodexProcess | ExistingActivation::BecamePrimary => (Vec::new(), None),
     };
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "launcher.activate_existing_codex",
@@ -646,7 +670,65 @@ async fn activate_existing_codex_app<H: LaunchHooks>(
     );
     match activation_error {
         Some(error) => Err(anyhow::anyhow!("激活已在运行的 Codex 失败:{error}")),
-        None => Ok(()),
+        None => Ok(activation),
+    }
+}
+
+/// 第二实例用的环境:系统实现 + 「试着接手单实例锁」。
+///
+/// guard 必须活到进程结束,所以只能由这一层(launcher)持有;core 的系统实现
+/// 永远返回 false。接手时**不做**残留清理:这条路上「无 Codex 进程、无 CDP」是
+/// 常态(用户刚关掉 Codex),据此杀别的 launcher 正是第一轮审计 S2 要防的事。
+struct SecondInstanceEnv {
+    inner: codex_plus_core::existing_instance::SystemExistingInstanceEnv,
+    debug_port: u16,
+    guard: Mutex<Option<codex_plus_core::ports::LoopbackPortGuard>>,
+}
+
+impl SecondInstanceEnv {
+    fn new(debug_port: u16) -> Self {
+        Self {
+            inner: codex_plus_core::existing_instance::SystemExistingInstanceEnv,
+            debug_port,
+            guard: Mutex::new(None),
+        }
+    }
+
+    fn take_guard(&self) -> Option<codex_plus_core::ports::LoopbackPortGuard> {
+        self.guard.lock().ok().and_then(|mut guard| guard.take())
+    }
+}
+
+impl codex_plus_core::existing_instance::ExistingInstanceEnv for SecondInstanceEnv {
+    fn codex_process_ids(&self) -> Vec<u32> {
+        self.inner.codex_process_ids()
+    }
+    fn activate_process_window(&self, process_id: u32) -> bool {
+        self.inner.activate_process_window(process_id)
+    }
+    fn process_has_window(&self, process_id: u32) -> bool {
+        self.inner.process_has_window(process_id)
+    }
+    fn activate_app(&self, app_dir: &Path) -> anyhow::Result<()> {
+        self.inner.activate_app(app_dir)
+    }
+    fn sleep(&self, duration: std::time::Duration) {
+        self.inner.sleep(duration);
+    }
+    fn try_take_over(&self) -> bool {
+        let Ok(mut slot) = self.guard.lock() else {
+            return false;
+        };
+        if slot.is_some() {
+            return true;
+        }
+        match acquire_single_instance_guard_with_retry(self.debug_port, false) {
+            Ok(Some(guard)) => {
+                *slot = Some(guard);
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -1600,8 +1682,12 @@ mod tests {
     struct FakeProcessEnv {
         process_ids: Vec<u32>,
         window_activates: bool,
+        has_window: bool,
+        takes_over: bool,
+        app_fails: bool,
         window_calls: AtomicUsize,
         app_calls: AtomicUsize,
+        take_over_calls: AtomicUsize,
     }
 
     impl FakeProcessEnv {
@@ -1609,8 +1695,36 @@ mod tests {
             Arc::new(Self {
                 process_ids,
                 window_activates,
+                has_window: true,
+                takes_over: false,
+                app_fails: false,
                 window_calls: AtomicUsize::new(0),
                 app_calls: AtomicUsize::new(0),
+                take_over_calls: AtomicUsize::new(0),
+            })
+        }
+        fn taking_over(process_ids: Vec<u32>) -> Arc<Self> {
+            Arc::new(Self {
+                process_ids,
+                window_activates: false,
+                has_window: false,
+                takes_over: true,
+                app_fails: false,
+                window_calls: AtomicUsize::new(0),
+                app_calls: AtomicUsize::new(0),
+                take_over_calls: AtomicUsize::new(0),
+            })
+        }
+        fn failing_activation(process_ids: Vec<u32>) -> Arc<Self> {
+            Arc::new(Self {
+                process_ids,
+                window_activates: false,
+                has_window: true,
+                takes_over: false,
+                app_fails: true,
+                window_calls: AtomicUsize::new(0),
+                app_calls: AtomicUsize::new(0),
+                take_over_calls: AtomicUsize::new(0),
             })
         }
     }
@@ -1623,8 +1737,18 @@ mod tests {
             self.window_calls.fetch_add(1, Ordering::SeqCst);
             self.window_activates
         }
+        fn process_has_window(&self, _process_id: u32) -> bool {
+            self.has_window
+        }
+        fn try_take_over(&self) -> bool {
+            self.take_over_calls.fetch_add(1, Ordering::SeqCst);
+            self.takes_over
+        }
         fn activate_app(&self, _app_dir: &Path) -> anyhow::Result<()> {
             self.app_calls.fetch_add(1, Ordering::SeqCst);
+            if self.app_fails {
+                anyhow::bail!("activation refused");
+            }
             Ok(())
         }
         fn sleep(&self, _duration: std::time::Duration) {}
@@ -1835,17 +1959,70 @@ mod tests {
         assert_eq!(saved.message, "boom");
     }
 
-    /// R4 的接线:已有实例分支的错误必须标成 secondary(否则 main 会照写状态)。
+    /// R4 的接线(行为版):已有实例分支失败时,错误是 secondary —— 状态文件一个字节
+    /// 都不能变(激活前后各验一次)。
+    #[tokio::test]
+    async fn second_instance_activation_failure_never_touches_the_status_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = secondary_options(dir.path());
+        options
+            .status_store
+            .save_latest(&primary_status(&options))
+            .unwrap();
+        let before = std::fs::read(dir.path().join("latest-status.json")).unwrap();
+        let hooks = RecordingHooks::default();
+        let env = FakeProcessEnv::failing_activation(vec![5]);
+
+        let error = activate_existing_codex_app(&hooks, env.clone(), &options)
+            .await
+            .expect_err("系统激活失败必须向上报错");
+
+        assert_primary_runtime_untouched(&hooks);
+        assert_eq!(
+            std::fs::read(dir.path().join("latest-status.json")).unwrap(),
+            before
+        );
+        record_launch_failure(&options, &LauncherFailure::secondary(error));
+        assert_eq!(
+            std::fs::read(dir.path().join("latest-status.json")).unwrap(),
+            before,
+            "第二实例的失败不能覆盖主实例的状态文件"
+        );
+    }
+
+    /// 应修 2:等待期间主实例放开了锁 —— 转为主实例(BecamePrimary),不弹提示、
+    /// 不做系统激活,也不去等主实例的 helper。
+    #[tokio::test]
+    async fn second_instance_becomes_primary_when_the_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = secondary_options(dir.path());
+        let hooks = RecordingHooks::default();
+        // 只剩正在退出、没有窗口的 Codex 残留进程。
+        let env = FakeProcessEnv::taking_over(vec![4242]);
+
+        let outcome = activate_existing_codex_app(&hooks, env.clone(), &options)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            codex_plus_core::existing_instance::ExistingActivation::BecamePrimary
+        );
+        assert_primary_runtime_untouched(&hooks);
+        assert_eq!(env.app_calls.load(Ordering::SeqCst), 0, "不能做系统激活");
+        assert!(env.take_over_calls.load(Ordering::SeqCst) >= 1);
+        assert!(!dir.path().join("latest-status.json").exists());
+    }
+
+    /// SecondInstanceEnv 真的能拿到锁并把 guard 交出来(锁空闲时)。
     #[test]
-    fn existing_instance_branch_marks_its_failures_as_secondary() {
-        let source = include_str!("main.rs").replace("\r\n", "\n");
-        let launcher_main = &source[source.find("async fn launcher_main(").unwrap()..];
-        let guard_else = &launcher_main[launcher_main
-            .find("acquire_guard_maybe_waiting(options.debug_port, await_guard)?")
-            .unwrap()..];
-        let branch = &guard_else[..guard_else.find("return Ok(());").unwrap()];
-        assert!(branch.contains(".map_err(LauncherFailure::secondary)?"));
-        assert!(!branch.contains("save_latest"));
+    fn second_instance_env_hands_over_the_acquired_guard() {
+        use codex_plus_core::existing_instance::ExistingInstanceEnv;
+        let env = SecondInstanceEnv::new(codex_plus_core::ports::find_available_loopback_port());
+        assert!(env.try_take_over(), "锁空闲时必须拿得到");
+        assert!(env.try_take_over(), "已经拿到就直接复用");
+        assert!(env.take_guard().is_some(), "guard 必须交给调用方(要活到进程结束)");
+        assert!(env.take_guard().is_none(), "只能交出一次");
     }
 
     #[test]

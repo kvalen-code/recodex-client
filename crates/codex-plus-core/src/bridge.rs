@@ -96,11 +96,17 @@ pub fn build_bridge_script(binding_name: &str) -> String {
 (() => {{
   // 桥可能在请求进行中被重新注入(看门狗/换代)。旧做法直接换一个新 Map,旧
   // resolver 被静默丢掉,调用方的 Promise 永久 pending —— 面板表现为一直「读取中」。
-  // 这里先把还挂着的请求统统以失败了结(上游 a7cb8d2)。
+  // 这里先把还挂着的请求统统了结(上游 a7cb8d2)。
+  // 但**有副作用**的请求(删除/撤销)不能说「失败」:后端收到了就会把它做完,前端
+  // 却以为没做,撤销 token 就此丢失。这类请求了结为「结果未知」,让用户刷新确认。
   const previousCallbacks = window.__codexSessionDeleteCallbacks;
   if (previousCallbacks && typeof previousCallbacks.forEach === "function") {{
     previousCallbacks.forEach((callback) => {{
-      try {{ callback.resolve({{ status: "failed", message: "桥接已重新连接,请重试" }}); }} catch {{}}
+      const mutating = callback && (callback.path === "/delete" || callback.path === "/undo");
+      const result = mutating
+        ? {{ status: "unknown", message: "桥接已重新连接,这次操作的结果未知,请刷新列表确认" }}
+        : {{ status: "failed", message: "桥接已重新连接,请重试" }};
+      try {{ callback.resolve(result); }} catch {{}}
     }});
   }}
   window.__codexSessionDeleteCallbacks = new Map();
@@ -123,7 +129,7 @@ pub fn build_bridge_script(binding_name: &str) -> String {
   }};
   window.__codexSessionDeleteBridge = (path, payload) => new Promise((resolve) => {{
     const id = String(++window.__codexSessionDeleteSeq);
-    window.__codexSessionDeleteCallbacks.set(id, {{ resolve }});
+    window.__codexSessionDeleteCallbacks.set(id, {{ resolve, path }});
     window.{binding_name}(JSON.stringify({{ id, path, payload }}));
   }});
 }})();

@@ -6066,13 +6066,36 @@
       if (!confirmed) return;
       releaseDeleteFocus(row, button);
       const result = await postJson("/delete", ref);
-      if (result.status === "server_deleted" || result.status === "local_deleted") {
-        removeDeletedRow(row, button, ref);
-        showToast(result.message || "删除成功", result.undo_token);
-      } else {
-        showToast(result.message || "删除失败", null);
-      }
+      handleDeleteResult(result, () => removeDeletedRow(row, button, ref));
     });
+  }
+
+  // 删除结果 → 界面。纯分支逻辑单独拎出来,方便测试。
+  //   - server_deleted/local_deleted:移除行,提示条带撤销;
+  //   - partial:数据库行已删、rollout 等文件没删掉 —— 索引/侧边栏也已清,重启后会话就
+  //     不见了,所以同样移除行,并且**必须**给撤销按钮,文案保留「部分失败」;
+  //   - unknown:桥在请求途中重连,后端可能已经删完,结果未知,不移除也不说失败;
+  //   - 其余失败:只要带着 undo_token 就照样给撤销按钮(撤销是幂等的),不移除行。
+  function handleDeleteResult(result, removeRow) {
+    const status = result?.status;
+    const undoToken = result?.undo_token || null;
+    if (status === "server_deleted" || status === "local_deleted") {
+      removeRow();
+      showToast(result.message || "删除成功", undoToken);
+      return "deleted";
+    }
+    if (status === "partial") {
+      removeRow();
+      const message = result.message || "";
+      showToast(/部分/.test(message) ? message : `部分删除失败：${message || "文件未能删除"}`, undoToken);
+      return "partial";
+    }
+    if (status === "unknown") {
+      showToast(result.message || "删除结果未知，请刷新列表确认", null);
+      return "unknown";
+    }
+    showToast(result?.message || "删除失败", undoToken);
+    return "failed";
   }
 
   async function exportMarkdown(ref) {
@@ -8029,6 +8052,12 @@
   if (window.__CODEX_PLUS_TEST_SESSION_COPY__) {
     window.__codexPlusSessionCopyTest = {
       pickForkButton: sessionCopyPickForkButton,
+    };
+  }
+
+  if (window.__CODEX_PLUS_TEST_DELETE_RESULT__) {
+    window.__codexPlusDeleteResultTest = {
+      handle: handleDeleteResult,
     };
   }
 

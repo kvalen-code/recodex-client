@@ -2274,6 +2274,20 @@ fn remove_thread_from_catalog_dbs(codex_home: &Path, thread_id: &str) -> anyhow:
     Ok(removed_total)
 }
 
+/// `restore_session_index_entries` 的详细结果。
+///
+/// 只看「追加了几行」分不清两件完全不同的事:**本来就在**(撤销重试,没事)和
+/// **文件被改过所以放弃写入**(什么都没恢复,必须让调用方知道)。纯 API 会话的
+/// 撤销全靠这一步,分不清就会谎报成功(第二轮审计 应修 3)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionIndexRestore {
+    pub appended: usize,
+    /// 备份里的行在索引里已经有了(上一次撤销放回来的)。
+    pub already_present: usize,
+    /// 读到写之间文件被别人改过,这次没有写。
+    pub file_changed: bool,
+}
+
 /// Append previously removed `session_index.jsonl` lines back (undo flow).
 /// Lines whose `id` already exists are skipped. Returns the number of
 /// appended lines. Best-effort: returns `Ok(0)` without writing when the
@@ -2282,8 +2296,16 @@ pub fn restore_session_index_entries(
     codex_home: &Path,
     lines: &[String],
 ) -> anyhow::Result<usize> {
+    Ok(restore_session_index_entries_detailed(codex_home, lines)?.appended)
+}
+
+pub fn restore_session_index_entries_detailed(
+    codex_home: &Path,
+    lines: &[String],
+) -> anyhow::Result<SessionIndexRestore> {
+    let mut outcome = SessionIndexRestore::default();
     if lines.is_empty() {
-        return Ok(0);
+        return Ok(outcome);
     }
     let path = codex_home.join("session_index.jsonl");
     let original_bytes = if path.exists() {
@@ -2307,6 +2329,7 @@ pub fn restore_session_index_entries(
     for line in lines {
         if let Some(candidate) = known_session_index_candidate(line) {
             if existing_ids.contains(&candidate.id) {
+                outcome.already_present += 1;
                 continue;
             }
             existing_ids.insert(candidate.id);
@@ -2316,7 +2339,7 @@ pub fn restore_session_index_entries(
         appended += 1;
     }
     if appended == 0 {
-        return Ok(0);
+        return Ok(outcome);
     }
     let current_bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -2324,10 +2347,12 @@ pub fn restore_session_index_entries(
         Err(error) => return Err(error.into()),
     };
     if current_bytes != original_bytes {
-        return Ok(0);
+        outcome.file_changed = true;
+        return Ok(outcome);
     }
     codex_plus_core::settings::atomic_write(&path, next_text.as_bytes())?;
-    Ok(appended)
+    outcome.appended = appended;
+    Ok(outcome)
 }
 
 fn ensure_codex_app_stopped(
