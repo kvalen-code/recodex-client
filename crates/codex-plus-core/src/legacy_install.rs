@@ -203,9 +203,11 @@ fn is_regenerable_state_file(relative: &Path) -> bool {
 
 /// 旧数据目录是否已经被新目录**完全取代**,可以安全删除。
 ///
-/// 旧目录里每个非可再生文件,都必须在新目录的同一相对路径上存在,并且内容相同
-/// 或新目录那份更新(mtime 不早于旧的)。有一个不满足就整个保留 ——
-/// 比如用户同时还装着上游 Codex++,它会一直往这个目录里写更新的数据。
+/// 旧目录里每个非可再生文件,都必须在新目录的同一相对路径上存在,并且**逐字节相同**。
+/// 有一个不满足就整个保留。不看 mtime:「新目录那份更新」并不说明旧的是过期副本 ——
+/// 比如当初整目录改名失败、程序以默认设置在新目录起步,新目录的 settings.json 更新,
+/// 但用户真正的设置只在旧目录里;按 mtime 判就把用户唯一的那份删了。
+/// 可再生的(状态快照、日志、锁)在 [`is_regenerable_state_file`] 里显式列出,不参与比较。
 /// 遇到符号链接、读不了的条目、文件多得离谱,一律当作「不确定」保留。
 pub fn legacy_dir_superseded(legacy: &Path, current: &Path) -> bool {
     const MAX_ENTRIES: usize = 20_000;
@@ -255,15 +257,8 @@ fn file_superseded(legacy_file: &Path, current_file: &Path) -> bool {
     else {
         return false;
     };
-    if !current_meta.is_file() {
-        return false;
-    }
-    if let (Ok(legacy_time), Ok(current_time)) = (legacy_meta.modified(), current_meta.modified()) {
-        if current_time >= legacy_time {
-            return true;
-        }
-    }
-    legacy_meta.len() == current_meta.len()
+    current_meta.is_file()
+        && legacy_meta.len() == current_meta.len()
         && matches!(
             (std::fs::read(legacy_file), std::fs::read(current_file)),
             (Ok(a), Ok(b)) if a == b
@@ -1066,21 +1061,34 @@ mod tests {
         assert!(!legacy_dir_superseded(&legacy, &current), "新目录里没有的数据不能删");
     }
 
-    /// 同时装着上游 Codex++ 时,它会一直往旧目录里写**更新**的设置。
+    /// 内容不同就保留,不管哪边更新:
+    /// - 旧的更新:同时装着上游 Codex++,它会一直往旧目录里写更新的设置;
+    /// - 新的更新:当初整目录改名失败,程序以默认设置在新目录起步 —— 用户真正的设置
+    ///   只在旧目录里,按 mtime 判就把用户唯一的那份删了。
     #[test]
-    fn a_legacy_file_newer_than_its_copy_is_kept() {
+    fn a_legacy_file_differing_from_its_copy_is_kept_whichever_is_newer() {
         let root = tempfile::tempdir().unwrap();
         let legacy = root.path().join(".codex-session-delete");
         let current = root.path().join(".recodex");
-        write(&legacy.join("settings.json"), b"{\"newer\":true}");
+        write(&legacy.join("settings.json"), b"{\"theme\":\"mine\"}");
         write(&current.join("settings.json"), b"{}");
         set_mtime(&current.join("settings.json"), 3600);
         set_mtime(&legacy.join("settings.json"), 60);
-        assert!(!legacy_dir_superseded(&legacy, &current));
+        assert!(!legacy_dir_superseded(&legacy, &current), "旧的更新:保留");
 
-        // 反过来:新目录那份更新 → 旧的是过期副本,可以删
         set_mtime(&legacy.join("settings.json"), 7200);
-        assert!(legacy_dir_superseded(&legacy, &current));
+        assert!(!legacy_dir_superseded(&legacy, &current), "新的更新但内容不同:也保留");
+        assert!(legacy.join("settings.json").is_file());
+    }
+
+    #[test]
+    fn same_length_different_content_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".codex-session-delete");
+        let current = root.path().join(".recodex");
+        write(&legacy.join("settings.json"), b"{\"a\":1}");
+        write(&current.join("settings.json"), b"{\"a\":2}");
+        assert!(!legacy_dir_superseded(&legacy, &current));
     }
 
     #[test]
