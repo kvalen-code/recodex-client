@@ -722,12 +722,17 @@ impl codex_plus_core::existing_instance::ExistingInstanceEnv for SecondInstanceE
         if slot.is_some() {
             return true;
         }
-        match acquire_single_instance_guard_with_retry(self.debug_port, false) {
-            Ok(Some(guard)) => {
+        // 直接试一次绑锁:走 acquire_guard_with 会每轮写一条 launcher.already_running
+        // (等待期间每 500ms 一轮,几十条噪音),而且那里还带着残留清理。
+        match try_acquire_single_instance_guard() {
+            Ok(guard) => {
+                if let Some(fallback_lock_path) = guard.fallback_path() {
+                    log_launcher_guard_fallback(fallback_lock_path);
+                }
                 *slot = Some(guard);
                 true
             }
-            _ => false,
+            Err(_) => false,
         }
     }
 }
