@@ -38,6 +38,14 @@ pub type Progress<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
 /// 整个下载安装的上限。单次连接/读取卡住由 http_client 的连接与读超时兜住,
 /// 这里兜「一直在动但慢得离谱」。不设总超时的 client:35 MB 在慢线路上几分钟是常态。
 const INSTALL_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// 安装锁(§2.7,与命令行 remoteInstallLockName 同名同语义):桌面客户端与 `recodex app`
+/// (或两个终端)同时装同一个 REMOTE_HOME 时串行化。O_EXCL 建文件,内容是 pid 与时间(仅供排障),
+/// 装完删除;别人持锁就等(直到 INSTALL_DEADLINE),锁文件老过 15 分钟视为持有者已死、直接接管。
+pub const INSTALL_LOCK_NAME: &str = ".runtime-install.lock";
+const INSTALL_LOCK_STALE: Duration = Duration::from_secs(15 * 60);
+const INSTALL_LOCK_POLL: Duration = Duration::from_millis(500);
+/// 以 `.` 开头的安装中间产物(`.staging-*`、`.old-*`)只清这么久以前的 —— 可能是另一方正在进行的安装。
+const STAGING_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// 保证本机有可用运行时,有新版就装新版。检查更新本身失败时,已装过就继续用旧的。
 pub async fn ensure_runtime(
@@ -97,7 +105,6 @@ pub async fn ensure_runtime(
         m_os,
         m_arch,
         &channel.manifest_url,
-        installed.as_ref(),
         progress,
     );
     let result = tokio::time::timeout(INSTALL_DEADLINE, installing)
@@ -122,9 +129,12 @@ async fn install_from_manifest(
     m_os: &str,
     m_arch: &str,
     manifest_url: &str,
-    installed: Option<&RuntimeCurrent>,
     progress: Progress<'_>,
 ) -> anyhow::Result<EnsureOutcome> {
+    let _lock = acquire_install_lock(home).await?;
+    // 等锁期间别人(recodex app、另一个客户端进程)可能刚装完:以锁内重读的为准。
+    let installed = layout::read_runtime_current(home, os);
+    let installed = installed.as_ref();
     let client = http_client()?;
     let public_key = manifest::release_public_key();
     let raw = fetch(&client, manifest_url, manifest::MAX_MANIFEST_SIZE, None)
@@ -195,12 +205,99 @@ async fn install_from_manifest(
     };
     layout::write_runtime_current(home, &next)
         .map_err(|error| anyhow::anyhow!("记录当前远程组件版本失败:{error}"))?;
+    // 切换成功后才清旧版本:留当前与上一版(旧守护进程可能还指着上一版在跑,回退也用得上)。
+    let mut keep = vec![PathBuf::from(&next.dir)];
+    keep.extend(installed.map(RuntimeCurrent::dir_path));
+    prune_runtime_dirs(home, &keep, std::time::SystemTime::now());
     Ok(EnsureOutcome {
         current: next,
         previous: installed.cloned(),
         updated: true,
         warning: None,
     })
+}
+
+/// 持有中的安装锁;drop 时删锁文件。
+pub struct InstallLock {
+    path: PathBuf,
+}
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 独占 `REMOTE_HOME/.runtime-install.lock`(同命令行 acquireRuntimeInstallLock)。别人持锁就每
+/// 0.5 秒再试;总期限由调用方的 INSTALL_DEADLINE 兜住(超时 drop 掉这个 future 即放弃等待)。
+pub async fn acquire_install_lock(home: &RemoteHome) -> anyhow::Result<InstallLock> {
+    std::fs::create_dir_all(&home.root)?;
+    let path = home.root.join(INSTALL_LOCK_NAME);
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                // 与 Go 的 fmt.Fprintln(f, pid, time.RFC3339) 同形,只供排障
+                let _ = writeln!(
+                    file,
+                    "{} {}",
+                    std::process::id(),
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                );
+                return Ok(InstallLock { path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > INSTALL_LOCK_STALE);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                tokio::time::sleep(INSTALL_LOCK_POLL).await;
+            }
+            Err(error) => anyhow::bail!("远程组件安装锁:{error}"),
+        }
+    }
+}
+
+/// 删掉 `runtime/` 下除 `keep` 以外的版本目录(同命令行 pruneRuntimeDirs)。以 `.` 开头的
+/// 中间产物只删一小时以前的。删不掉(Windows 上正被占用)就算了,下次再删。
+pub fn prune_runtime_dirs(home: &RemoteHome, keep: &[PathBuf], now: std::time::SystemTime) {
+    let root = home.runtime_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = root.join(entry.file_name());
+        if keep.iter().any(|kept| kept == &path) {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            let young = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < STAGING_MAX_AGE);
+            if young {
+                continue;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
 
 /// 解压到 `runtime/<版本>/`:先解到同级临时目录、校验齐全,再整体改名 ——
@@ -395,6 +492,73 @@ mod tests {
             .flatten()
             .collect();
         assert!(entries.is_empty(), "失败的安装不能留下目录: {entries:?}");
+    }
+
+    #[tokio::test]
+    async fn install_lock_waits_for_the_holder_and_takes_over_a_stale_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp);
+        let first = acquire_install_lock(&home).await.unwrap();
+        let lock_path = home.root.join(".runtime-install.lock");
+        let text = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            text.starts_with(&format!("{} ", std::process::id())) && text.ends_with("Z\n"),
+            "{text}"
+        );
+        // 被占着:等,直到持有者放手
+        let started = std::time::Instant::now();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(first);
+        });
+        let second = acquire_install_lock(&home).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250), "没有等持锁者");
+        releaser.await.unwrap();
+        drop(second);
+        assert!(!lock_path.exists(), "锁文件要随 drop 删掉");
+        // 陈旧锁(老过 15 分钟):直接接管
+        std::fs::write(&lock_path, b"1 2026-01-01T00:00:00Z\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(16 * 60))
+            .unwrap();
+        let taken = tokio::time::timeout(Duration::from_secs(2), acquire_install_lock(&home))
+            .await
+            .expect("陈旧锁没有被接管");
+        assert!(taken.is_ok());
+    }
+
+    #[test]
+    fn pruning_keeps_current_and_previous_and_young_staging_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp);
+        let root = home.runtime_root();
+        for name in ["1.0.0", "1.1.0", "1.2.0", ".staging-1.3.0-abcd", ".old-1.0.0-ef01"] {
+            std::fs::create_dir_all(root.join(name).join("app")).unwrap();
+        }
+        std::fs::write(root.join("current.json"), b"{}").unwrap();
+        let keep = [root.join("1.2.0"), root.join("1.1.0")];
+        let now = std::time::SystemTime::now();
+        let listing = || {
+            let mut left: Vec<String> = std::fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            left.sort();
+            left
+        };
+        prune_runtime_dirs(&home, &keep, now);
+        assert_eq!(
+            listing(),
+            [".old-1.0.0-ef01", ".staging-1.3.0-abcd", "1.1.0", "1.2.0", "current.json"],
+            "更早的版本删掉;刚建的中间产物可能是别人正在装,留着"
+        );
+        // 一小时以后:中间产物也清掉
+        prune_runtime_dirs(&home, &keep, now + Duration::from_secs(2 * 60 * 60));
+        assert_eq!(listing(), ["1.1.0", "1.2.0", "current.json"]);
     }
 
     #[tokio::test]
