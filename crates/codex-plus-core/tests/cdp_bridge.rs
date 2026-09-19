@@ -736,7 +736,7 @@ fn injection_script_does_not_unlock_disabled_plugin_install_buttons() {
 fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
     assert!(!script.contains("function pluginMarketplaceAliasForName"));
     assert!(
         !script.contains("if (name === \"openai-bundled\") return \"codex-plus-openai-bundled\"")
@@ -748,10 +748,15 @@ fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
 fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
+    assert!(script.contains("codexPluginFilterSourceCache = new WeakMap()"));
+    assert!(script.contains("function codexPluginFilterCallbackSource(callback)"));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
-    assert!(script.contains("source.includes(\"!u(e.marketplaceName)||e.marketplaceName===r\")"));
-    assert!(script.contains("source.includes(\"!Eu(e.marketplaceName)||e.marketplaceName===n\")"));
+    // 构建版本过滤器按**结构**匹配(压缩名每个 Codex 版本都会变:u/r、ne/n、Eu/n、26.915 的 ri/n),
+    // 具体形状由下面 harness 里的 buildFlavor* 用例逐一验证。
+    assert!(script.contains(
+        "codexPluginBuildFlavorFilterSourcePattern = /!\\s*[\\w$]+\\(\\s*e\\.marketplaceName\\s*\\)\\s*\\|\\|\\s*e\\.marketplaceName\\s*===\\s*[\\w$]+/"
+    ));
     assert!(script.contains("source.includes(\"!t.includes(e.name)\")"));
     assert!(!script.contains("if (!source.includes(\"marketplaceName\")) return false"));
     assert!(!script.contains("if (!source.includes(\"name\")) return false"));
@@ -761,20 +766,18 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
 fn injection_script_expands_api_key_plugin_marketplace_requests() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
     assert!(script.contains("installPluginMarketplaceBridgePatch"));
     assert!(script.contains("installPluginBuildFlavorFilterPatch"));
     assert!(script.contains("Array.prototype.filter"));
     assert!(script.contains("codexPluginBuildFlavorFilterPatch"));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
-    assert!(script.contains(
-        "codexPluginOfficialMarketplaceName(plugin?.marketplaceName) && !callback(plugin)"
-    ));
+    assert!(script.contains("!filtered.includes(plugin) : !callback(plugin)"));
     assert!(script.contains("isCodexPluginMarketplaceHiddenFilter"));
-    assert!(script.contains(
-        "codexPluginOfficialMarketplaceName(marketplace?.name) && !callback(marketplace)"
-    ));
+    assert!(script.contains("!filtered.includes(marketplace) : !callback(marketplace)"));
+    // 快速路径:原生 filter 什么都没滤掉就直接返回,不做源码检查
+    assert!(script.contains("if (filtered.length === this.length) return filtered;"));
     assert!(script.contains("plugin_marketplace_hidden_filter_bypassed"));
     assert!(script.contains("method === \"list-plugins\""));
     assert!(script.contains("method === \"vscode://codex/list-plugins\""));
@@ -852,6 +855,22 @@ fn injection_script_logs_marketplace_grouping_diagnostics() {
 #[test]
 fn injection_script_recovers_plugin_search_from_remote_auth_errors() {
     let cases = run_plugin_marketplace_search_contract_harness();
+
+    // 普通 filter:样本里没有官方市场名,连 Function#toString 都不该调用
+    assert_eq!(cases["ordinaryBuildMatched"], false);
+    assert_eq!(cases["ordinaryHiddenMatched"], false);
+    assert_eq!(cases["ordinaryFunctionToStringCalls"], 0);
+    // 同一个回调第二次判断走 WeakMap 缓存,只取一次源码
+    assert_eq!(cases["buildFlavorMatched"], true);
+    assert_eq!(cases["buildFlavorMatchedAgain"], true);
+    assert_eq!(cases["cachedFunctionToStringCalls"], 1);
+    // 已有的 filtered 结果说明官方插件没被滤掉 → 不是要放行的过滤器
+    assert_eq!(cases["buildFlavorNothingFiltered"], false);
+    // 各 Codex 版本压缩后的真实形状(26.915 是 ri/n)都认,形状不对的不认
+    assert_eq!(
+        cases["buildFlavorShapes"],
+        json!([true, true, true, true, true, false, false, false])
+    );
 
     assert_eq!(cases["initialKinds"], json!(["local", "vertical"]));
     assert_eq!(cases["latestBroadOmittedHasKinds"], false);
@@ -939,6 +958,36 @@ window.__CODEX_PLUS_PLUGIN_MARKETPLACES__ = [{{
 }}];
 const api = window.__codexPlusPluginMarketplaceTest;
 api.reset();
+const nativeFunctionToString = Function.prototype.toString;
+let functionToStringCalls = 0;
+Function.prototype.toString = function(...args) {{
+  functionToStringCalls += 1;
+  return nativeFunctionToString.apply(this, args);
+}};
+const ordinaryFilter = (value) => value > 1;
+const ordinaryBuildMatched = api.isBuildFlavorFilter(ordinaryFilter, [1, 2, 3]);
+const ordinaryHiddenMatched = api.isHiddenMarketplaceFilter(ordinaryFilter, [1, 2, 3]);
+const ordinaryFunctionToStringCalls = functionToStringCalls;
+const buildFlavorFilter = function(e) {{
+  /* !ri(e.marketplaceName)||e.marketplaceName===n */
+  return false;
+}};
+const officialPlugins = [{{ name: "product-design", marketplaceName: "openai-bundled" }}];
+const buildFlavorMatched = api.isBuildFlavorFilter(buildFlavorFilter, officialPlugins);
+const buildFlavorMatchedAgain = api.isBuildFlavorFilter(buildFlavorFilter, officialPlugins);
+const cachedFunctionToStringCalls = functionToStringCalls - ordinaryFunctionToStringCalls;
+Function.prototype.toString = nativeFunctionToString;
+const buildFlavorNothingFiltered = api.isBuildFlavorFilter(buildFlavorFilter, officialPlugins, officialPlugins.slice());
+const buildFlavorShapes = [
+  "e=>!u(e.marketplaceName)||e.marketplaceName===r",
+  "e=>!ne(e.marketplaceName)||e.marketplaceName===n",
+  "e=>!Eu(e.marketplaceName)||e.marketplaceName===n",
+  "e=>!ri(e.marketplaceName)||e.marketplaceName===n",
+  "e=>!$a(e.marketplaceName) || e.marketplaceName === $b",
+  "e=>e.marketplaceName===n",
+  "e=>ri(e.marketplaceName)||e.marketplaceName===`openai-primary-runtime`",
+  "e=>!t.includes(e.name)",
+].map((source) => api.isBuildFlavorFilterSource(source));
 const initial = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
 api.setCodexAppVersion("26.803.41515");
 const latestBroadOmitted = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
@@ -969,6 +1018,14 @@ const remoteUnavailable = api.remoteCatalogUnavailable();
 api.reset();
 const chatGpt = api.patchRequestParams("list-plugins", {{ marketplaceKinds: ["created-by-me-remote"] }});
 const cases = {{
+  ordinaryBuildMatched,
+  ordinaryHiddenMatched,
+  ordinaryFunctionToStringCalls,
+  buildFlavorMatched,
+  buildFlavorMatchedAgain,
+  cachedFunctionToStringCalls,
+  buildFlavorNothingFiltered,
+  buildFlavorShapes,
   initialKinds: initial.marketplaceKinds,
   latestBroadOmittedHasKinds: Object.prototype.hasOwnProperty.call(latestBroadOmitted, "marketplaceKinds"),
   latestBroadOmittedKinds: latestBroadOmitted.marketplaceKinds ?? null,

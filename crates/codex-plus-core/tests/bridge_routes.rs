@@ -213,14 +213,15 @@ async fn settings_routes_use_settings_service() {
     let updated = handle_bridge_request(
         ctx.clone(),
         "/settings/set",
-        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppServiceTierControls": true, "codexAppPetRealMouseLook": true}),
+        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppSessionCopy": false, "codexAppAnswerOutline": false, "codexAppPetRealMouseLook": true}),
     )
     .await;
     let loaded = handle_bridge_request(ctx, "/settings/get", json!({})).await;
 
     assert_eq!(updated["providerSyncEnabled"], true);
     assert_eq!(updated["codexAppSessionDelete"], false);
-    assert_eq!(updated["codexAppServiceTierControls"], true);
+    assert_eq!(updated["codexAppSessionCopy"], false);
+    assert_eq!(updated["codexAppAnswerOutline"], false);
     assert_eq!(updated["codexAppPetRealMouseLook"], true);
     assert_eq!(loaded, updated);
 }
@@ -961,9 +962,10 @@ impl BridgeSettingsService for FakeSettings {
         }
         for key in [
             "codexAppPluginMarketplaceUnlock",
-            "codexAppModelWhitelistUnlock",
             "codexAppSessionDelete",
             "codexAppMarkdownExport",
+            "codexAppSessionCopy",
+            "codexAppAnswerOutline",
             "codexAppForceChineseLocale",
             "codexAppThreadIdBadge",
             "codexAppConversationView",
@@ -971,7 +973,6 @@ impl BridgeSettingsService for FakeSettings {
             "codexAppZedRemoteOpen",
             "codexAppUpstreamWorktreeCreate",
             "codexAppNativeMenuPlacement",
-            "codexAppServiceTierControls",
             "codexAppPetRealMouseLook",
         ] {
             if let Some(value) = payload.get(key).and_then(Value::as_bool) {

@@ -56,7 +56,7 @@ function moduleLoaderRuntime(renderer: string) {
     "document",
     "performance",
     "fetch",
-    "codexServiceTierModulePromises",
+    "codexAppModulePromises",
     source + "\nreturn loadCodexAppModule;",
   ) as (...args: unknown[]) => (namePart: string) => Promise<unknown>;
 
@@ -130,28 +130,29 @@ test("不同前缀各自计数,一个前缀放弃不牵连另一个", async () =
 // 而"守卫被误删"恰恰是最可能发生的回归。
 test("dispatcher 补丁有 in-flight 去重与放弃开关", async () => {
   const renderer = await readRenderer();
-  const start = renderer.indexOf("  function installCodexServiceTierDispatcherPatch() {");
-  assert.ok(start >= 0, "找不到 installCodexServiceTierDispatcherPatch");
+  // 1.3.8 起服务模式下线,补丁更名为 installCodexDispatcherPatch(只剩官方混合模式的 provider 归一)
+  const start = renderer.indexOf("  function installCodexDispatcherPatch() {");
+  assert.ok(start >= 0, "找不到 installCodexDispatcherPatch");
   const body = renderer.slice(start, renderer.indexOf("\n  function ", start + 10));
 
   assert.match(
     body,
-    /codexAppModulesExhausted\(codexServiceTierDispatcherAssetPrefixes\)/,
+    /codexAppModulesExhausted\(codexDispatcherAssetPrefixes\)/,
     "放弃判据必须问负缓存的真实 attempts —— 自己数 scan 轮次的话,1.6 秒就能凑够阈值",
   );
   assert.match(
     body,
-    /if \(serviceTierDispatcherPatchPromise\) return;/,
+    /if \(dispatcherPatchPromise\) return;/,
     "少了 in-flight 去重 —— scan 的频率会直接变成并发全量扫描的频率",
   );
   assert.match(
     body,
-    /if \(!serviceTierDispatcherPatchFailureReported\)/,
+    /if \(!dispatcherPatchFailureReported\)/,
     "少了「只报首次」—— 每轮 scan 都会发一条相同诊断",
   );
   assert.match(
     body,
-    /finally \{\s*serviceTierDispatcherPatchPromise = null;/,
+    /finally \{\s*dispatcherPatchPromise = null;/,
     "in-flight 标志必须在 finally 里清,否则失败一次就永久卡住",
   );
 });
