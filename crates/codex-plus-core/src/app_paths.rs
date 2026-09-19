@@ -7,8 +7,11 @@ use anyhow::{Context, bail};
 #[derive(Debug, Clone, Copy)]
 struct AppPackageSpec {
     identity: &'static str,
+    /// manifest 读不到时的兜底 Application Id(见 packaged_app_user_model_id)。
     app_id: &'static str,
     executable_names: &'static [&'static str],
+    /// 同机并存多个宿主时的优先级,**数值大者优先**,同优先级再比版本。
+    /// ChatGPT-Desktop 的实际优先级是动态的,见 `package_priority`。
     priority: u8,
 }
 
@@ -29,6 +32,13 @@ pub(crate) struct RegisteredWindowsPackage {
     pub install_location: PathBuf,
 }
 
+/// Codex 已迁到新版 ChatGPT Desktop 宿主(上游 f4f9bae):两者并存时优先新宿主。
+/// 但 OpenAI.ChatGPT-Desktop 这个包名**也是老的纯聊天版 ChatGPT**,老版里没有
+/// Codex —— 只有包里真带着 Codex 运行时(`app/resources/codex.exe`)才算宿主,
+/// 否则降到最低,绝不能压过真正的 OpenAI.Codex。
+const CHATGPT_DESKTOP_CODEX_HOST_PRIORITY: u8 = 2;
+const NON_CODEX_HOST_PRIORITY: u8 = 0;
+
 const APP_PACKAGE_SPECS: &[AppPackageSpec] = &[
     AppPackageSpec {
         identity: "OpenAI.Codex",
@@ -46,7 +56,7 @@ const APP_PACKAGE_SPECS: &[AppPackageSpec] = &[
         identity: "OpenAI.ChatGPT-Desktop",
         app_id: "App",
         executable_names: CODEX_PACKAGE_EXECUTABLES,
-        priority: 1,
+        priority: CHATGPT_DESKTOP_CODEX_HOST_PRIORITY,
     },
 ];
 
@@ -60,15 +70,10 @@ pub fn find_latest_codex_app_dir(root: &Path) -> Option<PathBuf> {
             let spec = package_spec_from_path(&path)?;
             let version = version_tuple(&path)?;
             let app_dir = package_entry_dir(&path, spec)?;
-            Some((spec.priority, version, app_dir))
+            Some((package_priority(spec, &app_dir), version, app_dir))
         })
         .collect::<Vec<_>>();
-    matches.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .reverse()
-            .then_with(|| left.1.cmp(&right.1))
-    });
+    matches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     let (_, _, latest) = matches.pop()?;
     Some(latest)
 }
@@ -83,8 +88,15 @@ pub fn find_latest_codex_app_dir_from_roots(roots: &[PathBuf]) -> Option<PathBuf
 pub fn find_latest_codex_app_dir_default() -> Option<PathBuf> {
     #[cfg(windows)]
     {
+        // 系统注册信息是 Store 当前状态的权威来源(上游 f4f9bae / be67b30):
+        // WindowsApps 下常有**未注册的残留目录**(商店更新中途/回滚后留下的
+        // 更高版本号目录),按目录名版本号挑会挑中它 —— 实测 26.915.4065 残留
+        // 目录压过了真正注册的 26.915.3509。注册查询失败(或一个都没有)才退回
+        // 目录扫描;何况 WindowsApps 普通用户通常根本列不出来。
+        if let Ok(Some(registered)) = find_latest_codex_app_dir_from_appx_package() {
+            return Some(registered);
+        }
         find_latest_codex_app_dir_from_roots(&windows_app_package_roots())
-            .or_else(find_latest_codex_app_dir_from_appx_package)
     }
 
     #[cfg(not(windows))]
@@ -94,24 +106,34 @@ pub fn find_latest_codex_app_dir_default() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn find_latest_codex_app_dir_from_appx_package() -> Option<PathBuf> {
-    registered_windows_packages()
-        .ok()?
+fn find_latest_codex_app_dir_from_appx_package() -> anyhow::Result<Option<PathBuf>> {
+    Ok(latest_registered_app_dir(
+        registered_windows_packages()?,
+        |_| true,
+    ))
+}
+
+/// 已注册包里挑最合适的 app 目录;`accept` 用来把范围收窄到某个包身份。
+#[cfg(windows)]
+fn latest_registered_app_dir(
+    packages: Vec<RegisteredWindowsPackage>,
+    accept: impl Fn(&AppPackageSpec) -> bool,
+) -> Option<PathBuf> {
+    packages
         .into_iter()
-        .filter(|package| is_supported_windows_app_package_name(&package.full_name))
+        .filter(|package| {
+            codex_package_parts(&package.full_name).is_some_and(|(spec, _, _)| accept(&spec))
+        })
         .filter_map(|package| normalize_codex_app_path(&package.install_location))
         .max_by(compare_app_dir_candidates)
 }
 
+/// **不缓存**:原先是进程级 OnceLock,而微信连接 / 手机远程会在启动很久之后
+/// 才调 `find_codex_cli` —— 期间商店把 Codex 更新了,拿到的还是旧目录(旧目录
+/// 随后被系统删掉,子进程直接起不来)。几次 Win32 调用的开销可以忽略。
 #[cfg(windows)]
 pub(crate) fn registered_windows_packages() -> anyhow::Result<Vec<RegisteredWindowsPackage>> {
-    use std::sync::OnceLock;
-
-    static PACKAGES: OnceLock<Result<Vec<RegisteredWindowsPackage>, String>> = OnceLock::new();
-    PACKAGES
-        .get_or_init(|| query_registered_windows_packages().map_err(|error| error.to_string()))
-        .clone()
-        .map_err(anyhow::Error::msg)
+    query_registered_windows_packages()
 }
 
 #[cfg(windows)]
@@ -119,12 +141,23 @@ fn query_registered_windows_packages() -> anyhow::Result<Vec<RegisteredWindowsPa
     let mut packages = Vec::new();
     for family_name in OPENAI_PACKAGE_FAMILY_NAMES {
         for full_name in package_full_names_for_family(family_name)? {
-            let install_location = package_path_by_full_name(&full_name)
-                .with_context(|| format!("failed to resolve registered package {full_name}"))?;
-            packages.push(RegisteredWindowsPackage {
-                full_name,
-                install_location,
-            });
+            // 单个包查不到路径(比如正在更新/注册中)就跳过它,别连累同族或别的族里
+            // 好好的包 —— 原先一个 `?` 整批作废,退回到会挑中残留目录的目录扫描。
+            match package_path_by_full_name(&full_name) {
+                Ok(install_location) => packages.push(RegisteredWindowsPackage {
+                    full_name,
+                    install_location,
+                }),
+                Err(error) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "app_paths.registered_package_path_failed",
+                        serde_json::json!({
+                            "full_name": full_name,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                }
+            }
         }
     }
     Ok(packages)
@@ -331,10 +364,51 @@ pub fn resolve_codex_app_dir_with_saved(
     {
         // 已保存路径无效（例如误选 Codex++）时回退自动探测
         if let Some(path) = normalize_codex_app_path(Path::new(saved)) {
+            #[cfg(windows)]
+            if let Some(spec) = package_spec_from_path(&path) {
+                // Store 更新会生成新的版本目录:保存的旧目录即使还在,也不该压过
+                // 当前注册的版本(上游 be67b30)。但只在**同一个包身份**里换新 ——
+                // 用户点名要 OpenAI.Codex,不能因为装了 ChatGPT 就被换走。
+                // 注册查询失败/查不到时保留已保存路径,兼容离线或受限环境。
+                let current = registered_windows_packages().map(|packages| {
+                    latest_registered_app_dir(packages, |candidate| {
+                        candidate.identity == spec.identity
+                    })
+                });
+                return Some(resolve_saved_store_path(path, current));
+            }
             return Some(path);
         }
     }
     resolve_codex_app_dir(None)
+}
+
+/// 激活重试时重新解析包目录:同一包身份下**当前注册**的版本(商店更新期间会变)。
+/// 查不到或非 Store 包返回 None,调用方沿用原目录。
+pub fn reresolve_packaged_app_dir(app_dir: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let spec = package_spec_from_path(app_dir)?;
+        latest_registered_app_dir(registered_windows_packages().ok()?, |candidate| {
+            candidate.identity == spec.identity
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app_dir;
+        None
+    }
+}
+
+/// 已保存的 Store 路径 vs 当前注册的同身份包:查到就用当前的,查不到保留原值。
+pub fn resolve_saved_store_path(
+    saved_path: PathBuf,
+    current: anyhow::Result<Option<PathBuf>>,
+) -> PathBuf {
+    match current {
+        Ok(Some(current)) => current,
+        Ok(None) | Err(_) => saved_path,
+    }
 }
 
 pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
@@ -461,7 +535,81 @@ pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
     if publisher_id.is_empty() {
         return None;
     }
-    Some(format!("{}_{publisher_id}!{}", spec.identity, spec.app_id))
+    // 应用段原先写死 `App`。新版 ChatGPT Desktop(1.2026.190.0)改了 manifest 里的
+    // Application Id,拿 `App` 去激活直接 0x80270254(上游 2a41afb,#2148;上游
+    // main 后来的合并把这段弄丢了,这里按 2a41afb 的意图重写)。
+    // 优先读包里真实的 AppxManifest.xml,读不到再退回历史默认值。
+    let app_id = packaged_manifest_app_id(app_dir).unwrap_or_else(|| spec.app_id.to_string());
+    Some(format!("{}_{publisher_id}!{app_id}", spec.identity))
+}
+
+fn packaged_manifest_app_id(app_dir: &Path) -> Option<String> {
+    let package_dir = if app_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("app"))
+    {
+        app_dir.parent()?
+    } else {
+        app_dir
+    };
+    let manifest = std::fs::read_to_string(package_dir.join("AppxManifest.xml")).ok()?;
+    manifest_application_id(&manifest)
+}
+
+/// AppxManifest.xml 里主程序那个 `<Application>` 的 Id,即 AUMID `!` 之后的部分。
+///
+/// 一个包可以声明多个 Application —— 实测 OpenAI.Codex 26.915 就有两个:
+/// `App`(app/ChatGPT.exe)和 `CodexCoreCommandRunner`(命令执行器)。所以先找
+/// Executable 指向主程序(ChatGPT.exe / Codex.exe)的那个,找不到才取第一个。
+pub fn manifest_application_id(manifest: &str) -> Option<String> {
+    let mut first = None;
+    let mut rest = manifest;
+    while let Some(pos) = rest.find("<Application") {
+        rest = &rest[pos + "<Application".len()..];
+        // 跳过 <Applications> 这类容器节点,只看 <Application ...>。
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let tag_end = rest.find('>')?;
+        let tag = &rest[..tag_end];
+        rest = &rest[tag_end..];
+        let Some(id) = xml_attribute_value(tag, "Id").filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let is_main_executable = xml_attribute_value(tag, "Executable").is_some_and(|exe| {
+            exe.rsplit(['/', '\\'])
+                .next()
+                .is_some_and(is_supported_app_executable_name)
+        });
+        if is_main_executable {
+            return Some(id);
+        }
+        first.get_or_insert(id);
+    }
+    first
+}
+
+fn xml_attribute_value(tag: &str, name: &str) -> Option<String> {
+    let mut rest = tag;
+    while let Some(pos) = rest.find(name) {
+        let before = rest[..pos].chars().next_back();
+        let after = &rest[pos + name.len()..];
+        rest = after;
+        // 必须是完整属性名:前面是空白、后面(可隔空白)紧跟 `=`。
+        if !before.is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let Some(value) = after.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim_start();
+        let quote = value.chars().next().filter(|ch| *ch == '"' || *ch == '\'')?;
+        let value = &value[1..];
+        let end = value.find(quote)?;
+        return Some(value[..end].to_string());
+    }
+    None
 }
 
 fn package_name_from_app_dir(app_dir: &Path) -> Option<String> {
@@ -609,7 +757,7 @@ fn compare_app_dir_candidates(left: &PathBuf, right: &PathBuf) -> std::cmp::Orde
     app_dir_sort_key(left).cmp(&app_dir_sort_key(right))
 }
 
-fn app_dir_sort_key(app_dir: &Path) -> Option<(std::cmp::Reverse<u8>, Vec<u32>)> {
+fn app_dir_sort_key(app_dir: &Path) -> Option<(u8, Vec<u32>)> {
     let spec = package_spec_from_path(app_dir)?;
     let package_dir = if app_dir
         .file_name()
@@ -620,10 +768,30 @@ fn app_dir_sort_key(app_dir: &Path) -> Option<(std::cmp::Reverse<u8>, Vec<u32>)>
     } else {
         app_dir
     };
-    Some((
-        std::cmp::Reverse(spec.priority),
-        version_tuple(package_dir)?,
-    ))
+    Some((package_priority(spec, app_dir), version_tuple(package_dir)?))
+}
+
+/// 见 `CHATGPT_DESKTOP_CODEX_HOST_PRIORITY`:ChatGPT-Desktop 只有真带 Codex
+/// 运行时才算宿主。`app_dir` 可以是包目录或其下的 `app`。
+fn package_priority(spec: AppPackageSpec, app_dir: &Path) -> u8 {
+    if spec.priority != CHATGPT_DESKTOP_CODEX_HOST_PRIORITY {
+        return spec.priority;
+    }
+    let entry = if app_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("app"))
+    {
+        app_dir.to_path_buf()
+    } else {
+        app_dir.join("app")
+    };
+    let resources = entry.join("resources");
+    if resources.join("codex.exe").is_file() || resources.join("codex").is_file() {
+        spec.priority
+    } else {
+        NON_CODEX_HOST_PRIORITY
+    }
 }
 
 fn package_entry_dir(package_dir: &Path, spec: AppPackageSpec) -> Option<PathBuf> {
@@ -663,9 +831,14 @@ fn codex_package_parts(package_name: &str) -> Option<(AppPackageSpec, &str, &str
         let Some((version, rest)) = rest.split_once('_') else {
             continue;
         };
-        let Some((_, publisher_id)) = rest.rsplit_once("__") else {
+        // full name 形如 `Name_Version_Arch_ResourceId_PublisherId`:ResourceId 通常
+        // 为空(`x64__pub`),也可能是 `~`(`neutral_~_pub`)。取最后一段即可。
+        let Some((_, publisher_id)) = rest.rsplit_once('_') else {
             continue;
         };
+        if publisher_id.is_empty() {
+            continue;
+        }
         return Some((*spec, version, publisher_id));
     }
     None

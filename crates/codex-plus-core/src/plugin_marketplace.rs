@@ -72,6 +72,136 @@ pub fn ensure_openai_curated_marketplace_config(home: &Path) -> anyhow::Result<b
     Ok(changed)
 }
 
+/// 启动时对 `~/.codex/.tmp/plugins*` 做的非配置类维护(目前只有旧品牌简介改写)。
+/// 不写 config.toml。
+pub fn refresh_marketplace_branding(home: &Path) -> bool {
+    refresh_remote_marketplace_branding(home).unwrap_or(false)
+}
+
+/// 清理结果:删了哪些条目、备份放在哪。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReservedMarketplaceCleanup {
+    pub removed: Vec<String>,
+    pub backup: Option<PathBuf>,
+}
+
+/// 清掉**我们**以前写进 config.toml 的 `[marketplaces.openai-curated]` /
+/// `[marketplaces.openai-api-curated]`。
+///
+/// 为什么不再写(1.3.8 起):
+///   - `openai-*` 是 Codex 的保留名,注册在它们下面的本地 marketplace 会被静默
+///     忽略(上游 02a23e1 实测)—— 这两条从来没起过作用;
+///   - 插件市场解锁靠的是注入脚本的桥补丁:helper 直接读 `~/.codex/.tmp/plugins`
+///     下的 marketplace.json / api_marketplace.json 注入页面(assets.rs
+///     `local_plugin_marketplaces`),再在 `list-plugins` 请求/响应上合并
+///     (plugin_marketplace_bridge_patch_installed / plugin_marketplace_local_merged),
+///     全程不经过 config.toml;
+///   - 它还是 config.toml 的又一个写入方,绕开了托管块写入契约(codexcfg 的
+///     校验/备份那一套)。
+///
+/// 只删能证明是我们写的:表里恰好只有 `source_type = "local"` 和 `source`,且
+/// `source` 指向我们登记的那个目录(`<home>/.tmp/plugins`,可带 `\\?\` 前缀)。
+/// 用户手工加的、Codex 自己写的(比如 `openai-bundled` / `openai-primary-runtime`)
+/// 一概不碰。第一次真要删之前把整份 config.toml 备份到
+/// `config.toml.recodex-marketplace-cleanup.bak`(已存在就不覆盖,留住最初的样子)。
+pub fn cleanup_recodex_reserved_marketplace_configs(
+    home: &Path,
+) -> anyhow::Result<ReservedMarketplaceCleanup> {
+    let config_path = home.join("config.toml");
+    let existing = match std::fs::read(&config_path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            // 不是 UTF-8 就不是我们能安全改的文件,别动。
+            Err(_) => return Ok(ReservedMarketplaceCleanup::default()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReservedMarketplaceCleanup::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
+        }
+    };
+    let Some((updated, removed)) = remove_recodex_reserved_marketplaces(&existing, home) else {
+        return Ok(ReservedMarketplaceCleanup::default());
+    };
+    // 结果必须还能被读回去,读不回去就放弃(与 codexcfg 的 refuse_if_would_break 同一条闸)。
+    if updated.trim_start_matches('\u{feff}').parse::<DocumentMut>().is_err() {
+        anyhow::bail!("refusing to write config.toml: cleanup result would not parse");
+    }
+    let backup = config_path.with_file_name("config.toml.recodex-marketplace-cleanup.bak");
+    if !backup.exists() {
+        crate::settings::atomic_write(&backup, existing.as_bytes())
+            .with_context(|| format!("failed to back up {}", config_path.display()))?;
+    }
+    crate::settings::atomic_write(&config_path, updated.as_bytes())?;
+    Ok(ReservedMarketplaceCleanup {
+        removed,
+        backup: Some(backup),
+    })
+}
+
+/// 纯文本版本:返回 (改后的文本, 删掉的条目名);没有可删的返回 None。
+/// 用 toml_edit 就地删表,其余内容(注释、顺序、格式)原样保留。
+pub fn remove_recodex_reserved_marketplaces(
+    config_text: &str,
+    home: &Path,
+) -> Option<(String, Vec<String>)> {
+    let had_bom = config_text.starts_with('\u{feff}');
+    let mut doc = config_text
+        .trim_start_matches('\u{feff}')
+        .parse::<DocumentMut>()
+        .ok()?;
+    let managed_root = home.join(".tmp").join("plugins");
+    let marketplaces = doc.get_mut("marketplaces")?.as_table_mut()?;
+    let mut removed = Vec::new();
+    for name in [OPENAI_CURATED_MARKETPLACE, OPENAI_API_CURATED_MARKETPLACE] {
+        let ours = marketplaces
+            .get(name)
+            .and_then(Item::as_table)
+            .is_some_and(|table| is_recodex_marketplace_table(table, &managed_root));
+        if ours {
+            marketplaces.remove(name);
+            removed.push(name.to_string());
+        }
+    }
+    if removed.is_empty() {
+        return None;
+    }
+    // `[marketplaces]` 本身若只是个隐式父表且已空,一并去掉;显式写过的空表保留。
+    if marketplaces.is_empty() && marketplaces.is_implicit() {
+        doc.as_table_mut().remove("marketplaces");
+    }
+    let mut text = doc.to_string();
+    if had_bom {
+        text.insert(0, '\u{feff}');
+    }
+    Some((text, removed))
+}
+
+fn is_recodex_marketplace_table(table: &Table, managed_root: &Path) -> bool {
+    if table.len() != 2 {
+        return false;
+    }
+    let source_type = table.get("source_type").and_then(Item::as_str);
+    let source = table.get("source").and_then(Item::as_str);
+    let (Some("local"), Some(source)) = (source_type, source) else {
+        return false;
+    };
+    let normalize = |value: &str| {
+        normalize_windows_extended_path(value)
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let expected = normalize(&managed_root.to_string_lossy());
+    let actual = normalize(source);
+    if cfg!(windows) {
+        actual.eq_ignore_ascii_case(&expected)
+    } else {
+        actual == expected
+    }
+}
+
 pub fn ensure_openai_curated_remote_marketplace_config(home: &Path) -> anyhow::Result<bool> {
     let Some(marketplace_root) = local_openai_curated_remote_marketplace_root(home)? else {
         return Ok(false);
@@ -888,6 +1018,70 @@ mod tests {
                 .as_str()
             )
         );
+    }
+
+    #[test]
+    fn cleanup_removes_only_the_reserved_entries_we_wrote() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        write_marketplace(home);
+        // 先按旧行为写一遍(1.3.7 及以前启动时会做的事)。
+        ensure_openai_curated_marketplace_config(home).unwrap();
+        let config_path = home.join("config.toml");
+        let mut before = std::fs::read_to_string(&config_path).unwrap();
+        before = format!(
+            "# 用户的注释\nmodel = \"gpt-5\"\n\n{before}\n[marketplaces.openai-bundled]\nsource_type = \"local\"\nsource = '\\\\?\\C:\\codex\\.tmp\\bundled-marketplaces\\openai-bundled'\n\n[marketplaces.my-kit]\nsource_type = \"local\"\nsource = \"/somewhere\"\n"
+        );
+        std::fs::write(&config_path, &before).unwrap();
+
+        let result = cleanup_recodex_reserved_marketplace_configs(home).unwrap();
+        assert_eq!(
+            result.removed,
+            vec!["openai-curated".to_string(), "openai-api-curated".to_string()]
+        );
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!after.contains("[marketplaces.openai-curated]"), "{after}");
+        assert!(!after.contains("[marketplaces.openai-api-curated]"), "{after}");
+        assert!(after.contains("[marketplaces.openai-bundled]"), "{after}");
+        assert!(after.contains("[marketplaces.my-kit]"), "{after}");
+        assert!(after.contains("# 用户的注释"), "{after}");
+        assert!(after.contains("model = \"gpt-5\""), "{after}");
+
+        // 备份是改之前的原样;第二次什么都不做、也不覆盖备份。
+        let backup = result.backup.unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), before);
+        let again = cleanup_recodex_reserved_marketplace_configs(home).unwrap();
+        assert!(again.removed.is_empty());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), after);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), before);
+    }
+
+    #[test]
+    fn cleanup_leaves_user_owned_reserved_entries_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let plugins = home.join(".tmp").join("plugins");
+        let text = format!(
+            "[marketplaces.openai-curated]\nsource_type = \"local\"\nsource = \"/elsewhere\"\n\n[marketplaces.openai-api-curated]\nsource_type = \"local\"\nsource = {:?}\nnote = \"mine\"\n",
+            plugins.to_string_lossy()
+        );
+        assert_eq!(remove_recodex_reserved_marketplaces(&text, home), None);
+        std::fs::write(home.join("config.toml"), &text).unwrap();
+        let result = cleanup_recodex_reserved_marketplace_configs(home).unwrap();
+        assert!(result.removed.is_empty());
+        assert!(result.backup.is_none());
+        assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), text);
+        assert!(!home.join("config.toml.recodex-marketplace-cleanup.bak").exists());
+    }
+
+    #[test]
+    fn cleanup_drops_the_now_empty_implicit_marketplaces_table() {
+        let home = Path::new("/h");
+        let text = "model = \"x\"\n\n[marketplaces.openai-curated]\nsource_type = \"local\"\nsource = '\\\\?\\/h/.tmp/plugins'\n";
+        let (updated, removed) = remove_recodex_reserved_marketplaces(text, home).unwrap();
+        assert_eq!(removed, vec!["openai-curated".to_string()]);
+        assert!(!updated.contains("marketplaces"), "{updated}");
+        assert!(updated.contains("model = \"x\""));
     }
 
     #[test]

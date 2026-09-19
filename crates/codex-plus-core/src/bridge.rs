@@ -94,8 +94,21 @@ pub fn build_bridge_script(binding_name: &str) -> String {
     format!(
         r#"
 (() => {{
+  // 桥可能在请求进行中被重新注入(看门狗/换代)。旧做法直接换一个新 Map,旧
+  // resolver 被静默丢掉,调用方的 Promise 永久 pending —— 面板表现为一直「读取中」。
+  // 这里先把还挂着的请求统统以失败了结(上游 a7cb8d2)。
+  const previousCallbacks = window.__codexSessionDeleteCallbacks;
+  if (previousCallbacks && typeof previousCallbacks.forEach === "function") {{
+    previousCallbacks.forEach((callback) => {{
+      try {{ callback.resolve({{ status: "failed", message: "桥接已重新连接,请重试" }}); }} catch {{}}
+    }});
+  }}
   window.__codexSessionDeleteCallbacks = new Map();
-  window.__codexSessionDeleteSeq = 0;
+  // 序号**不归零**:上一代桥迟到的响应带的是旧 id,归零后会撞上新请求的同号 id,
+  // 把别人的结果塞给新请求。
+  window.__codexSessionDeleteSeq = Number.isFinite(window.__codexSessionDeleteSeq)
+    ? window.__codexSessionDeleteSeq
+    : 0;
   window.__codexSessionDeleteResolve = (id, result) => {{
     const callback = window.__codexSessionDeleteCallbacks.get(id);
     if (!callback) return;
@@ -810,4 +823,55 @@ fn extract_string_field(input: &str, field: &str) -> Option<String> {
 
 fn next_message_id() -> u64 {
     NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 重新注入时:挂着的请求以失败了结(不是永久 pending),序号接着往上数。
+    /// 用 node 真跑一遍脚本;机器上没有 node 就跳过(只做字符串断言的那条在
+    /// tests/cdp_bridge.rs 里)。
+    #[test]
+    fn reinjection_settles_pending_callbacks_and_keeps_sequence() {
+        let script = build_bridge_script("__testBinding");
+        let harness = format!(
+            r#"
+globalThis.window = globalThis;
+const sent = [];
+window.__testBinding = (raw) => sent.push(JSON.parse(raw));
+const inject = () => {{ {script} }};
+inject();
+const pending = window.__codexSessionDeleteBridge("/backend/status", {{}});
+inject();
+const next = window.__codexSessionDeleteBridge("/backend/status", {{}});
+const timeout = new Promise((resolve) => setTimeout(() => resolve("pending"), 500));
+Promise.race([pending, timeout]).then((result) => {{
+  console.log(JSON.stringify({{ result, ids: sent.map((m) => m.id), waiting: window.__codexSessionDeleteCallbacks.size }}));
+  process.exit(0);
+}});
+void next;
+"#
+        );
+        let output = match std::process::Command::new("node")
+            .arg("-e")
+            .arg(&harness)
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => {
+                eprintln!("跳过:没有 node");
+                return;
+            }
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["result"]["status"], "failed", "{value}");
+        assert_eq!(value["ids"], serde_json::json!(["1", "2"]), "{value}");
+        assert_eq!(value["waiting"], 1, "{value}");
+    }
 }

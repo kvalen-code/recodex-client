@@ -160,6 +160,8 @@ async fn main() -> Result<()> {
                 codex_app: options
                     .app_dir
                     .map(|path| path.to_string_lossy().to_string()),
+                // AUMID 与错误码已写进 message(见 PackagedActivationFailure::into_error)。
+                aumid: None,
             });
         }
         return Err(error);
@@ -314,17 +316,9 @@ async fn launcher_main(
     // 还要 1 秒左右才退出,不等的话会误判成「已有实例」而直接退出,页面就失去后端。
     let await_guard = args.iter().any(|arg| arg == "--await-guard");
     let Some(_guard) = acquire_guard_maybe_waiting(options.debug_port, await_guard)? else {
+        // latest-status.json 归主实例所有,这里不写:它记着主实例**实际**的调试/helper
+        // 端口,拿本进程的请求值覆盖掉,下一个 launcher 就读不到真实端口了。
         activate_existing_codex_app(&options).await?;
-        options.status_store.save_latest(&LaunchStatus {
-            status: "running".to_string(),
-            message: "Existing Codex instance activated".to_string(),
-            started_at_ms: current_timestamp_ms(),
-            debug_port: Some(options.debug_port),
-            helper_port: Some(options.helper_port),
-            codex_app: options
-                .app_dir
-                .map(|path| path.to_string_lossy().to_string()),
-        })?;
         return Ok(());
     };
     // recodex-overlay: 旧 exe / 旧引用 / 卸载项版本号 / 旧数据残留的清理,后台线程做,不拖慢启动。
@@ -450,7 +444,6 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
 
 async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
     let hooks = LauncherHooks::default();
-    let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
@@ -468,19 +461,23 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             json!({"blocking_process_ids": blocking_process_ids}),
         );
     }
+    // 主实例在用的端口以它写的 latest-status.json 为准(见 existing_instance_ports)。
+    let primary = codex_plus_core::launcher::resolve_existing_instance_ports(
+        &options.status_store,
+        options.debug_port,
+        options.helper_port,
+    );
     let launch_result = hooks
         .launch_codex(
             &app_dir,
-            options.debug_port,
+            primary.debug_port,
             &settings,
             &settings.codex_extra_args,
         )
         .await;
-    if settings.enhancements_enabled {
-        // 接住实际绑定端口:下面的 ensure_injection / start_bridge_watchdog 都用它,
-        // 换过端口还拿旧值 = 注入和看门狗一直连一个没人监听的地址。
-        helper_port = hooks.start_helper(helper_port).await?;
-    }
+    // 这里**不**起自己的 helper、不注入、不起看门狗:本进程马上就退出,旧做法会把
+    // 页面的 helperBase 改指到本进程的临时端口,进程一退面板就对着死端口(线上
+    // 实测一次挂了约 9 小时)。主实例的 helper 与看门狗一直在,只确认它还活着。
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     #[cfg(windows)]
     let activated = process_ids
@@ -489,28 +486,21 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         .any(codex_plus_core::windows_activate_process_window);
     #[cfg(not(windows))]
     let activated = false;
-    let injection_ready = if settings.enhancements_enabled {
-        hooks
-            .ensure_injection(options.debug_port, helper_port, &app_dir)
-            .await
+    let primary_helper_port = if settings.enhancements_enabled {
+        codex_plus_core::launcher::wait_for_existing_helper(
+            &primary.helper_ports,
+            std::time::Duration::from_secs(10),
+        )
+        .await
     } else {
-        false
+        None
     };
-    if injection_ready {
-        hooks
-            .start_bridge_watchdog(options.debug_port, helper_port)
-            .await?;
-        hooks.write_status("running").await;
-    } else if settings.enhancements_enabled {
-        hooks.write_status("running_degraded").await;
-        // 「激活已在运行的 Codex」这条路同样会降级,别让它成为唯一不吭声的分支。
-        //
-        // 用**阻塞**版:这条路返回之后 launcher_main 紧跟着就 `return Ok(())`,
-        // 进程随即退出。Windows 上那条弹窗线程会跟着被掐掉,对话框一闪而过 ——
-        // 判据不是「是不是致命错误」,而是「提示之后进程还活不活着」。
+    let helper_available = !settings.enhancements_enabled || primary_helper_port.is_some();
+    if !helper_available {
+        // 用**阻塞**版:这条路返回之后进程随即退出,非阻塞弹窗会一闪而过。
         codex_plus_core::user_alert::alert_once_blocking(
             "ReCodex 增强功能未启动",
-            "已经切回正在运行的 Codex,但汉化、宠物、侧边栏等增强功能没能接上。
+            "已经切回正在运行的 Codex,但汉化、宠物、侧边栏等增强功能的后台服务没有在运行。
 请先完全退出 Codex,再用 ReCodex 重新启动;若仍然不行请联系客服。",
         );
     }
@@ -518,14 +508,16 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         "launcher.activate_existing_codex",
         json!({
             "app_dir": app_dir.to_string_lossy(),
-            "debug_port": options.debug_port,
-            "helper_port": helper_port,
+            "debug_port": primary.debug_port,
+            "requested_debug_port": options.debug_port,
+            "helper_port": primary_helper_port,
+            "helper_candidates": primary.helper_ports,
             "requested_helper_port": options.helper_port,
             "process_ids": process_ids,
             "activated": activated,
-            "injection_ready": injection_ready,
+            "helper_available": helper_available,
             "launch_ok": launch_result.is_ok(),
-            "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
+            "launch_error": launch_result.as_ref().err().map(|error| format!("{error:#}"))
         }),
     );
     launch_result.map(|_| ())
@@ -1361,7 +1353,6 @@ mod tests {
         assert!(source.contains("acquire_single_instance_guard(options.debug_port)?"));
         assert!(source.contains("launcher_guard_port"));
         assert!(source.contains("launcher.already_running"));
-        assert!(source.contains("Existing Codex instance activated"));
         assert!(source.contains("status: \"failed\".to_string()"));
     }
 
@@ -1386,6 +1377,40 @@ mod tests {
         assert!(body[recovery..launch].contains("should_finalize_pending_remote_control_recovery"));
         assert!(
             body[recovery..launch].contains("hooks.run_remote_control_session_recovery().await?")
+        );
+    }
+
+    /// 上游 acdf0ec 同款守卫:第二个 launcher 只激活窗口、确认主实例 helper 活着,
+    /// 不起自己的 helper / 注入 / 看门狗(否则页面 helperBase 被改指到本进程的临时
+    /// 端口,本进程一退面板就对着死端口),也不覆盖主实例的 latest-status.json。
+    #[test]
+    fn existing_launcher_path_reuses_the_primary_launcher_runtime() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn activate_existing_codex_app")
+            .expect("existing launcher activation function");
+        let end = source[start..]
+            .find("fn should_finalize_pending_remote_control_recovery")
+            .map(|offset| start + offset)
+            .expect("next function after existing launcher activation");
+        let body = &source[start..end];
+
+        assert!(!body.contains("hooks.start_helper"));
+        assert!(!body.contains("hooks.ensure_injection"));
+        assert!(!body.contains("hooks.start_bridge_watchdog"));
+        assert!(!body.contains("select_helper_port"));
+        assert!(body.contains("resolve_existing_instance_ports("));
+        assert!(body.contains("wait_for_existing_helper("));
+        assert!(body.contains("primary.debug_port"));
+
+        let launcher_main = &source[source.find("async fn launcher_main(").unwrap()..];
+        let guard_else = &launcher_main[launcher_main
+            .find("acquire_guard_maybe_waiting(options.debug_port, await_guard)?")
+            .unwrap()..];
+        let branch = &guard_else[..guard_else.find("return Ok(());").unwrap()];
+        assert!(
+            !branch.contains("save_latest"),
+            "已有实例分支不能覆盖主实例的 latest-status.json"
         );
     }
 

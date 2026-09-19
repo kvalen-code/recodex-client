@@ -120,6 +120,11 @@ fn settings_path_for_tests() -> Option<PathBuf> {
 
 static SETTINGS_PATH_FOR_TESTS: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
+/// 测试是否把设置路径指到了别处(`set_settings_path_for_tests`)。
+pub fn settings_path_overridden_for_tests() -> bool {
+    settings_path_for_tests().is_some()
+}
+
 #[cfg(test)]
 static SETTINGS_PATH_TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
