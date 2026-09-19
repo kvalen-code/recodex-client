@@ -16,10 +16,24 @@ use super::layout::{REMOTE_HOME_ENV, RemoteHome, RuntimeCurrent};
 /// `pair --json` 的一行事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairEvent {
-    Waiting { public_key: String, qr: String },
-    Authorized { machine_id: String },
-    AlreadyPaired { machine_id: String },
-    Error { message: String },
+    Waiting {
+        public_key: String,
+        qr: String,
+        /// 运行时以 `--bind-approver` 起来、会核对批准方(docs/remote-app-plan.md §2.4.1)。
+        /// 没有这一位 = 老运行时,它不核对 —— 这时**不能**登记跟随账号请求。
+        approver_check: bool,
+    },
+    Authorized {
+        machine_id: String,
+    },
+    AlreadyPaired {
+        machine_id: String,
+    },
+    Error {
+        message: String,
+        /// 机读错误码(§2.4.1 的四个批准方相关码);普通失败为空。
+        code: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,10 +43,37 @@ struct RawPairEvent {
     public_key: String,
     #[serde(default)]
     qr: String,
+    #[serde(default, rename = "approverCheck")]
+    approver_check: bool,
     #[serde(default, rename = "machineId")]
     machine_id: String,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    code: String,
+}
+
+/// 运行时 error 事件里的机读码(与远程组件 commands/pair.ts 的 PairErrorCode 一致)。
+pub const PAIR_ERR_APPROVER_MISMATCH: &str = "approver_mismatch";
+pub const PAIR_ERR_APPROVER_MISSING: &str = "approver_missing";
+pub const PAIR_ERR_APPROVER_CHECK_FAILED: &str = "approver_check_failed";
+pub const PAIR_ERR_RELAY_ANSWER_CONSUMED: &str = "relay_answer_consumed";
+
+/// 往运行时 stdin 写的一行指示(§2.4.1):后台记下的批准方(中继账号 id + 内容公钥)。
+pub fn approver_directive(public_key: &str, account_id: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "account": account_id,
+            "key": public_key,
+            "type": "approver",
+        })
+    )
+}
+
+/// 往运行时 stdin 写的一行指示(§2.4.1):这次没有后台记录(只能扫码),不做绑定。
+pub fn unbound_directive() -> String {
+    format!("{}\n", serde_json::json!({ "type": "unbound" }))
 }
 
 /// 解析一行。不是 JSON、事件不认识、或必填字段缺失的行一律跳过 ——
@@ -47,6 +88,7 @@ pub fn parse_pair_event_line(line: &str) -> Option<PairEvent> {
         "waiting" if !raw.public_key.is_empty() && !raw.qr.is_empty() => Some(PairEvent::Waiting {
             public_key: raw.public_key,
             qr: raw.qr,
+            approver_check: raw.approver_check,
         }),
         "authorized" => Some(PairEvent::Authorized {
             machine_id: raw.machine_id,
@@ -56,6 +98,7 @@ pub fn parse_pair_event_line(line: &str) -> Option<PairEvent> {
         }),
         "error" => Some(PairEvent::Error {
             message: raw.message,
+            code: raw.code,
         }),
         _ => None,
     }
@@ -253,7 +296,19 @@ mod tests {
             ),
             Some(PairEvent::Waiting {
                 public_key: "AAAA".into(),
-                qr: "recodex://terminal?abc".into()
+                qr: "recodex://terminal?abc".into(),
+                // 老运行时没有这一位
+                approver_check: false,
+            })
+        );
+        assert_eq!(
+            parse_pair_event_line(
+                r#"{"event":"waiting","publicKey":"AAAA","qr":"recodex://terminal?abc","approverCheck":true}"#
+            ),
+            Some(PairEvent::Waiting {
+                public_key: "AAAA".into(),
+                qr: "recodex://terminal?abc".into(),
+                approver_check: true,
             })
         );
         assert_eq!(
@@ -271,7 +326,17 @@ mod tests {
         assert_eq!(
             parse_pair_event_line(r#"{"event":"error","message":"无法连接中继"}"#),
             Some(PairEvent::Error {
-                message: "无法连接中继".into()
+                message: "无法连接中继".into(),
+                code: String::new(),
+            })
+        );
+        assert_eq!(
+            parse_pair_event_line(
+                r#"{"event":"error","message":"approver mismatch","code":"approver_mismatch"}"#
+            ),
+            Some(PairEvent::Error {
+                message: "approver mismatch".into(),
+                code: PAIR_ERR_APPROVER_MISMATCH.into(),
             })
         );
         for noise in [
@@ -285,6 +350,23 @@ mod tests {
         ] {
             assert_eq!(parse_pair_event_line(noise), None, "{noise}");
         }
+    }
+
+    /// stdin 指示必须严格照 §2.4.1:一行一个 JSON、`\n` 结尾、字段名固定。
+    #[test]
+    fn directives_are_one_json_line_each() {
+        let line = approver_directive("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", "acc_1-x");
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1, "{line}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(line.trim()).unwrap(),
+            serde_json::json!({
+                "type": "approver",
+                "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                "account": "acc_1-x",
+            })
+        );
+        let line = unbound_directive();
+        assert_eq!(line, "{\"type\":\"unbound\"}\n");
     }
 
     #[test]

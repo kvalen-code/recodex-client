@@ -31,9 +31,14 @@ if (cmd === 'status') {
         daemon: { running: has('daemon'), pid: has('daemon') ? 42 : null, version: '0.1.0' } });
 } else if (cmd === 'pair') {
   touch('pair.pid');
+  fs.writeFileSync(flag('pair.args'), process.argv.slice(2).join(' '));
   if (has('paired') && !process.argv.includes('--force')) { out({ event: 'already-paired', machineId: 'm-1' }); process.exit(0); }
   console.log('some noise from a dependency');
-  out({ event: 'waiting', publicKey: 'FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU=', qr: 'recodex://terminal?abc' });
+  // 新运行时会核对批准方(§2.4.1),waiting 里多一个 approverCheck
+  out({ event: 'waiting', publicKey: 'FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU=', qr: 'recodex://terminal?abc',
+        ...(process.argv.includes('--bind-approver') ? { approverCheck: true } : {}) });
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => fs.appendFileSync(flag('directives.log'), chunk));
   const timer = setInterval(() => {
     if (has('approve')) { clearInterval(timer); rm('approve'); touch('paired'); out({ event: 'authorized', machineId: 'm-1' }); process.exit(0); }
   }, 50);
@@ -141,6 +146,25 @@ async fn full_flow_with_a_fake_runtime() {
     assert!(waiting["phoneNote"].as_str().unwrap().contains("登录"));
     assert!(!waiting["machineName"].as_str().unwrap().is_empty());
     assert!(home.join("pair.pid").exists());
+    assert!(
+        std::fs::read_to_string(home.join("pair.args"))
+            .unwrap()
+            .contains("--bind-approver"),
+        "运行时必须以 pair --json --bind-approver 起来(§2.4.1)"
+    );
+    // 没有后台记录时要明确告诉运行时这次不做批准方绑定,不然它会等满 30 秒再报 approver_missing
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(home.join("directives.log")).unwrap_or_default()
+        != "{\"type\":\"unbound\"}
+"
+    {
+        assert!(
+            Instant::now() < deadline,
+            "没等到 unbound 指示:{:?}",
+            std::fs::read_to_string(home.join("directives.log"))
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // 手机那边完成(扫码)→ 运行时给出 authorized → 拉起守护进程
     std::fs::write(home.join("approve"), b"").unwrap();
