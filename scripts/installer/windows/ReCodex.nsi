@@ -100,6 +100,13 @@ Section "Uninstall"
   Delete "$INSTDIR\recodex.exe"
   ; 旧名字也清掉:从改名前的版本升上来的机器上,它可能还躺在这儿
   Delete "$INSTDIR\codex-plus-plus.exe"
+  ; 自更新(.old/.new)与旧名接班(.migrating)留下的残留:不清的话 RMDir 删不掉目录
+  Delete "$INSTDIR\recodex.exe.old"
+  Delete "$INSTDIR\recodex.exe.new"
+  Delete "$INSTDIR\recodex.exe.migrating"
+  Delete "$INSTDIR\codex-plus-plus.exe.old"
+  Delete "$INSTDIR\codex-plus-plus.exe.new"
+  Delete "$INSTDIR\codex-plus-plus.exe.migrating"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 
@@ -107,6 +114,11 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\ReCodex\ReCodex.lnk"
   Delete "$SMPROGRAMS\ReCodex\卸载 ReCodex.lnk"
   RMDir "$SMPROGRAMS\ReCodex"
+
+  ; 开机自启项:从 Codex++ 迁移过来的机器上,启动时会把指向我们的 CodexPlusPlusWatcher
+  ; 改名成 ReCodexWatcher。新名字只可能是我们的;旧名字上游也在用,这里不碰。
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "ReCodexWatcher"
+  Delete "$SMSTARTUP\ReCodexWatcher.lnk"
 
   DeleteRegKey HKCU "Software\ReCodex"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ReCodex"

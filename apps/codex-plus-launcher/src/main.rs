@@ -308,8 +308,6 @@ async fn launcher_main(
     // recodex-overlay: 先同步服务端托管配置,再跟随推荐模型 —— 两者都写 config.toml,
     // 顺序固定就不会互相冲掉;而且必须在拉起 Codex **之前**:Codex 是启动时读一次
     // config.toml,后台线程写完时它已经拿着旧配置跑了,用户还得再重启一次。
-    // recodex-overlay: 旧 exe / 旧引用 / 卸载项版本号 / 旧数据残留的清理,后台线程做,不拖慢启动
-    codex_plus_core::legacy_install::spawn_startup_housekeeping();
     sync_managed_config_from_server().await;
     follow_upstream_recommended_model().await;
     // recodex-overlay: 由「切换模式/更新后重启」拉起时带 --await-guard —— 旧 launcher
@@ -329,6 +327,9 @@ async fn launcher_main(
         })?;
         return Ok(());
     };
+    // recodex-overlay: 旧 exe / 旧引用 / 卸载项版本号 / 旧数据残留的清理,后台线程做,不拖慢启动。
+    // 必须在拿到单实例锁之后:只有锁的持有者能改快捷方式、删旧 exe;这里也是旧名接班的报到点。
+    codex_plus_core::legacy_install::spawn_startup_housekeeping();
     // 这里原先每次启动都无条件去拉
     // https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json,
     // 是上游遗留。两个问题:
@@ -1508,5 +1509,18 @@ mod legacy_handoff_placement_tests {
             .expect("main 里、launcher_main 之前没有调用旧名接班");
         let line = body[..handoff].rsplit('\n').next().unwrap_or_default();
         assert!(line.contains("!helper_only &&"), "helper 进程不能接班:{line}");
+    }
+
+    /// 旧 exe 清理/改入口只能由单实例锁的持有者做;它也是旧名接班的报到点。
+    #[test]
+    fn housekeeping_runs_only_after_the_single_instance_guard() {
+        let source = include_str!("main.rs");
+        let start = source.find("async fn launcher_main(").expect("找不到 launcher_main");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("launcher_main 没有结尾")];
+        let guard = body.find("acquire_guard_maybe_waiting(options.debug_port").expect("没有抢锁");
+        let calls: Vec<_> = body.match_indices("spawn_startup_housekeeping();").collect();
+        assert_eq!(calls.len(), 1, "launcher_main 里只能调用一次");
+        assert!(calls[0].0 > guard, "必须在拿到单实例锁之后");
     }
 }

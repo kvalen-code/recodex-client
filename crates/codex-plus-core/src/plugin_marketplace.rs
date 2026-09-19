@@ -13,8 +13,47 @@ const OPENAI_PLUGINS_ZIP_URL: &str =
 const OPENAI_PLUGINS_DOWNLOAD_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 const OPENAI_CURATED_REMOTE_MARKETPLACE_ZIP: &[u8] =
     include_bytes!("../../../assets/plugin-marketplaces/openai-curated-remote.zip");
+/// recodex-overlay: 内嵌快照里 marketplace.json 的简介原先写着 Codex++,已在 zip 里改掉。
+/// 但快照只在目录不存在时解压一次 —— 以前解压过的机器上那份永远是旧文案。
+/// 启动时就地把**这一整句**换掉(只认原句,别的内容一个字节不动;Codex 自己也会写这个目录)。
+const LEGACY_REMOTE_MARKETPLACE_DESCRIPTION: &str =
+    "Official ChatGPT-auth remote plugins cached locally by Codex++.";
+const REMOTE_MARKETPLACE_DESCRIPTION: &str =
+    "Official ChatGPT-auth remote plugins cached locally by ReCodex.";
+
+/// 已解压的远程插件市场里还是旧品牌简介时,返回改好的文本;否则 None。
+fn rebrand_remote_marketplace_text(text: &str) -> Option<String> {
+    text.contains(LEGACY_REMOTE_MARKETPLACE_DESCRIPTION)
+        .then(|| text.replace(LEGACY_REMOTE_MARKETPLACE_DESCRIPTION, REMOTE_MARKETPLACE_DESCRIPTION))
+}
+
+/// 把 `~/.codex/.tmp/plugins-remote` 里旧快照的简介改成新品牌。返回是否改写了文件。
+/// 先写临时文件再改名,不留半截 JSON。
+fn refresh_remote_marketplace_branding(home: &Path) -> anyhow::Result<bool> {
+    let path = home
+        .join(".tmp")
+        .join("plugins-remote")
+        .join(".agents")
+        .join("plugins")
+        .join("marketplace.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    let Some(updated) = rebrand_remote_marketplace_text(&text) else {
+        return Ok(false);
+    };
+    let staging = path.with_extension("json.recodex-tmp");
+    std::fs::write(&staging, updated)
+        .with_context(|| format!("failed to write {}", staging.display()))?;
+    if let Err(error) = std::fs::rename(&staging, &path) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    Ok(true)
+}
 
 pub fn ensure_openai_curated_marketplace_config(home: &Path) -> anyhow::Result<bool> {
+    let _ = refresh_remote_marketplace_branding(home);
     let Some(marketplace_root) = local_openai_curated_marketplace_root(home)? else {
         return Ok(false);
     };
@@ -65,6 +104,7 @@ pub fn ensure_openai_curated_remote_marketplace_available(
     home: &Path,
 ) -> anyhow::Result<MarketplaceEnsureResult> {
     let mut initialized = false;
+    let _ = refresh_remote_marketplace_branding(home);
     if local_openai_curated_remote_marketplace_root(home)?.is_none() {
         install_openai_curated_remote_marketplace_zip(home, OPENAI_CURATED_REMOTE_MARKETPLACE_ZIP)?;
         initialized = true;
@@ -1010,6 +1050,53 @@ mod tests {
                 .as_str()
             )
         );
+    }
+
+    #[test]
+    fn embedded_remote_marketplace_snapshot_has_no_legacy_brand() {
+        let mut archive =
+            zip::ZipArchive::new(Cursor::new(OPENAI_CURATED_REMOTE_MARKETPLACE_ZIP)).unwrap();
+        for index in 0..archive.len() {
+            let mut file = archive.by_index(index).unwrap();
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents).unwrap();
+            let text = String::from_utf8_lossy(&contents).to_ascii_lowercase();
+            for needle in ["codex++", "codexplusplus", "codex-plus", "bigpizza"] {
+                assert!(!text.contains(needle), "{} 里还有 {needle}", file.name());
+            }
+        }
+    }
+
+    #[test]
+    fn an_already_extracted_snapshot_gets_the_new_description() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        ensure_openai_curated_remote_marketplace_available(home).unwrap();
+        let path = home
+            .join(".tmp")
+            .join("plugins-remote")
+            .join(".agents")
+            .join("plugins")
+            .join("marketplace.json");
+        let fresh = std::fs::read_to_string(&path).unwrap();
+        assert!(fresh.contains(REMOTE_MARKETPLACE_DESCRIPTION), "内嵌快照应已是新文案");
+        // 模拟以前解压的旧快照
+        let stale = fresh.replace(REMOTE_MARKETPLACE_DESCRIPTION, LEGACY_REMOTE_MARKETPLACE_DESCRIPTION);
+        std::fs::write(&path, &stale).unwrap();
+
+        assert!(refresh_remote_marketplace_branding(home).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), fresh, "只换那一句,其余不动");
+        assert!(!refresh_remote_marketplace_branding(home).unwrap(), "幂等");
+        // 启动路径(ensure_openai_curated_marketplace_config)同样会刷
+        std::fs::write(&path, &stale).unwrap();
+        let _ = ensure_openai_curated_marketplace_config(home);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), fresh);
+    }
+
+    #[test]
+    fn marketplace_text_without_the_legacy_sentence_is_untouched() {
+        assert_eq!(rebrand_remote_marketplace_text(r#"{"shortDescription":"by Codex++ fans"}"#), None);
+        assert_eq!(rebrand_remote_marketplace_text(REMOTE_MARKETPLACE_DESCRIPTION), None);
     }
 
     #[test]
