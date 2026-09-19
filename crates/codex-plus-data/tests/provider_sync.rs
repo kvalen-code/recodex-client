@@ -1689,7 +1689,8 @@ fn provider_sync_backup_metadata_contains_reference_fields_and_managed_marker() 
     assert_eq!(metadata["codexHome"], home.to_string_lossy().to_string());
     assert_eq!(metadata["targetProvider"], "apigather");
     assert_eq!(metadata["changedSessionFiles"], 1);
-    assert_eq!(metadata["managedBy"], "Codex++ provider sync");
+    // 写入的是新标记;旧标记只在读取(轮转)时兼容,见下方 prune 那条测试。
+    assert_eq!(metadata["managedBy"], "ReCodex provider sync");
     assert!(metadata["createdAt"].as_str().unwrap().contains('T'));
     assert!(
         metadata["dbFiles"]
@@ -2033,15 +2034,30 @@ fn provider_sync_skips_when_home_missing_or_lock_exists_and_prunes_backups() {
 
     fs::remove_dir_all(home.join("tmp/provider-sync.lock")).unwrap();
     let backup_root = home.join("backups_state/provider-sync");
+    // 新旧两种标记混着放:升级上来的用户目录里就是这个样子。旧标记的目录也必须
+    // 参与轮转,否则它们永远删不掉,backups_state 只增不减。
     for index in 0..6 {
         let backup = backup_root.join(format!("2000010100000{index}"));
         fs::create_dir_all(&backup).unwrap();
+        let marker = if index % 2 == 0 {
+            "Codex++ provider sync"
+        } else {
+            "ReCodex provider sync"
+        };
         fs::write(
             backup.join("metadata.json"),
-            json!({"managedBy": "Codex++ provider sync"}).to_string(),
+            json!({"managedBy": marker}).to_string(),
         )
         .unwrap();
     }
+    // 不带我们标记的目录(用户自己放的、别的工具的)不参与轮转,一个都不能删
+    let foreign = backup_root.join("19990101000000");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(
+        foreign.join("metadata.json"),
+        json!({"managedBy": "someone else"}).to_string(),
+    )
+    .unwrap();
     write_rollout(
         &home.join("sessions/rollout-new.jsonl"),
         "openai",
@@ -2054,7 +2070,12 @@ fn provider_sync_skips_when_home_missing_or_lock_exists_and_prunes_backups() {
         .unwrap()
         .filter(|entry| entry.as_ref().unwrap().path().is_dir())
         .count();
-    assert_eq!(backups, 5);
+    // 5 个受管备份 + 1 个外来目录
+    assert_eq!(backups, 6);
+    assert!(foreign.exists(), "不是我们标记的备份目录不能被轮转删掉");
+    // 最旧的几个(不论新旧标记)被轮转掉
+    assert!(!backup_root.join("20000101000000").exists(), "旧标记的备份也要参与轮转");
+    assert!(!backup_root.join("20000101000001").exists(), "新标记的旧备份要被轮转");
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]

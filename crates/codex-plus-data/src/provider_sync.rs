@@ -11,6 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_PROVIDER: &str = "openai";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const BACKUP_KEEP_COUNT: usize = 5;
+/// 备份目录 metadata.json 里的 `managedBy` 标记。`prune_backups` 只轮转带这个标记的目录,
+/// 用户或别的工具放进 `backups_state/provider-sync/` 的东西不碰。
+pub const BACKUP_MANAGED_BY: &str = "ReCodex provider sync";
+/// 改名前写的标记。老版本留下的备份目录仍带着它 —— 读取时必须新旧都认,
+/// 否则这些目录永远不参与轮转,在用户的 ~/.codex 里只增不减。
+pub const LEGACY_BACKUP_MANAGED_BY: &str = "Codex++ provider sync";
 const REMOTE_CONTROL_CREATION_WINDOW_SECS: i64 = 15 * 60;
 
 #[derive(Debug, Deserialize)]
@@ -1847,7 +1853,7 @@ fn create_backup(
             "createdAt": chrono::Utc::now().to_rfc3339(),
             "dbFiles": db_files,
             "changedSessionFiles": changes.len(),
-            "managedBy": "Codex++ provider sync"
+            "managedBy": BACKUP_MANAGED_BY
         }))?,
     )?;
     Ok(backup_dir)
@@ -1875,7 +1881,7 @@ fn create_session_index_cleanup_backup(
         "createdAt": chrono::Utc::now().to_rfc3339(),
         "snapshotSha256": plan.snapshot_sha256,
         "prunedSessionIndexEntries": removed_entries,
-        "managedBy": "Codex++ provider sync"
+        "managedBy": BACKUP_MANAGED_BY
     }))
     .map_err(|error| cleanup_apply_error(error, Some(backup_dir.clone())))?;
     fs::write(backup_dir.join("metadata.json"), metadata)
@@ -3198,6 +3204,13 @@ fn dedupe_paths(paths: Vec<String>) -> Vec<String> {
     result
 }
 
+fn is_managed_backup(metadata: &Value) -> bool {
+    matches!(
+        metadata.get("managedBy").and_then(Value::as_str),
+        Some(BACKUP_MANAGED_BY | LEGACY_BACKUP_MANAGED_BY)
+    )
+}
+
 fn prune_backups(home: &Path) -> anyhow::Result<()> {
     let root = home.join("backups_state/provider-sync");
     if !root.exists() {
@@ -3215,7 +3228,7 @@ fn prune_backups(home: &Path) -> anyhow::Result<()> {
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        if value.get("managedBy").and_then(Value::as_str) == Some("Codex++ provider sync") {
+        if is_managed_backup(&value) {
             managed.push(path);
         }
     }
