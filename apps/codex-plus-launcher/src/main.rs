@@ -390,13 +390,10 @@ async fn launcher_main(
     //   2. 真判断出「有更新」时它去拉 MANAGER_BINARY,而 slim fork 根本不构建管理工具。
     // 我们真正的自更新走 selfupdate.rs + 服务端下发的清单(routes.rs 的 /self-update),
     // 与这条毫无关系。删掉。
-    // recodex-overlay: 微信连接按已保存设置自动拉起(原由 manager 负责)
-    codex_plus_core::connect::control::start_from_saved_settings();
-    // recodex-overlay: 手机远程「跟随账号」开着就自动接入:没配对则发起配对(手机弹窗),
-    // 已配对则保证守护进程在跑。与微信一样放在单实例锁之后,后台进行、不拖慢启动。
-    codex_plus_core::phone_remote::start_from_saved_settings();
     // recodex: 扫掉「会话删除」留在索引/侧边栏里的残骸。放在单实例锁之后(只由持锁者做)、
-    // 拉起 Codex 之前(Codex 运行中会把内存里的全局状态整份写回);Codex 已在跑则顺延。
+    // 在拉起 Codex 之前(Codex 运行中会把内存里的全局状态整份写回),也在微信连接/
+    // 手机远程这些守护进程之前 —— 它们可能在清扫途中拉起一个 Codex 会话,而清扫的
+    // 前提正是「Codex 没在跑」(第四轮审计 S6)。Codex 已在跑则整轮顺延。
     // 同步但**限时**(STARTUP_SWEEP_BUDGET,1.5 秒):备份可能有几百 MB,首次启动不能为它
     // 拖住 Codex。每份备份只轻量分类一次并缓存,没做完的顺延到下次启动。不放后台线程与
     // Codex 并行:Codex 启动时读进内存的全局状态之后会整份写回,清了也白清,而标记已记成
@@ -405,6 +402,11 @@ async fn launcher_main(
         &codex_plus_core::codex_sqlite::default_codex_home_dir(),
         &codex_plus_core::paths::default_app_state_dir().join("backups"),
     );
+    // recodex-overlay: 微信连接按已保存设置自动拉起(原由 manager 负责)
+    codex_plus_core::connect::control::start_from_saved_settings();
+    // recodex-overlay: 手机远程「跟随账号」开着就自动接入:没配对则发起配对(手机弹窗),
+    // 已配对则保证守护进程在跑。与微信一样放在单实例锁之后,后台进行、不拖慢启动。
+    codex_plus_core::phone_remote::start_from_saved_settings();
     // recodex-overlay: 让上游新出的模型自动生效。
     // 位置有三个约束:必须在 key 刷新**之后**(拉 manifest 要带 key);必须在
     // helper_only 分支之后(helper 不启动 Codex,白等一次网络请求还会跟主进程抢着
@@ -2249,5 +2251,17 @@ mod legacy_handoff_placement_tests {
         assert_eq!(source.matches(remote_call.as_str()).count(), 1, "整个启动器里只能调用一次");
         let remote = body.find(remote_call.as_str()).expect("launcher_main 里没有手机远程自动接入");
         assert!(guard < housekeeping && housekeeping < remote, "顺序必须是 锁 → 清理 → 手机远程");
+        // 残骸清扫要在守护进程拉起之前:它们可能在清扫途中拉起 Codex 会话,
+        // 而清扫的前提是「Codex 没在跑」(第四轮审计 S6)。
+        let sweep = body
+            .find("sweep_deleted_thread_leftovers_at_startup(")
+            .expect("launcher_main 里没有启动清扫");
+        let connect = body
+            .find("connect::control::start_from_saved_settings();")
+            .expect("launcher_main 里没有微信连接自动拉起");
+        assert!(
+            housekeeping < sweep && sweep < connect && connect < remote,
+            "顺序必须是 清理 → 清扫 → 微信连接 → 手机远程(清扫@{sweep} 连接@{connect} 远程@{remote})"
+        );
     }
 }

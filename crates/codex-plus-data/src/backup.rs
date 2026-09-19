@@ -57,12 +57,39 @@ impl BackupStore {
         let text = fs::read_to_string(&path)
             .with_context(|| format!("Backup token not found: {token}"))?;
         let mut backup: Value = serde_json::from_str(&text)?;
-        if let Some(leftovers) = self.read_leftovers(token)? {
-            if let Some(tables) = backup.get_mut("tables").and_then(Value::as_object_mut) {
-                merge_leftover_tables(tables, &leftovers);
+        // sidecar 读不动时**不能**让整单撤销失败:主备份好好的(可能几百 MB、装着
+        // 整份 rollout),而 sidecar 只有几 KB,被杀软/索引器短暂持锁、坏块、被人改坏
+        // 都可能读不了。这一步与 restore_backups 对索引/侧边栏的口径一致:尽力而为,
+        // 失败只记一条诊断(第四轮审计 A1)。写入侧(append_leftovers)仍是 fail-closed:
+        // 存不下残骸就别清。
+        match self.read_leftovers(token) {
+            Ok(Some(leftovers)) => {
+                if let Some(tables) = backup.get_mut("tables").and_then(Value::as_object_mut) {
+                    merge_leftover_tables(tables, &leftovers);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "backup.leftovers_unreadable",
+                    serde_json::json!({
+                        "token": token,
+                        "error": format!("{error:#}"),
+                    }),
+                );
             }
         }
         Ok(backup)
+    }
+
+    /// 撤销成功后清掉 sidecar:里面的条目已经放回索引/侧边栏了,留着只会在下一次
+    /// 读这份备份时又合一遍(第四轮审计 S4)。尽力而为。
+    pub fn remove_leftovers(&self, token: &str) -> bool {
+        match fs::remove_file(self.leftovers_path(token)) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => false,
+        }
     }
 
     /// 残骸补记文件:`<token>.leftovers.json`,只放 `__session_index` / `__sidebar`。
@@ -151,6 +178,13 @@ pub(crate) fn merge_leftover_tables(tables: &mut Map<String, Value>, leftovers: 
 }
 
 fn merge_sidebar_snapshot(existing: &mut Value, incoming: &Value) {
+    // 主备份里的 __sidebar 不是对象(null、被改坏)时,整份用 sidecar 的替换 ——
+    // 原先直接 return,等于把清扫存下来的残骸悄悄丢掉,撤销就恢复不回侧边栏
+    // (第四轮审计 S8)。
+    if !existing.is_object() {
+        *existing = incoming.clone();
+        return;
+    }
     let Some(existing) = existing.as_object_mut() else {
         return;
     };

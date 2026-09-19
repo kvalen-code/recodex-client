@@ -470,3 +470,78 @@ fn partial_batch_undo_marks_the_backups_that_did_come_back() {
         "没恢复成功的不能记:它还得能再撤一次"
     );
 }
+
+/// 第四轮 A1:sidecar 读不动(被占/坏块/被改坏)不能把整单撤销拖垮 —— 主备份是好的,
+/// 库行和 rollout 必须照常恢复,只是索引/侧边栏那点残骸补不回来。
+#[test]
+fn unreadable_leftovers_sidecar_does_not_break_the_whole_undo() {
+    let h = home_with_thread();
+    let adapter = SQLiteStorageAdapter::new(&h.db, BackupStore::new(&h.backups))
+        .with_codex_home(&h.home);
+    let token = adapter.delete_local(&session("local:t1")).undo_token.unwrap();
+    // 造一份读不出来的 sidecar(内容不是 JSON)。
+    fs::write(h.backups.join(format!("{token}.leftovers.json")), b"{ broken").unwrap();
+
+    let undone = adapter.undo(&token);
+
+    assert_eq!(undone.status, DeleteStatus::Undone, "{}", undone.message);
+    assert_eq!(thread_rows(&h.db, "t1"), 1);
+    assert!(h.rollout.exists());
+}
+
+/// 第四轮 S4:撤销成功后 sidecar 要删掉 —— 里面的条目已经放回去了。
+#[test]
+fn successful_undo_removes_the_leftovers_sidecar() {
+    let h = home_with_thread();
+    let adapter = SQLiteStorageAdapter::new(&h.db, BackupStore::new(&h.backups))
+        .with_codex_home(&h.home);
+    let token = adapter.delete_local(&session("local:t1")).undo_token.unwrap();
+    let sidecar = h.backups.join(format!("{token}.leftovers.json"));
+    BackupStore::new(&h.backups)
+        .append_leftovers(
+            &token,
+            serde_json::json!({
+                "__session_index": ["{\"id\":\"t1\",\"thread_name\":\"T1\",\"updated_at\":\"2026-09-20T00:00:00Z\"}"]
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(sidecar.exists());
+
+    let undone = adapter.undo(&token);
+
+    assert_eq!(undone.status, DeleteStatus::Undone, "{}", undone.message);
+    assert!(!sidecar.exists(), "撤销成功后 sidecar 应删掉");
+}
+
+/// 第四轮 S8:主备份里的 __sidebar 不是对象(null/被改坏)时,sidecar 的整份快照要顶上,
+/// 不能被静默丢掉。
+#[test]
+fn leftovers_replace_a_broken_sidebar_snapshot_in_the_main_backup() {
+    let h = home_with_thread();
+    let store = BackupStore::new(&h.backups);
+    let token = store
+        .write_backup(
+            "t1",
+            &h.db,
+            json!({ "threads": [{ "id": "t1" }], "__sidebar": Value::Null }),
+        )
+        .unwrap();
+    store
+        .append_leftovers(
+            &token,
+            json!({ "__sidebar": { "thread_id": "t1", "global_state": { "pinned-thread-ids": ["t1"] }, "catalog": [] } })
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+
+    let merged = store.read_backup(&token).unwrap();
+
+    assert_eq!(merged["tables"]["__sidebar"]["thread_id"], "t1");
+    assert_eq!(
+        merged["tables"]["__sidebar"]["global_state"]["pinned-thread-ids"],
+        json!(["t1"])
+    );
+}

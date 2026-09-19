@@ -285,9 +285,12 @@ pub fn record_undone_backups(backup_dir: &Path, tokens: &[String]) {
     }
     let marker_path = backup_dir.join(MARKER_FILE_NAME);
     let mut marker = load_marker(&marker_path);
+    let store = crate::BackupStore::new(backup_dir.to_path_buf());
     for token in tokens {
         marker.classified.remove(token);
         marker.processed.insert(token.clone(), json!("undone"));
+        // 残骸已经随这次撤销放回索引/侧边栏了,sidecar 留着没用(S4)。
+        store.remove_leftovers(token);
     }
     let _ = save_marker(&marker_path, &marker);
 }

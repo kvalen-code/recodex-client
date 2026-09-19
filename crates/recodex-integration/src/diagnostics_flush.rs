@@ -327,8 +327,12 @@ pub(crate) fn redact_user_paths(input: &str) -> String {
             // 但「路径后面还接着一句话」(`cwd /home/bob missing, see /var/log`)同样
             // 常见:整段吞掉会把后面的信息一并抹掉,甚至把下一个路径粘进来。规则:
             //   - 引号结束 → JSON 串里的路径就是这么收尾的,整段遮掉,空格照遮;
-            //   - 分隔符结束 → 这一段是目录名,**且看着像目录名**(不含逗号、至多
-            //     一个空格、不太长)才整段遮,否则退回第一个空格;
+            //   - 分隔符结束 → 也是目录名,整段遮掉(`Mary Jane Watson` 这种两个以上
+            //     空格的真名不能只遮掉名,第四轮审计 A2)。两种情况要退回:
+            //       * 这一段以空格结尾 —— 那个分隔符属于**后面另一个路径**
+            //         (`copy /home/bob /mnt/backup failed`,第四轮审计 A3);
+            //       * 分隔符后面直接是常见的绝对路径起点(users/home/mnt/var/…、盘符),
+            //         同上,双保险;
             //   - 行尾/串尾结束 → 后面可能跟着说明文字,退回第一个空格。
             let start = i;
             let mut end = i;
@@ -344,8 +348,14 @@ pub(crate) fn redact_user_paths(input: &str) -> String {
                 .get(end)
                 .is_some_and(|byte| matches!(byte, b'\\' | b'/'));
             let segment = &input[start..end];
+            // 这一段后面是不是另起了一个路径:分隔符前是空格、分隔符后直接是常见
+            // 根目录/盘符,或者这一段里空格之后本身就是个路径开头(`bob D:`)。
+            let tail_after_space = spaced_end.map(|at| &lower[at + 1..end]);
+            let separator_belongs_to_next_path = segment.ends_with(' ')
+                || starts_new_absolute_path(&lower[end..])
+                || tail_after_space.is_some_and(looks_like_path_prefix);
             let name_end = if terminated_by_quote
-                || (terminated_by_separator && looks_like_directory_name(segment))
+                || (terminated_by_separator && !separator_belongs_to_next_path)
             {
                 end
             } else {
@@ -422,12 +432,34 @@ pub(crate) fn redact(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 这一段像不像一个目录名(而不是「路径后面接的一句话」)。
-/// 判据故意保守:目录名里不会有逗号,带空格的用户名一般也就一个空格。
-fn looks_like_directory_name(segment: &str) -> bool {
-    !segment.contains(',')
-        && segment.chars().filter(|ch| *ch == ' ').count() <= 1
-        && segment.len() <= 64
+/// 分隔符后面是不是**另一个**绝对路径的开头(`/mnt/...`、`/Users/...`、`C:\...`)。
+/// 是的话这个分隔符不属于当前这一段 —— 当前段其实是「路径 + 一句话」。
+/// 入参是已小写化的剩余文本(从那个分隔符开始)。
+fn starts_new_absolute_path(lower_rest: &str) -> bool {
+    has_path_prefix(lower_rest.trim_start_matches(['\\', '/']))
+}
+
+/// 这一小段本身是不是一个路径的开头(用来看「空格之后」的那半截)。
+fn looks_like_path_prefix(lower: &str) -> bool {
+    lower.starts_with('\\') || lower.starts_with('/') || has_path_prefix(lower)
+}
+
+fn has_path_prefix(rest: &str) -> bool {
+    const ROOT_DIRS: &[&str] = &[
+        "users/", "users\\", "home/", "home\\", "mnt/", "var/", "opt/", "tmp/", "etc/",
+        "usr/", "windows/", "windows\\", "program files",
+    ];
+    if ROOT_DIRS.iter().any(|dir| rest.starts_with(dir)) {
+        return true;
+    }
+    // 盘符:`c:\`、`c:/`,或者就停在 `c:`(分隔符已经被当成段尾了)
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some(drive), Some(':')) if drive.is_ascii_alphabetic() => {
+            matches!(chars.next(), None | Some('\\') | Some('/'))
+        }
+        _ => false,
+    }
 }
 
 fn is_token_byte(b: u8) -> bool {
@@ -735,6 +767,26 @@ mod tests {
             r#"\\nas\Users\[user]\share"#
         );
         assert_eq!(redact_user_paths("//nas/home/ann/x"), "//nas/home/[user]/x");
+        // A2:三段以上的真名也要整段遮,不能只遮掉名
+        assert_eq!(
+            redact_user_paths("/Users/Mary Jane Watson/Library/Caches"),
+            "/Users/[user]/Library/Caches"
+        );
+        assert_eq!(
+            redact_user_paths(r#"C:\Users\Mary Jane Watson\AppData\Local"#),
+            r#"C:\Users\[user]\AppData\Local"#
+        );
+        // A3:后面跟着另一个路径时别把它粘进来
+        assert_eq!(
+            redact_user_paths("copy /home/bob /mnt/backup failed"),
+            "copy /home/[user] /mnt/backup failed"
+        );
+        assert_eq!(
+            redact_user_paths(r#"copy C:\Users\bob D:\backup failed"#),
+            r#"copy C:\Users\[user] D:\backup failed"#
+        );
+        // 真的是深路径时照常整段遮(下一段不是绝对路径起点)
+        assert_eq!(redact_user_paths("/home/bob/mnt/x"), "/home/[user]/mnt/x");
         // 路径后面还跟着一句话时,只遮到第一个空格:既别抹掉正文,也别把后面的
         // 路径粘进来(第三轮审计 4)
         assert_eq!(redact_user_paths("open /home/bob failed"), "open /home/[user] failed");

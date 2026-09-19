@@ -1418,7 +1418,12 @@ pub fn refresh_key_env_from_user_scope() -> bool {
         if std::env::var(SUB2API_ENV_KEY).ok().as_deref() == Some(stored.as_str()) {
             return false;
         }
-        // Safe here: called once at startup, before any Codex child is spawned.
+        // 注意:这里**不是**「整个进程只调一次」。launcher 每次拉起 Codex 之前都会再调
+        // 一遍(用户中途登录/换组织后,注册表里的 key 已经换了,而本进程环境还是旧的)。
+        // 那时诊断回传、启动清理、手机远程这些后台线程已经在跑 —— set_var 与并发
+        // getenv 严格来说是竞态。仍然接受的理由:改的只有这一个我们自己的键,读它的
+        // 只有我们(以及即将被 spawn 的子进程,它在 set_var 之后才创建);真正的根治
+        // 是把 key 用 Command::env 显式传给子进程、不再动进程环境(排到 1.3.9 评估)。
         unsafe { std::env::set_var(SUB2API_ENV_KEY, &stored) };
         true
     }
