@@ -1272,3 +1272,131 @@ fn thread_usage_history_reads_rollout_token_count_events() {
         })
     );
 }
+
+/// ReCodex：数据库里没有这条会话、只清了索引的那条退路也要写备份，
+/// 撤销 token 能把索引条目和侧边栏条目放回去。
+#[test]
+fn index_only_delete_writes_a_backup_and_undo_restores_the_index() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let empty_db = tmp.path().join("empty.sqlite");
+    let unrelated_rollout = tmp.path().join("unrelated.jsonl");
+    fs::write(&unrelated_rollout, "{\"type\":\"message\"}\n").unwrap();
+    create_codex_thread_db(&empty_db, &unrelated_rollout);
+    let api_only =
+        "{\"id\":\"api-only\",\"thread_name\":\"A\",\"updated_at\":\"2026-08-26T00:00:00Z\"}";
+    let keep = "{\"id\":\"keep\",\"thread_name\":\"B\",\"updated_at\":\"2026-08-26T00:00:00Z\"}";
+    fs::write(home.join("session_index.jsonl"), format!("{api_only}\n{keep}\n")).unwrap();
+    fs::write(
+        home.join(".codex-global-state.json"),
+        json!({
+            "projectless-thread-ids": ["api-only", "keep"],
+            "thread-project-assignments": {"api-only": {"projectId": "p"}, "keep": {"projectId": "p"}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let backups = tmp.path().join("backups");
+
+    let result = delete_local_from_paths(
+        vec![empty_db.clone()],
+        BackupStore::new(&backups),
+        &session("api-only", "Codex Thread"),
+        Some(home.as_path()),
+    );
+
+    assert_eq!(result.status, DeleteStatus::LocalDeleted, "{}", result.message);
+    let token = result.undo_token.clone().expect("退路删除也要给撤销 token");
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join(".codex-global-state.json")).unwrap()).unwrap();
+    assert_eq!(state["projectless-thread-ids"], json!(["keep"]));
+    assert!(state["thread-project-assignments"].get("api-only").is_none());
+
+    let undone = SQLiteStorageAdapter::new(&empty_db, BackupStore::new(&backups))
+        .with_codex_home(&home)
+        .undo(&token);
+
+    assert_eq!(undone.status, DeleteStatus::Undone, "{}", undone.message);
+    let index_text = fs::read_to_string(home.join("session_index.jsonl")).unwrap();
+    assert_eq!(index_text.matches("\"id\":\"api-only\"").count(), 1);
+    assert_eq!(index_text.matches("\"id\":\"keep\"").count(), 1);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join(".codex-global-state.json")).unwrap()).unwrap();
+    assert_eq!(state["projectless-thread-ids"], json!(["keep", "api-only"]));
+    assert_eq!(state["thread-project-assignments"]["api-only"]["projectId"], "p");
+    // 数据库本来就没有这条，撤销也不该往库里塞东西
+    assert_eq!(thread_count(&empty_db, "api-only"), 0);
+}
+
+/// 什么都没清掉时不能留下撤销 token（否则界面会显示一次「可撤销」的假删除）。
+#[test]
+fn failed_index_only_delete_leaves_no_undo_token_or_backup() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let empty_db = tmp.path().join("empty.sqlite");
+    let unrelated_rollout = tmp.path().join("unrelated.jsonl");
+    fs::write(&unrelated_rollout, "{\"type\":\"message\"}\n").unwrap();
+    create_codex_thread_db(&empty_db, &unrelated_rollout);
+    let backups = tmp.path().join("backups");
+
+    let result = delete_local_from_paths(
+        vec![empty_db],
+        BackupStore::new(&backups),
+        &session("missing", "Codex Thread"),
+        Some(home.as_path()),
+    );
+
+    assert_eq!(result.status, DeleteStatus::Failed);
+    assert!(result.undo_token.is_none());
+    assert!(!backups.exists() || fs::read_dir(&backups).unwrap().next().is_none());
+}
+
+/// ReCodex 扩充的侧边栏键：置顶、项目归属、标签页路由，删除清、撤销回。
+#[test]
+fn delete_codex_thread_clears_pinned_project_assignment_and_tab_routes() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    let rollout = home.join("sessions/rollout-t1.jsonl");
+    fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    fs::write(&rollout, "{}\n").unwrap();
+    let state_db = home.join("state_5.sqlite");
+    create_codex_thread_db(&state_db, &rollout);
+    fs::write(
+        home.join(".codex-global-state.json"),
+        json!({
+            "pinned-thread-ids": ["t1", "keep"],
+            "thread-project-assignments": {"t1": {"projectId": "p"}, "keep": {"projectId": "p"}},
+            "electron-persisted-atom-state": {
+                "thread-tab-routes-v1:t1": {"routes": []},
+                "thread-tab-routes-v1:t10": {"routes": []}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let adapter = SQLiteStorageAdapter::new(&state_db, BackupStore::new(tmp.path().join("backups")))
+        .with_codex_home(&home);
+
+    let deleted = adapter.delete_local(&session("local:t1", "Codex Thread"));
+
+    assert_eq!(deleted.status, DeleteStatus::LocalDeleted, "{}", deleted.message);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join(".codex-global-state.json")).unwrap()).unwrap();
+    assert_eq!(state["pinned-thread-ids"], json!(["keep"]));
+    assert!(state["thread-project-assignments"].get("t1").is_none());
+    let atoms = &state["electron-persisted-atom-state"];
+    assert!(atoms.get("thread-tab-routes-v1:t1").is_none());
+    // 前缀相同的别的线程（t10）不能被误伤
+    assert!(atoms.get("thread-tab-routes-v1:t10").is_some());
+
+    let undone = adapter.undo(deleted.undo_token.as_deref().unwrap());
+
+    assert_eq!(undone.status, DeleteStatus::Undone, "{}", undone.message);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join(".codex-global-state.json")).unwrap()).unwrap();
+    assert_eq!(state["pinned-thread-ids"], json!(["keep", "t1"]));
+    assert_eq!(state["thread-project-assignments"]["t1"]["projectId"], "p");
+    assert!(state["electron-persisted-atom-state"].get("thread-tab-routes-v1:t1").is_some());
+}

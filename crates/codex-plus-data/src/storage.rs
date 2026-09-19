@@ -22,7 +22,8 @@ pub fn delete_local_from_paths(
     );
     let mut deleted_count = 0usize;
     let mut backup_tokens = Vec::new();
-    for db_path in db_paths {
+    let db_paths = db_paths.into_iter().collect::<Vec<_>>();
+    for db_path in db_paths.iter().cloned() {
         let adapter = match codex_home {
             Some(home) => SQLiteStorageAdapter::new(db_path, backup_store.clone())
                 .with_codex_home(home),
@@ -55,6 +56,21 @@ pub fn delete_local_from_paths(
         && let Some(home) = codex_home
     {
         let thread_id = normalize_codex_thread_id(&session.session_id);
+        // ReCodex：这条退路原先删了索引/侧边栏却不留备份，撤销时无从恢复。
+        // 先把要删的东西写进一份只含 `__session_index`/`__sidebar` 的备份，
+        // 撤销走同一个 token。
+        match write_index_only_backup(&backup_store, &db_paths, home, &thread_id) {
+            Ok(Some((token, backup_path))) => {
+                result.undo_token = Some(token);
+                result.backup_path = Some(backup_path.to_string_lossy().to_string());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // 备份失败就不删：宁可留个幽灵条目，也不做撤销不了的删除。
+                result.message = format!("{}；索引备份失败，未清理：{error}", result.message);
+                return result;
+            }
+        }
         match crate::provider_sync::remove_session_index_entry(home, &thread_id) {
             Ok(removed) if removed > 0 => {
                 result.status = DeleteStatus::LocalDeleted;
@@ -80,8 +96,75 @@ pub fn delete_local_from_paths(
                 result.message = format!("{}；侧边栏索引清理失败：{error}", result.message);
             }
         }
+        if matches!(result.status, DeleteStatus::Failed) {
+            // 什么都没清掉：别把撤销 token 留给界面，免得出现「可撤销」的假删除。
+            result.undo_token = None;
+            result.backup_path = None;
+        }
     }
     result
+}
+
+/// 为「数据库里没有这条会话、只剩索引/侧边栏条目」的删除写备份。
+/// 什么都没有时返回 `None`（不写空备份）。
+fn write_index_only_backup(
+    backup_store: &BackupStore,
+    db_paths: &[PathBuf],
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<Option<(String, PathBuf)>> {
+    let mut tables = Map::new();
+    add_thread_sidebar_backup_tables(&mut tables, codex_home, thread_id)?;
+    if !sidebar_backup_has_content(&tables) {
+        return Ok(None);
+    }
+    let source_db = db_paths
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| codex_home.join("state_5.sqlite"));
+    let token = backup_store.write_backup(thread_id, &source_db, Value::Object(tables))?;
+    let path = backup_store.path_for(&token);
+    Ok(Some((token, path)))
+}
+
+/// 把线程在 session_index.jsonl 和侧边栏缓存里的条目写进备份表。
+pub(crate) fn add_thread_sidebar_backup_tables(
+    tables: &mut Map<String, Value>,
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<()> {
+    let session_index_lines =
+        crate::provider_sync::session_index_lines_for_thread(codex_home, thread_id)?;
+    if !session_index_lines.is_empty() {
+        tables.insert(
+            "__session_index".to_string(),
+            Value::Array(session_index_lines.into_iter().map(Value::String).collect()),
+        );
+    }
+    tables.insert(
+        "__sidebar".to_string(),
+        crate::provider_sync::snapshot_thread_sidebar_references(codex_home, thread_id)?,
+    );
+    Ok(())
+}
+
+/// 备份表里是否真有索引/侧边栏条目（`__sidebar` 总会写入，但可能是空快照）。
+pub(crate) fn sidebar_backup_has_content(tables: &Map<String, Value>) -> bool {
+    let index = tables
+        .get("__session_index")
+        .and_then(Value::as_array)
+        .is_some_and(|lines| !lines.is_empty());
+    let sidebar = tables.get("__sidebar");
+    let global = sidebar
+        .and_then(|value| value.get("global_state"))
+        .and_then(Value::as_object)
+        .is_some_and(|state| !state.is_empty());
+    let catalog = sidebar
+        .and_then(|value| value.get("catalog"))
+        .and_then(Value::as_array)
+        .is_some_and(|entries| !entries.is_empty());
+    index || global || catalog
 }
 
 #[derive(Debug, Clone)]
@@ -626,19 +709,7 @@ impl SQLiteStorageAdapter {
         let Some(home) = self.codex_home.as_deref() else {
             return Ok(());
         };
-        let session_index_lines =
-            crate::provider_sync::session_index_lines_for_thread(home, thread_id)?;
-        if !session_index_lines.is_empty() {
-            tables.insert(
-                "__session_index".to_string(),
-                Value::Array(session_index_lines.into_iter().map(Value::String).collect()),
-            );
-        }
-        tables.insert(
-            "__sidebar".to_string(),
-            crate::provider_sync::snapshot_thread_sidebar_references(home, thread_id)?,
-        );
-        Ok(())
+        add_thread_sidebar_backup_tables(tables, home, thread_id)
     }
 
     fn delete_codex_automation_run(
@@ -873,12 +944,14 @@ fn restore_backups(
         let Some(tables) = backup["tables"].as_object() else {
             continue;
         };
-        let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
-        let db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         validate_restore_tables(tables)?;
-        detect_restore_conflicts(&db, tables)?;
+        if backup_has_db_rows(tables) {
+            let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
+            let db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            detect_restore_conflicts(&db, tables)?;
+            preflight_restore_rows(&db, tables)?;
+        }
         detect_file_restore_conflicts(tables)?;
-        preflight_restore_rows(&db, tables)?;
         if let Some(sidebar) = tables.get("__sidebar") {
             let home = codex_home
                 .ok_or_else(|| anyhow::anyhow!("sidebar restore requires a Codex home"))?;
@@ -890,11 +963,14 @@ fn restore_backups(
         let Some(tables) = backup["tables"].as_object() else {
             continue;
         };
-        let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
-        let mut db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        let tx = db.transaction()?;
-        restore_rows(&tx, tables)?;
-        tx.commit()?;
+        if backup_has_db_rows(tables) {
+            let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
+            let mut db =
+                Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            let tx = db.transaction()?;
+            restore_rows(&tx, tables)?;
+            tx.commit()?;
+        }
         if let Some(files) = tables.get("__files").and_then(Value::as_array) {
             for file in files {
                 let Some(path) = file.get("path").and_then(Value::as_str) else {
@@ -930,6 +1006,12 @@ fn restore_backups(
         }
     }
     Ok(())
+}
+
+/// 备份里除 `__` 开头的附属表（文件、索引、侧边栏）外是否还有数据库表。
+/// 只含索引/侧边栏的备份（数据库里本就没有这条会话）撤销时不必碰数据库。
+fn backup_has_db_rows(tables: &Map<String, Value>) -> bool {
+    tables.keys().any(|table| !table.starts_with("__"))
 }
 
 fn preflight_restore_rows(db: &Connection, tables: &Map<String, Value>) -> anyhow::Result<()> {

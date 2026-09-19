@@ -1812,6 +1812,26 @@ pub fn validate_thread_sidebar_snapshot(
     Ok(())
 }
 
+/// 全局状态里「按 thread id 列出」的数组。上游只处理 projectless-thread-ids；
+/// ReCodex 实测还有 pinned-thread-ids，置顶过的会话删掉后同样会残留。
+const SIDEBAR_THREAD_ID_ARRAYS: [&str; 2] = ["projectless-thread-ids", "pinned-thread-ids"];
+
+/// 全局状态里「以 thread id 为键」的对象。thread-project-assignments 是 ReCodex
+/// 追加的：实测删除后它仍把会话挂在项目下，侧边栏据此继续显示。
+const SIDEBAR_THREAD_MAPS: [&str; 4] = [
+    "thread-projectless-output-directories",
+    "thread-workspace-root-hints",
+    "thread-writable-roots",
+    "thread-project-assignments",
+];
+
+/// electron-persisted-atom-state 里以 `<前缀>:<thread id>` 为键的条目。
+const SIDEBAR_ATOM_KEY_PREFIXES: [&str; 3] = [
+    "thread-client-id-v1",
+    "thread-reference-capability",
+    "thread-tab-routes-v1",
+];
+
 const SIDEBAR_CATALOG_TABLES: [&str; 3] = [
     "local_thread_catalog",
     "thread_timeline_ledger",
@@ -1831,22 +1851,20 @@ fn snapshot_thread_from_global_state(
         return Ok(json!({}));
     };
     let mut snapshot = Map::new();
-    if let Some(ids) = root.get("projectless-thread-ids").and_then(Value::as_array) {
-        let values = ids
-            .iter()
-            .filter(|value| thread_value_matches(value, thread_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !values.is_empty() {
-            snapshot.insert("projectless-thread-ids".to_string(), Value::Array(values));
+    for key in SIDEBAR_THREAD_ID_ARRAYS {
+        if let Some(ids) = root.get(key).and_then(Value::as_array) {
+            let values = ids
+                .iter()
+                .filter(|value| thread_value_matches(value, thread_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !values.is_empty() {
+                snapshot.insert(key.to_string(), Value::Array(values));
+            }
         }
     }
     let mut maps = Map::new();
-    for key in [
-        "thread-projectless-output-directories",
-        "thread-workspace-root-hints",
-        "thread-writable-roots",
-    ] {
+    for key in SIDEBAR_THREAD_MAPS {
         if let Some(map) = root.get(key).and_then(Value::as_object) {
             let entries = map
                 .iter()
@@ -1934,12 +1952,12 @@ fn restore_thread_to_global_state(
         return Ok(0);
     };
     let mut restored = 0usize;
-    if let Some(values) = global
-        .get("projectless-thread-ids")
-        .and_then(Value::as_array)
-    {
+    for key in SIDEBAR_THREAD_ID_ARRAYS {
+        let Some(values) = global.get(key).and_then(Value::as_array) else {
+            continue;
+        };
         let ids = root
-            .entry("projectless-thread-ids")
+            .entry(key)
             .or_insert_with(|| Value::Array(Vec::new()));
         if let Some(ids) = ids.as_array_mut() {
             for value in values {
@@ -2086,14 +2104,11 @@ fn thread_key_matches(key: &str, thread_id: &str) -> bool {
 
 fn sidebar_atom_key_matches(key: &str, thread_id: &str) -> bool {
     let encoded_local = format!("local%3A{thread_id}");
-    [
-        format!("thread-client-id-v1:{thread_id}"),
-        format!("thread-client-id-v1:{encoded_local}"),
-        format!("thread-reference-capability:{thread_id}"),
-        format!("thread-reference-capability:{encoded_local}"),
-    ]
-    .iter()
-    .any(|candidate| key == candidate)
+    SIDEBAR_ATOM_KEY_PREFIXES.iter().any(|prefix| {
+        key.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .is_some_and(|rest| rest == thread_id || rest == encoded_local)
+    })
 }
 
 pub fn remove_thread_sidebar_references(
@@ -2134,19 +2149,14 @@ fn remove_thread_from_global_state(codex_home: &Path, thread_id: &str) -> anyhow
         return Ok(0);
     };
     let mut removed = 0usize;
-    if let Some(ids) = root
-        .get_mut("projectless-thread-ids")
-        .and_then(Value::as_array_mut)
-    {
-        let before = ids.len();
-        ids.retain(|value| !thread_value_matches(value, thread_id));
-        removed += before.saturating_sub(ids.len());
+    for key in SIDEBAR_THREAD_ID_ARRAYS {
+        if let Some(ids) = root.get_mut(key).and_then(Value::as_array_mut) {
+            let before = ids.len();
+            ids.retain(|value| !thread_value_matches(value, thread_id));
+            removed += before.saturating_sub(ids.len());
+        }
     }
-    for key in [
-        "thread-projectless-output-directories",
-        "thread-workspace-root-hints",
-        "thread-writable-roots",
-    ] {
+    for key in SIDEBAR_THREAD_MAPS {
         if let Some(map) = root.get_mut(key).and_then(Value::as_object_mut) {
             for candidate in [thread_id, &format!("local:{thread_id}")] {
                 if map.remove(candidate).is_some() {
@@ -2159,19 +2169,9 @@ fn remove_thread_from_global_state(codex_home: &Path, thread_id: &str) -> anyhow
         .get_mut("electron-persisted-atom-state")
         .and_then(Value::as_object_mut)
     {
-        let encoded_local = format!("local%3A{thread_id}");
-        let client_id = format!("thread-client-id-v1:{thread_id}");
-        let client_id_encoded = format!("thread-client-id-v1:{encoded_local}");
-        let reference_capability = format!("thread-reference-capability:{thread_id}");
-        let reference_capability_encoded = format!("thread-reference-capability:{encoded_local}");
         let keys = atom
             .keys()
-            .filter(|key| {
-                *key == &client_id
-                    || *key == &client_id_encoded
-                    || *key == &reference_capability
-                    || *key == &reference_capability_encoded
-            })
+            .filter(|key| sidebar_atom_key_matches(key, thread_id))
             .cloned()
             .collect::<Vec<_>>();
         for key in keys {
@@ -2182,6 +2182,12 @@ fn remove_thread_from_global_state(codex_home: &Path, thread_id: &str) -> anyhow
     if removed == 0 {
         return Ok(0);
     }
+    // 先比对再写：读到写之间文件被别人（通常是正在运行的 Codex）改过就放弃，
+    // 绝不拿旧快照覆盖对方的新内容。
+    //
+    // 已知局限（与上游一致）：Codex 运行时把全局状态放在内存里，之后会整份写回
+    // 这个文件，可能把刚删掉的条目又写回来。删除当下无法阻止；ReCodex 的补救是
+    // 启动器下次启动、Codex 尚未运行时由 deleted_leftovers 再扫一遍。
     if fs::read(&path)? != original_bytes {
         anyhow::bail!(".codex-global-state.json changed while deleting thread {thread_id}");
     }
@@ -2272,7 +2278,12 @@ pub fn restore_session_index_entries(
     if appended == 0 {
         return Ok(0);
     }
-    if fs::read(&path)? != original_bytes {
+    let current_bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if current_bytes != original_bytes {
         return Ok(0);
     }
     codex_plus_core::settings::atomic_write(&path, next_text.as_bytes())?;
