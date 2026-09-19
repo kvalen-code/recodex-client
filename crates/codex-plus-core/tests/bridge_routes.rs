@@ -213,7 +213,7 @@ async fn settings_routes_use_settings_service() {
     let updated = handle_bridge_request(
         ctx.clone(),
         "/settings/set",
-        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppSessionCopy": false, "codexAppPetRealMouseLook": true}),
+        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppSessionCopy": false, "codexAppAnswerOutline": false, "codexAppPetRealMouseLook": true}),
     )
     .await;
     let loaded = handle_bridge_request(ctx, "/settings/get", json!({})).await;
@@ -221,6 +221,7 @@ async fn settings_routes_use_settings_service() {
     assert_eq!(updated["providerSyncEnabled"], true);
     assert_eq!(updated["codexAppSessionDelete"], false);
     assert_eq!(updated["codexAppSessionCopy"], false);
+    assert_eq!(updated["codexAppAnswerOutline"], false);
     assert_eq!(updated["codexAppPetRealMouseLook"], true);
     assert_eq!(loaded, updated);
 }
@@ -964,6 +965,7 @@ impl BridgeSettingsService for FakeSettings {
             "codexAppSessionDelete",
             "codexAppMarkdownExport",
             "codexAppSessionCopy",
+            "codexAppAnswerOutline",
             "codexAppForceChineseLocale",
             "codexAppThreadIdBadge",
             "codexAppConversationView",

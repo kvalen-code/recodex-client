@@ -1136,7 +1136,7 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, sessionDelete: true, markdownExport: true, sessionCopy: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { pluginMarketplaceUnlock: true, sessionDelete: true, markdownExport: true, sessionCopy: true, answerOutline: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
@@ -1144,6 +1144,7 @@
     sessionDelete: "codexAppSessionDelete",
     markdownExport: "codexAppMarkdownExport",
     sessionCopy: "codexAppSessionCopy",
+    answerOutline: "codexAppAnswerOutline",
     threadIdBadge: "codexAppThreadIdBadge",
     conversationView: "codexAppConversationView",
     threadScrollRestore: "codexAppThreadScrollRestore",
@@ -1179,6 +1180,7 @@
         sessionDelete: false,
         markdownExport: false,
         sessionCopy: false,
+        answerOutline: false,
         pasteFix: false,
         threadIdBadge: false,
         conversationView: false,
@@ -7436,6 +7438,7 @@
     refreshConversationView();
     scheduleThreadScrollSync();
     installAppServerRequestPatch();
+    refreshAnswerOutline();
   }
 
   function runScanStep(step) {
@@ -7453,7 +7456,7 @@
   }
 
   function isExtensionUiNode(node) {
-    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .codex-zed-remote-button, .codex-zed-remote-toast, #codex-plus-menu`);
+    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .codex-zed-remote-button, .codex-zed-remote-toast, #codex-plus-menu, #codex-answer-outline`);
   }
 
   function scanRelevantSelector() {
@@ -7542,12 +7545,14 @@
       "找不到要复制的会话": "找不到要複製的對話",
       "会话加载超时，请稍后重试": "對話載入逾時，請稍後再試",
       "当前会话没有可复制的回答": "目前對話沒有可複製的回答",
+      "回答大纲": "回答大綱",
     },
     ru: {
       "原地复制会话": "Дублировать чат",
       "找不到要复制的会话": "Не найден чат для копирования",
       "会话加载超时，请稍后重试": "Чат загружается слишком долго, попробуйте ещё раз",
       "当前会话没有可复制的回答": "В этом чате нет ответа, от которого можно сделать копию",
+      "回答大纲": "План ответа",
     },
   };
 
@@ -7650,6 +7655,326 @@
     forkButton.click();
   }
 
+  // ── 回答大纲 ───────────────────────────────────────────────
+  // 最新一条**已完成**回答里有 ≥2 个标题时,在对话区右上角放一个小按钮,点开列出标题,
+  // 点标题平滑滚到原文。流式输出中不显示;代码块、表格里的「标题」不算。
+  // 解析规则精简自上游 Answer Outline(outline/parser.js + navigation.js),不带它的悬浮面板运行时。
+  const answerOutlineRootId = "codex-answer-outline";
+  const answerOutlineFlashClass = "codex-answer-outline-flash";
+  const answerOutlineMinItems = 2;
+  const answerOutlineMaxItems = 30;
+  const answerOutlineMaxTitleLength = 60;
+  const answerOutlineTurnSelector = "div.contents[data-content-search-turn-key]";
+  const answerOutlineMarkdownSelector = '[data-markdown-text-style="assistant-message"]';
+  const answerOutlineStopLabels = /^(停止|Stop|Остановить)$/i;
+  let answerOutlineState = { signature: "", items: [], open: false, timer: 0, observer: null };
+
+  function answerOutlineStyleText() {
+    return `
+      #${answerOutlineRootId} {
+        position: fixed; z-index: 40; display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
+        font: 12px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+        --ao-surface: var(--color-surface-elevated-secondary, #ffffff);
+        --ao-text: var(--color-text-primary, #1a1c1f);
+        --ao-muted: var(--color-text-secondary, rgba(26,28,31,.65));
+        --ao-border: var(--color-border, rgba(26,28,31,.1));
+        --ao-hover: var(--color-background-primary-ghost-hover, rgba(26,28,31,.06));
+        --ao-accent: var(--color-text-info, #339cff);
+      }
+      @media (prefers-color-scheme: dark) {
+        #${answerOutlineRootId} {
+          --ao-surface: var(--color-surface-elevated-secondary, #26282c);
+          --ao-text: var(--color-text-primary, #ececf1);
+          --ao-muted: var(--color-text-secondary, rgba(236,236,241,.65));
+          --ao-border: var(--color-border, rgba(255,255,255,.12));
+          --ao-hover: var(--color-background-primary-ghost-hover, rgba(255,255,255,.08));
+        }
+      }
+      #${answerOutlineRootId}[hidden] { display: none; }
+      #${answerOutlineRootId} .ao-toggle {
+        display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 9px; cursor: pointer;
+        border: 1px solid var(--ao-border); border-radius: 999px; background: var(--ao-surface); color: var(--ao-muted);
+        box-shadow: 0 1px 4px rgba(0,0,0,.08); font: inherit;
+      }
+      #${answerOutlineRootId} .ao-toggle:hover, #${answerOutlineRootId} .ao-toggle[aria-expanded="true"] { color: var(--ao-text); }
+      #${answerOutlineRootId} .ao-toggle svg { width: 14px; height: 14px; }
+      #${answerOutlineRootId} .ao-list {
+        width: 260px; max-height: min(60vh, 440px); overflow-y: auto; margin: 0; padding: 6px; list-style: none;
+        border: 1px solid var(--ao-border); border-radius: 12px; background: var(--ao-surface); color: var(--ao-text);
+        box-shadow: 0 8px 28px rgba(0,0,0,.16);
+      }
+      #${answerOutlineRootId} .ao-title { padding: 4px 8px 6px; color: var(--ao-muted); font-weight: 600; }
+      #${answerOutlineRootId} .ao-item {
+        display: block; width: 100%; box-sizing: border-box; padding: 5px 8px; border: 0; border-radius: 7px;
+        background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      #${answerOutlineRootId} .ao-item:hover, #${answerOutlineRootId} .ao-item:focus-visible { background: var(--ao-hover); outline: none; }
+      #${answerOutlineRootId} .ao-item[data-level="1"] { padding-left: 20px; color: var(--ao-muted); }
+      #${answerOutlineRootId} .ao-item[data-level="2"] { padding-left: 32px; color: var(--ao-muted); }
+      .${answerOutlineFlashClass} { animation: codex-answer-outline-flash 1.2s ease-out; border-radius: 4px; }
+      @keyframes codex-answer-outline-flash {
+        0%, 30% { background-color: color-mix(in srgb, var(--color-text-info, #339cff) 22%, transparent); }
+        100% { background-color: transparent; }
+      }
+      @media (prefers-reduced-motion: reduce) { .${answerOutlineFlashClass} { animation: none; } }
+    `;
+  }
+
+  function answerOutlineNormalize(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  // 粗体段落当标题要足够「像标题」:编号 / 章节词 / 以冒号结尾,且不能是一句完整的话。
+  // 不做这层过滤的话,Codex 回答开头那句加粗的结论也会被当成标题。
+  function answerOutlineLooksLikeHeading(text) {
+    if (text.length < 2 || text.length > 40 || /[。！？.!?]$/.test(text)) return false;
+    return /^(?:\d{1,2}(?:\.\d{1,2})*[.、．)]\s*\S|[一二三四五六七八九十]+[、.．]\s*\S|第[一二三四五六七八九十百\d]+[章节部分步]|[（(]\d{1,2}[）)]\s*\S)/.test(text)
+      || /[:：]$/.test(text)
+      || /^(?:摘要|概述|背景|目标|现状|问题|原因|分析|方案|步骤|实现|验证|测试|结果|结论|总结|建议|注意(?:事项)?|说明|附录|下一步|summary|overview|background|goals?|analysis|solution|steps?|implementation|verification|tests?|results?|conclusions?|notes?|next steps?|итоги?|вывод(?:ы)?|шаги|решение|анализ|проверка|результат(?:ы)?)$/i.test(text);
+  }
+
+  function answerOutlineExcluded(node, root) {
+    return !!node.closest("pre, code, table, thead, tbody, [role='table'], [role='grid'], blockquote, .cm-editor, .monaco-editor, .sr-only")
+      || node.closest(`#${answerOutlineRootId}`)
+      || !root.contains(node);
+  }
+
+  function answerOutlineCollect(root) {
+    const semantic = [];
+    root.querySelectorAll("h1, h2, h3, h4, h5, h6").forEach((node) => {
+      if (answerOutlineExcluded(node, root) || !visibleElement(node)) return;
+      const text = answerOutlineNormalize(node.textContent);
+      if (!text || text.length > 120) return;
+      semantic.push({ el: node, text, level: Number(node.tagName.slice(1)) });
+    });
+    let items = semantic;
+    if (items.length < answerOutlineMinItems) {
+      // 没有真正的标题时,退而取「整段只有一个粗体」的段落(Codex 常用 **小标题** 分节)。
+      const pseudo = [];
+      root.querySelectorAll("p, li").forEach((node) => {
+        if (answerOutlineExcluded(node, root) || node.children.length !== 1) return;
+        const strong = node.firstElementChild;
+        if (!strong?.matches("strong, b")) return;
+        const text = answerOutlineNormalize(node.textContent);
+        if (text !== answerOutlineNormalize(strong.textContent) || !answerOutlineLooksLikeHeading(text)) return;
+        if (!visibleElement(node)) return;
+        pseudo.push({ el: node, text, level: 7 });
+      });
+      items = [...semantic, ...pseudo].sort((left, right) =>
+        left.el.compareDocumentPosition(right.el) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+    }
+    const seen = new Set();
+    items = items.filter((item) => {
+      const key = `${item.level}|${item.text}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, answerOutlineMaxItems);
+    if (!items.length) return items;
+    // 显示层级:相对最浅的一级缩进,最多三档。
+    const levels = Array.from(new Set(items.map((item) => item.level))).sort((a, b) => a - b);
+    items.forEach((item) => {
+      item.depth = Math.min(2, levels.indexOf(item.level));
+      item.label = item.text.length > answerOutlineMaxTitleLength ? `${item.text.slice(0, answerOutlineMaxTitleLength - 1)}…` : item.text;
+    });
+    return items;
+  }
+
+  // 最新一条回答:最后一个对话轮次里最后一块 assistant 正文。
+  // 这一轮还没出现操作栏(复制/分支那一排)且停止按钮还在 → 还在流式输出,不给大纲。
+  function answerOutlineLatestAnswer() {
+    const turn = Array.from(document.querySelectorAll(answerOutlineTurnSelector)).at(-1);
+    if (!turn) return null;
+    const root = Array.from(turn.querySelectorAll(answerOutlineMarkdownSelector)).at(-1);
+    if (!root) return null;
+    const finished = !!turn.querySelector(".turn-action-controls")
+      || !Array.from(document.querySelectorAll("button[aria-label]"))
+        .some((button) => answerOutlineStopLabels.test(button.getAttribute("aria-label") || "") && visibleElement(button));
+    return finished ? { turn, root } : null;
+  }
+
+  function answerOutlineScrollContainer(node) {
+    const threadRoot = node.closest?.(".thread-scroll-container");
+    if (threadRoot) return threadRoot;
+    for (let current = node.parentElement; current && current !== document.body; current = current.parentElement) {
+      const overflowY = getComputedStyle(current).overflowY;
+      if (/(auto|scroll|overlay)/.test(overflowY) && current.scrollHeight > current.clientHeight + 4) return current;
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function answerOutlineJump(item) {
+    const target = item?.el;
+    if (!(target instanceof Element) || !target.isConnected) return;
+    const container = answerOutlineScrollContainer(target);
+    const containerTop = container === document.scrollingElement || container === document.documentElement
+      ? 0
+      : container.getBoundingClientRect().top;
+    // 按视觉/布局高度之比换算,Codex 缩放(Ctrl +/-)时也落在同一位置。
+    const scale = container.clientHeight > 0 ? (container.getBoundingClientRect().height / container.clientHeight) || 1 : 1;
+    const delta = (target.getBoundingClientRect().top - containerTop - 28) / scale;
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+    // scrollBy 是相对滚动:对话容器是 column-reverse(scrollTop 为负)时同样正确。
+    container.scrollBy({ top: delta, behavior: reduceMotion ? "auto" : "smooth" });
+    target.classList.remove(answerOutlineFlashClass);
+    void target.getBoundingClientRect();
+    target.classList.add(answerOutlineFlashClass);
+    setTimeout(() => target.classList.remove(answerOutlineFlashClass), 1300);
+  }
+
+  function answerOutlineRemove() {
+    document.getElementById(answerOutlineRootId)?.remove();
+    answerOutlineState.signature = "";
+    answerOutlineState.items = [];
+    answerOutlineState.open = false;
+  }
+
+  function answerOutlineSetOpen(open) {
+    const host = document.getElementById(answerOutlineRootId);
+    if (!host) return;
+    answerOutlineState.open = !!open;
+    host.querySelector(".ao-list").hidden = !open;
+    host.querySelector(".ao-toggle").setAttribute("aria-expanded", String(!!open));
+  }
+
+  function answerOutlineRender(items, root) {
+    let host = document.getElementById(answerOutlineRootId);
+    if (!host) {
+      host = document.createElement("div");
+      host.id = answerOutlineRootId;
+      const style = document.createElement("style");
+      style.textContent = answerOutlineStyleText();
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "ao-toggle";
+      toggle.setAttribute("aria-haspopup", "true");
+      toggle.addEventListener("click", (event) => {
+        event.stopPropagation();
+        answerOutlineSetOpen(!answerOutlineState.open);
+      });
+      const list = document.createElement("div");
+      list.className = "ao-list";
+      list.setAttribute("role", "navigation");
+      list.hidden = true;
+      host.append(style, toggle, list);
+      host.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") answerOutlineSetOpen(false);
+      });
+      document.body.appendChild(host);
+    }
+    const label = codexPlusUiText("回答大纲");
+    const toggle = host.querySelector(".ao-toggle");
+    toggle.title = label;
+    toggle.setAttribute("aria-label", `${label} (${items.length})`);
+    toggle.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"></path></svg>';
+    toggle.appendChild(document.createTextNode(String(items.length)));
+    const list = host.querySelector(".ao-list");
+    list.setAttribute("aria-label", label);
+    list.replaceChildren();
+    const title = document.createElement("div");
+    title.className = "ao-title";
+    title.textContent = label;
+    list.appendChild(title);
+    items.forEach((item) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ao-item";
+      button.dataset.level = String(item.depth);
+      button.textContent = item.label;
+      button.title = item.text;
+      button.addEventListener("click", () => answerOutlineJump(item));
+      list.appendChild(button);
+    });
+    answerOutlinePosition(root);
+  }
+
+  // 贴在对话滚动区的右上角;对话区不可见时(设置页等)整块隐藏。
+  function answerOutlinePosition(root) {
+    const host = document.getElementById(answerOutlineRootId);
+    if (!host) return;
+    const container = root?.closest?.(".thread-scroll-container");
+    const rect = container?.getBoundingClientRect?.();
+    if (!rect || rect.width < 320 || rect.height < 120) {
+      host.hidden = true;
+      return;
+    }
+    host.hidden = false;
+    host.style.top = `${Math.round(rect.top + 10)}px`;
+    host.style.right = `${Math.max(8, Math.round(window.innerWidth - rect.right + 18))}px`;
+  }
+
+  function refreshAnswerOutline() {
+    if (!codexPlusSettings().answerOutline) {
+      answerOutlineRemove();
+      answerOutlineDisconnect();
+      return;
+    }
+    answerOutlineObserve();
+    const latest = answerOutlineLatestAnswer();
+    const items = latest ? answerOutlineCollect(latest.root) : [];
+    if (items.length < answerOutlineMinItems) {
+      answerOutlineRemove();
+      return;
+    }
+    const signature = `${codexPlusUiLang()}|${latest.turn.getAttribute("data-content-search-turn-key") || ""}|${items.map((item) => `${item.depth}:${item.text}`).join("\n")}`;
+    answerOutlineState.items = items;
+    if (signature === answerOutlineState.signature && document.getElementById(answerOutlineRootId)) {
+      answerOutlinePosition(latest.root);
+      return;
+    }
+    const wasOpen = answerOutlineState.open && answerOutlineState.signature.split("|")[1] === signature.split("|")[1];
+    answerOutlineState.signature = signature;
+    answerOutlineRender(items, latest.root);
+    answerOutlineSetOpen(wasOpen);
+  }
+
+  // 节流而不是去抖:流式输出时 DOM 一刻不停,去抖会让「新一轮开始 → 旧大纲收起」一直等到输出结束。
+  function scheduleAnswerOutlineRefresh() {
+    if (answerOutlineState.timer) return;
+    answerOutlineState.timer = setTimeout(() => {
+      answerOutlineState.timer = 0;
+      runScanStep(refreshAnswerOutline);
+    }, 500);
+  }
+
+  // 主 scan 只对侧边栏等结构变化敏感,回答正文的流式变化和切换会话时对话区的整块替换它都不管,
+  // 所以大纲自己挂一个观察者。回调只做节流排期,真正的查询每 500ms 至多一次、只看最后一个轮次;
+  // 大纲节点自身的变化只在渲染时发生一次,下一轮签名相同就不再渲染,不会自喂。
+  function answerOutlineObserve() {
+    if (answerOutlineState.observer) return;
+    answerOutlineState.observer = new MutationObserver(scheduleAnswerOutlineRefresh);
+    answerOutlineState.observer.observe(document.body || document.documentElement, { childList: true, subtree: true, characterData: true });
+  }
+
+  function answerOutlineDisconnect() {
+    answerOutlineState.observer?.disconnect();
+    answerOutlineState.observer = null;
+    clearTimeout(answerOutlineState.timer);
+    answerOutlineState.timer = 0;
+  }
+
+  window.__codexAnswerOutlineDisconnect?.();
+  window.__codexAnswerOutlineDisconnect = answerOutlineDisconnect;
+  if (window.__codexAnswerOutlineDocHandler) {
+    document.removeEventListener("pointerdown", window.__codexAnswerOutlineDocHandler, true);
+  }
+  window.__codexAnswerOutlineDocHandler = (event) => {
+    if (!answerOutlineState.open) return;
+    if (event.target?.closest?.(`#${answerOutlineRootId}`)) return;
+    answerOutlineSetOpen(false);
+  };
+  document.addEventListener("pointerdown", window.__codexAnswerOutlineDocHandler, true);
+
+  if (window.__CODEX_PLUS_TEST_ANSWER_OUTLINE__) {
+    window.__codexPlusAnswerOutlineTest = {
+      collect: answerOutlineCollect,
+      latestAnswer: answerOutlineLatestAnswer,
+      looksLikeHeading: answerOutlineLooksLikeHeading,
+      uiText: codexPlusUiText,
+    };
+  }
+
   void loadBackendSettingsForStartup();
   installUpstreamBranchDropdownAdapter();
   installUpstreamWorktreeNativeAdapter();
@@ -7666,6 +7991,7 @@
       syncActionGroupsLayout();
       // recodex-overlay:drop-floating-menu-call
       runScanStep(refreshConversationView);
+      runScanStep(refreshAnswerOutline);
     });
   };
   window.addEventListener("resize", window.__codexPlusResizeHandler);
