@@ -743,10 +743,14 @@ async fn self_update_value(manifest_url: String) -> Value {
         Err(error) => return json!({"status":"failed","message":format!("无法定位程序文件:{error}")}),
     };
     match crate::selfupdate::stage_replacement(&exe, &bytes) {
-        Ok(_) => json!({
-            "status": "ok",
-            "message": format!("已更新到 {},正在重启…", manifest.version)
-        }),
+        Ok(_) => {
+            // 控制面板「程序和功能」里的版本号原先永远停在安装包那一版
+            crate::legacy_install::record_installed_version(&manifest.version);
+            json!({
+                "status": "ok",
+                "message": format!("已更新到 {},正在重启…", manifest.version)
+            })
+        }
         Err(error) => json!({"status":"failed","message":format!("替换程序文件失败:{error}")}),
     }
 }

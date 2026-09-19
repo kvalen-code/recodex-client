@@ -142,6 +142,114 @@ pub fn create_shortcut(spec: &ShortcutSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 逐个读取 .lnk,让 `decide` 决定要不要改、改成什么,需要改的就写回。
+///
+/// COM 只初始化一次(扫开始菜单可能上百个文件)。单个文件读不了/写不了只记进
+/// 返回的错误列表,不影响其余文件 —— 调用方(启动时的旧名迁移)要的是「尽量改」,
+/// 不是「全有或全无」。返回 (改写成功的路径, 错误说明)。
+#[cfg(windows)]
+pub fn update_shortcuts(
+    paths: &[PathBuf],
+    decide: impl Fn(&crate::legacy_install::ShortcutInfo) -> crate::legacy_install::ShortcutChanges,
+) -> (Vec<PathBuf>, Vec<String>) {
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::{STGM_READ, STGM_READWRITE};
+
+    let mut updated = Vec::new();
+    let mut errors = Vec::new();
+    let _com = match ComApartment::init() {
+        Ok(com) => com,
+        Err(error) => {
+            errors.push(format!("初始化 COM 失败:{error}"));
+            return (updated, errors);
+        }
+    };
+    for path in paths {
+        let result: anyhow::Result<bool> = (|| unsafe {
+            let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+                .context("创建 ShellLink COM 对象失败")?;
+            let persist_file: IPersistFile = shell_link.cast().context("获取 IPersistFile 失败")?;
+            let wide_path = wide_null(path.as_os_str());
+            // 要改 AppUserModelID 就得以读写方式打开(只读打开时属性存储 SetValue 报
+            // STG_E_ACCESSDENIED);只读文件打不开读写就退回只读 —— 至少还能判断要不要改。
+            if persist_file
+                .Load(PCWSTR(wide_path.as_ptr()), STGM_READWRITE)
+                .is_err()
+            {
+                persist_file
+                    .Load(PCWSTR(wide_path.as_ptr()), STGM_READ)
+                    .context("读取快捷方式失败")?;
+            }
+
+            let mut target = vec![0u16; 1024];
+            // flags = 0:取长路径、不解析(Resolve 可能去搜盘、弹窗)
+            let _ = shell_link.GetPath(&mut target, std::ptr::null_mut(), 0);
+            let mut icon = vec![0u16; 1024];
+            let mut icon_index = 0i32;
+            let _ = shell_link.GetIconLocation(&mut icon, &mut icon_index);
+            let store: Option<IPropertyStore> = shell_link.cast().ok();
+            let app_user_model_id = store
+                .as_ref()
+                .and_then(|store| store.GetValue(&PKEY_AppUserModel_ID).ok())
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let info = crate::legacy_install::ShortcutInfo {
+                target: nul_terminated_wide_to_string(&target),
+                icon: nul_terminated_wide_to_string(&icon),
+                app_user_model_id,
+            };
+            let changes = decide(&info);
+            if changes.is_empty() {
+                return Ok(false);
+            }
+            if let Some(new_target) = &changes.target {
+                shell_link
+                    .SetPath(PCWSTR(wide_null(new_target.as_os_str()).as_ptr()))
+                    .context("设置快捷方式目标失败")?;
+            }
+            if let Some(new_icon) = &changes.icon {
+                shell_link
+                    .SetIconLocation(PCWSTR(wide_null(new_icon.as_os_str()).as_ptr()), icon_index)
+                    .context("设置快捷方式图标失败")?;
+            }
+            if let Some(new_id) = &changes.app_user_model_id {
+                let store = store.context("快捷方式不支持属性存储")?;
+                store
+                    .SetValue(&PKEY_AppUserModel_ID, &PROPVARIANT::from(new_id.as_str()))
+                    .context("设置快捷方式 AppUserModelID 失败")?;
+                store.Commit().context("提交快捷方式属性失败")?;
+            }
+            persist_file
+                .Save(PCWSTR(wide_path.as_ptr()), true)
+                .context("保存快捷方式失败")?;
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => updated.push(path.clone()),
+            Ok(false) => {}
+            Err(error) => errors.push(format!("{}:{error:#}", path.display())),
+        }
+    }
+    (updated, errors)
+}
+
+/// 「程序」文件夹(开始菜单)。和 desktop_dir 一样走已知文件夹,不拼环境变量 ——
+/// 用户可能把它重定向到别处。
+#[cfg(windows)]
+pub fn start_menu_programs_dir() -> Option<PathBuf> {
+    unsafe {
+        let path = SHGetKnownFolderPath(
+            &windows::Win32::UI::Shell::FOLDERID_Programs,
+            KF_FLAG_DEFAULT,
+            None,
+        )
+        .ok()?;
+        let value = path.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(path.as_ptr().cast()));
+        value
+    }
+}
+
 #[cfg(windows)]
 pub fn desktop_dir() -> Option<PathBuf> {
     unsafe {
@@ -654,11 +762,13 @@ fn apply_taskbar_properties(hwnd: HWND, icon_resource_path: &PathBuf) -> anyhow:
     let relaunch_command = std::env::current_exe()
         .ok()
         .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|| "codex-plus-plus.exe".to_string());
+        .unwrap_or_else(|| format!("{}.exe", crate::install::SILENT_BINARY));
+    // 旧值是上游的 com.bigpizzav3.codexplusplus.codex;老的任务栏固定项由
+    // legacy_install 在启动时改成新值,两边才会合成一组。
     set_property_string(
         &store,
         &PKEY_AppUserModel_ID,
-        "com.bigpizzav3.codexplusplus.codex",
+        crate::legacy_install::CODEX_WINDOW_APP_USER_MODEL_ID,
     )?;
     set_property_string(
         &store,

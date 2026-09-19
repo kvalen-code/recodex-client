@@ -11,6 +11,7 @@ pub mod diagnostic_log;
 pub mod http_client;
 pub mod install;
 pub mod launcher;
+pub mod legacy_install; // recodex-overlay: 改名前安装的一次性迁移与残留清理
 pub mod model_catalog;
 pub mod model_suffix;
 pub mod models;

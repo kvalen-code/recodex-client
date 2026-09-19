@@ -134,6 +134,12 @@ where
     if remove_appdata_dirs(&mut warnings) > 0 {
         warnings.push("已删除设备标识与用户脚本目录".to_string());
     }
+    // 以前出货过的管理工具留下的 WebView 数据目录(%LOCALAPPDATA%\com.bigpizzav3.codexplusplus.manager)。
+    // 名字与上游 Codex++ 共用:机器上还装着上游、或目录里有 WebView 缓存以外的东西,就不碰。
+    // 结果会显示给用户,不带目录名(那个名字就是上游品牌)。
+    if crate::legacy_install::remove_legacy_manager_data_for_uninstall().is_some() {
+        warnings.push("已清除旧版管理工具的缓存".to_string());
+    }
 
     // 3) 清理指向本 exe 的开机自启项,再安排 exe 自删
     let exe: Option<PathBuf> = std::env::current_exe().ok();

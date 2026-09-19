@@ -686,7 +686,9 @@ fn start_native_menu_localizer(inspector_port: u16, debug_port: u16) {
 #[cfg(windows)]
 fn apply_codexplusplus_window_icon_after_launch(process_id: u32) {
     let icon_resource_path =
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codex-plus-plus.exe"));
+        std::env::current_exe().unwrap_or_else(|_| {
+            PathBuf::from(format!("{}.exe", crate::install::SILENT_BINARY))
+        });
     const ATTEMPTS: u32 = 30;
     tokio::spawn(async move {
         for attempt in 1..=ATTEMPTS {

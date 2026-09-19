@@ -108,6 +108,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
+    // recodex-overlay: 老安装自更新上来仍叫 codex-plus-plus.exe(自更新只换内容不换文件名)。
+    // 复制成同目录的 recodex.exe、改好快捷方式与卸载项,从新名重新拉起,本进程直接退出。
+    // 必须早于单实例锁与拉起 Codex;失败时返回 false,照常以旧名运行(下次启动再试)。
+    // helper 进程不做:它是被外部按端口约定拉起的,换进程会让对方失联。
+    if !helper_only && codex_plus_core::legacy_install::handoff_from_legacy_binary(&args) {
+        return Ok(());
+    }
     // 这里是唯一允许弹窗的地方:user_alert 默认关闭,免得任何链接了 codex-plus-core
     // 的东西(尤其是集成测试里故意触发错误路径的用例)往用户桌面上弹框。
     codex_plus_core::user_alert::enable();
@@ -277,6 +284,8 @@ async fn launcher_main(
     // recodex-overlay: 先同步服务端托管配置,再跟随推荐模型 —— 两者都写 config.toml,
     // 顺序固定就不会互相冲掉;而且必须在拉起 Codex **之前**:Codex 是启动时读一次
     // config.toml,后台线程写完时它已经拿着旧配置跑了,用户还得再重启一次。
+    // recodex-overlay: 旧 exe / 旧引用 / 卸载项版本号 / 旧数据残留的清理,后台线程做,不拖慢启动
+    codex_plus_core::legacy_install::spawn_startup_housekeeping();
     sync_managed_config_from_server().await;
     follow_upstream_recommended_model().await;
     // recodex-overlay: 由「切换模式/更新后重启」拉起时带 --await-guard —— 旧 launcher
@@ -1452,5 +1461,25 @@ mod managed_config_sync_placement_tests {
             between.lines().skip(1).all(|l| { let t = l.trim(); t.is_empty() || t.starts_with("//") }),
             "同步与跟随模型之间不该有别的语句:\n{between}"
         );
+    }
+}
+
+#[cfg(test)]
+mod legacy_handoff_placement_tests {
+    /// 旧名接班必须发生在 main 里、`launcher_main` 之前 —— 进了 launcher_main 就会去抢
+    /// 单实例锁、拉起 Codex,那时再换进程,新进程会以为「已有实例在跑」而直接退出。
+    /// 同时必须跳过 helper 进程。钉文本是因为这段只在 Windows 旧名安装上才走得到。
+    #[test]
+    fn handoff_runs_in_main_before_launcher_main_and_skips_helpers() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("async fn main()").expect("找不到 main");
+        let body = &source[main_start..];
+        // main 里第一处 launcher_main 调用;接班必须在它之前
+        let launcher = body.find("launcher_main(args").expect("main 里没有调用 launcher_main");
+        let handoff = body[..launcher]
+            .find("legacy_install::handoff_from_legacy_binary(&args)")
+            .expect("main 里、launcher_main 之前没有调用旧名接班");
+        let line = body[..handoff].rsplit('\n').next().unwrap_or_default();
+        assert!(line.contains("!helper_only &&"), "helper 进程不能接班:{line}");
     }
 }
