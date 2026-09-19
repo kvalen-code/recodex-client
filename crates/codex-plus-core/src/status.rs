@@ -11,6 +11,10 @@ pub struct LaunchStatus {
     pub debug_port: Option<u16>,
     pub helper_port: Option<u16>,
     pub codex_app: Option<String>,
+    /// Windows 商店版激活用的 AUMID(上游 6c11bf7)。激活失败 0x80270254 这类问题
+    /// 靠它一眼看出是不是应用段读错了;旧状态文件没有这个字段,读时按 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aumid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +81,7 @@ mod tests {
             debug_port: Some(9222),
             helper_port: Some(4545),
             codex_app: Some("Codex".to_string()),
+            aumid: Some("OpenAI.Codex_abc!App".to_string()),
         };
 
         store.save_latest(&status).unwrap();

@@ -160,6 +160,8 @@ async fn main() -> Result<()> {
                 codex_app: options
                     .app_dir
                     .map(|path| path.to_string_lossy().to_string()),
+                // AUMID 与错误码已写进 message(见 PackagedActivationFailure::into_error)。
+                aumid: None,
             });
         }
         return Err(error);
@@ -324,6 +326,7 @@ async fn launcher_main(
             codex_app: options
                 .app_dir
                 .map(|path| path.to_string_lossy().to_string()),
+            aumid: None,
         })?;
         return Ok(());
     };

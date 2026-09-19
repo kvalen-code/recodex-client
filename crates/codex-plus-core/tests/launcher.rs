@@ -13,7 +13,8 @@ use codex_plus_core::launcher::{
     build_codex_command, build_codex_command_with_native_menu_inspector,
     build_macos_cleanup_command, build_macos_open_command,
     build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
-    build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
+    PACKAGED_ACTIVATION_RETRY_DELAYS_MS, build_packaged_activation_with_native_menu_inspector,
+    launch_and_inject_with_hooks,
     select_macos_debug_launch_action,
 };
 #[cfg(windows)]
@@ -2841,7 +2842,7 @@ fn windows_restart_without_cdp_runs_before_the_msix_branch() {
     // MSIX 激活:它一旦先执行,后面的一切对 Windows 用户都是死代码。
     // 只钉函数名不钉整行 —— 那一行现在带了失败重试,再钉原文就是每改一次红一次。
     let msix_activation = body
-        .find("activate_packaged_app(app_user_model_id, arguments).await")
+        .find("let outcome = activate_packaged_app_with_retry(")
         .expect("找不到 MSIX 激活调用");
 
     assert!(
@@ -2863,17 +2864,31 @@ fn windows_activation_failure_retries_before_giving_up() {
         .split_once("async fn launch_codex")
         .expect("找不到 launch_codex")
         .1;
-    let activation = body
-        .split_once("activate_packaged_app(app_user_model_id, arguments).await")
-        .expect("找不到 MSIX 激活调用")
-        .1;
+    // 1.3.8 起重试挪进 activate_packaged_app_with_retry(按退避、每次重新解析包)。
     assert!(
-        activation.contains("activate_packaged_app(app_user_model_id, arguments).await"),
-        "激活只调了一次 —— 刚杀完进程 COM 侧可能还持着激活锁,必须重试一次"
+        body.contains("let outcome = activate_packaged_app_with_retry(")
+            && body.contains("PACKAGED_ACTIVATION_RETRY_DELAYS_MS,"),
+        "launch_codex 没走带重试的激活 —— 刚杀完进程 COM 侧可能还持着激活锁,商店更新时包在注册中"
+    );
+    let retry = source
+        .split_once("pub async fn activate_packaged_app_with_retry(")
+        .expect("找不到 activate_packaged_app_with_retry")
+        .1;
+    let retry = &retry[..retry.find("pub fn direct_launch_fallback_is_sensible").unwrap_or(retry.len())];
+    assert!(
+        retry.contains("activate_packaged_app(&current_aumid, arguments).await")
+            && retry.contains("loop {"),
+        "激活只调了一次"
     );
     assert!(
-        body.contains("launcher.windows_activation_failed"),
+        retry.contains("launcher.windows_activation_failed"),
         "激活彻底失败没有任何上报 —— 这条路径刚从「谁也走不到」变成「所有 Windows 用户都走」"
+    );
+    assert!(retry.contains("reresolve_packaged_app_dir"), "重试没有重新解析包");
+    assert!(
+        PACKAGED_ACTIVATION_RETRY_DELAYS_MS.len() >= 3
+            && PACKAGED_ACTIVATION_RETRY_DELAYS_MS.iter().sum::<u64>() <= 25_000,
+        "重试 3~5 次、总等待约 20 秒"
     );
 }
 

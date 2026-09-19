@@ -591,6 +591,187 @@ where
     }
 }
 
+/// 激活重试的等待序列(毫秒):共 4 次重试、约 20 秒。
+///
+/// 商店更新 Codex 时包的注册窗口通常几秒到十几秒;1.5 秒只重试一次(旧做法)
+/// 覆盖不住。再长就不值得了 —— 用户盯着一个没反应的图标超过 20 秒会自己再点。
+pub const PACKAGED_ACTIVATION_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000, 10_000];
+
+/// 包正在更新 / 注册中(ERROR_INSTALL_... 系列里商店更新期间实测到的那个)。
+pub const HRESULT_PACKAGE_REGISTRATION_IN_PROGRESS: u32 = 0x8007_3D28;
+/// AUMID 找不到对应的应用(manifest 的 Application Id 变了,或包刚换了版本)。
+pub const HRESULT_APPLICATION_NOT_FOUND: u32 = 0x8027_0254;
+
+pub fn format_hresult(code: u32) -> String {
+    format!("0x{code:08X}")
+}
+
+/// 从激活错误里取 HRESULT。windows-rs 的错误能直接 downcast;兜底再从文本里
+/// 找形如 `0x8xxxxxxx` 的片段(错误可能被 context 包过一层)。
+pub fn activation_error_hresult(error: &anyhow::Error) -> Option<u32> {
+    #[cfg(windows)]
+    if let Some(code) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<windows::core::Error>())
+        .map(|error| error.code().0 as u32)
+    {
+        return Some(code);
+    }
+    let text = format!("{error:#}");
+    let lower = text.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(pos) = rest.find("0x") {
+        let digits = &rest[pos + 2..];
+        let hex: String = digits.chars().take_while(char::is_ascii_hexdigit).collect();
+        if hex.len() == 8 {
+            if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                return Some(code);
+            }
+        }
+        rest = &rest[pos + 2..];
+    }
+    None
+}
+
+/// 这两类错误等一等、重新解析包就可能好;其它错误只按旧行为再试一次。
+pub fn packaged_activation_error_is_transient(code: Option<u32>) -> bool {
+    matches!(
+        code,
+        Some(HRESULT_PACKAGE_REGISTRATION_IN_PROGRESS | HRESULT_APPLICATION_NOT_FOUND)
+    )
+}
+
+/// 激活彻底失败时留给上层的信息:最后一次用的 AUMID / 包目录 / 错误码。
+#[derive(Debug)]
+pub struct PackagedActivationFailure {
+    pub app_user_model_id: String,
+    pub app_dir: PathBuf,
+    pub error_code: Option<u32>,
+    pub attempts: usize,
+    pub error: anyhow::Error,
+}
+
+impl PackagedActivationFailure {
+    /// 用户看到的「ReCodex 启动失败」与 latest-status.json 的 message 都来自这里,
+    /// 带上 AUMID 与错误码,客服拿到截图/诊断就能直接定位。
+    pub fn into_error(self) -> anyhow::Error {
+        let code = self
+            .error_code
+            .map(format_hresult)
+            .unwrap_or_else(|| "未知".to_string());
+        let hint = match self.error_code {
+            Some(HRESULT_PACKAGE_REGISTRATION_IN_PROGRESS) => {
+                "Codex 可能正在由微软商店更新,请等更新完成后再打开 ReCodex。"
+            }
+            Some(HRESULT_APPLICATION_NOT_FOUND) => {
+                "Codex 的安装信息与预期不符,请在微软商店里更新或修复 Codex。"
+            }
+            _ => "",
+        };
+        self.error.context(format!(
+            "激活 Codex 失败(AUMID {},错误码 {code},共尝试 {} 次)。{hint}",
+            self.app_user_model_id, self.attempts
+        ))
+    }
+}
+
+/// 按 `delays_ms` 退避重试激活。每次重试前重新解析包目录与 AUMID:商店更新期间
+/// 注册的版本会变,旧目录/旧 AUMID 再试多少次都没用。
+///
+/// 成功返回 (进程 id, 实际用的 AUMID)。
+pub async fn activate_packaged_app_with_retry(
+    app_dir: &Path,
+    app_user_model_id: &str,
+    arguments: &str,
+    delays_ms: &[u64],
+) -> Result<(u32, String), PackagedActivationFailure> {
+    let mut current_dir = app_dir.to_path_buf();
+    let mut current_aumid = app_user_model_id.to_string();
+    let mut attempts = 0usize;
+    let mut history = Vec::new();
+    loop {
+        attempts += 1;
+        let error = match activate_packaged_app(&current_aumid, arguments).await {
+            Ok(process_id) => {
+                if attempts > 1 {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.windows_activation_recovered",
+                        serde_json::json!({
+                            "aumid": current_aumid,
+                            "app_dir": current_dir,
+                            "attempts": attempts,
+                            "history": history,
+                        }),
+                    );
+                }
+                return Ok((process_id, current_aumid));
+            }
+            Err(error) => error,
+        };
+        let code = activation_error_hresult(&error);
+        history.push(serde_json::json!({
+            "aumid": current_aumid,
+            "error_code": code.map(format_hresult),
+            "error": format!("{error:#}"),
+        }));
+        // 非瞬时错误只按旧行为再试一次(刚杀完进程时 COM 侧的激活锁)。
+        let retries_allowed = if packaged_activation_error_is_transient(code) {
+            delays_ms.len()
+        } else {
+            delays_ms.len().min(1)
+        };
+        if attempts > retries_allowed {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.windows_activation_failed",
+                serde_json::json!({
+                    "aumid": current_aumid,
+                    "app_dir": current_dir,
+                    "error_code": code.map(format_hresult),
+                    "attempts": attempts,
+                    "history": history,
+                    "error": format!("{error:#}"),
+                }),
+            );
+            return Err(PackagedActivationFailure {
+                app_user_model_id: current_aumid,
+                app_dir: current_dir,
+                error_code: code,
+                attempts,
+                error,
+            });
+        }
+        let delay = delays_ms[attempts - 1];
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.windows_activation_retry",
+            serde_json::json!({
+                "aumid": current_aumid,
+                "error_code": code.map(format_hresult),
+                "error": format!("{error:#}"),
+                "attempt": attempts,
+                "delay_ms": delay,
+            }),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        if let Some(resolved) = crate::app_paths::reresolve_packaged_app_dir(&current_dir) {
+            if let Some(aumid) = crate::app_paths::packaged_app_user_model_id(&resolved) {
+                current_aumid = aumid;
+                current_dir = resolved;
+            }
+        }
+    }
+}
+
+/// 激活失败后退到直接执行 exe 是否有意义:exe 得真的在,且不在 WindowsApps 下。
+pub fn direct_launch_fallback_is_sensible(executable: &Path) -> bool {
+    executable.is_file()
+        && !executable.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("WindowsApps"))
+        })
+}
+
 fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
     settings.active_relay_uses_protocol_proxy()
 }
@@ -1252,7 +1433,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                     app_user_model_id,
                     arguments,
                     ..
-                } = &activation
+                } = activation
                 else {
                     unreachable!();
                 };
@@ -1260,52 +1441,53 @@ impl LaunchHooks for DefaultLaunchHooks {
                 // Windows 走的是 TerminateProcess)。激活要是再失败,用户手上就
                 // **什么都不剩了** —— 比「能用但没有增强功能」糟得多。
                 //
-                // 失败是真会发生的:刚终止完 COM 侧还可能持着激活锁,MSIX 包在
-                // 更新/重注册期间也会拒绝激活。所以隔一会儿重试一次。
-                //
-                // 这条路径原先是个光秃秃的 `?`,失败时一条诊断都不留 ——
-                // 而它刚从「MSIX 用户永远走不到」变成「所有 Windows 用户都走」,
-                // 正是最需要看得见的时候。macOS 分支在下面 30 行处为同一个问题
-                // 做过一次同样的加固(那边的注释写得更细)。
-                let process_id = match activate_packaged_app(app_user_model_id, arguments).await {
-                    Ok(process_id) => process_id,
-                    Err(first_error) => {
-                        let _ = crate::diagnostic_log::append_diagnostic_log(
-                            "launcher.windows_activation_retry",
-                            serde_json::json!({ "error": format!("{first_error:#}") }),
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                        match activate_packaged_app(app_user_model_id, arguments).await {
-                            Ok(process_id) => process_id,
-                            Err(second_error) => {
-                                let _ = crate::diagnostic_log::append_diagnostic_log(
-                                    "launcher.windows_activation_failed",
-                                    serde_json::json!({
-                                        "first": format!("{first_error:#}"),
-                                        "error": format!("{second_error:#}"),
-                                    }),
-                                );
-                                return Err(second_error);
-                            }
+                // 失败是真会发生的:刚终止完 COM 侧还可能持着激活锁;商店正在更新
+                // Codex 时包处于注册中,激活报 0x80073D28(2026-09-18 线上实测:
+                // 1.5 秒后重试仍失败、弹了「ReCodex 启动失败」,4 秒后用户手动再点
+                // 就好了);manifest 里 Application Id 对不上报 0x80270254。
+                // 所以按退避重试,并且**每次重新解析包**:更新完成后注册的是新版本
+                // 目录,AUMID 的应用段也要从新 manifest 里重新读。
+                let outcome = activate_packaged_app_with_retry(
+                    app_dir,
+                    &app_user_model_id,
+                    &arguments,
+                    PACKAGED_ACTIVATION_RETRY_DELAYS_MS,
+                )
+                .await;
+                match outcome {
+                    Ok((process_id, app_user_model_id)) => {
+                        apply_codexplusplus_window_icon_after_launch(process_id);
+                        if let Some(inspector_port) = native_menu_inspector_port {
+                            start_native_menu_localizer(inspector_port, debug_port);
                         }
+                        return Ok(CodexLaunch::PackagedActivation {
+                            app_user_model_id,
+                            arguments,
+                            process_id: Some(process_id),
+                        });
                     }
-                };
-                apply_codexplusplus_window_icon_after_launch(process_id);
-                if let Some(inspector_port) = native_menu_inspector_port {
-                    start_native_menu_localizer(inspector_port, debug_port);
+                    Err(failure) => {
+                        // 上游 6c11bf7 在这里无条件退到「直接执行 exe」。但 MSIX 包
+                        // 装在 WindowsApps 下,那里的 exe 普通进程执行不了(见
+                        // app_paths::find_codex_cli 的注释,线上实测 Access is denied),
+                        // 退过去只会把「激活失败 0x80073D28」换成一句更难懂的
+                        // 「failed to launch Codex executable」。所以只有 exe 不在
+                        // WindowsApps 下(侧载/解包的包目录)才退。
+                        let executable = crate::app_paths::build_codex_executable(&failure.app_dir);
+                        if !direct_launch_fallback_is_sensible(&executable) {
+                            return Err(failure.into_error());
+                        }
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.packaged_activation_fallback",
+                            serde_json::json!({
+                                "aumid": failure.app_user_model_id,
+                                "error_code": failure.error_code.map(format_hresult),
+                                "app_dir": failure.app_dir,
+                                "executable": executable,
+                            }),
+                        );
+                    }
                 }
-                return Ok(match activation {
-                    CodexLaunch::PackagedActivation {
-                        app_user_model_id,
-                        arguments,
-                        ..
-                    } => CodexLaunch::PackagedActivation {
-                        app_user_model_id,
-                        arguments,
-                        process_id: Some(process_id),
-                    },
-                    CodexLaunch::Process { .. } => unreachable!(),
-                });
             }
         }
 
@@ -3697,6 +3879,7 @@ fn launch_status(
         debug_port: Some(debug_port),
         helper_port: Some(helper_port),
         codex_app: Some(app_dir.to_string_lossy().to_string()),
+        aumid: crate::app_paths::packaged_app_user_model_id(app_dir),
     }
 }
 
