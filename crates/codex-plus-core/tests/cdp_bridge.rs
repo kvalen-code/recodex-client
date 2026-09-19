@@ -737,7 +737,7 @@ fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
     assert!(
         !script.contains("if (name === \"openai-bundled\") return \"codex-plus-openai-bundled\"")
     );
-    assert!(script.contains("if (name === \"openai-bundled\") return \"OpenAI插件1(Codex++)\""));
+    assert!(script.contains("if (name === \"openai-bundled\") return \"OpenAI插件1(ReCodex)\""));
 }
 
 #[test]
@@ -799,21 +799,21 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
         "next.remoteMarketplaceName = restorePluginMarketplaceName(next.remoteMarketplaceName)"
     ));
     assert!(!script.contains("marketplace.name = alias"));
-    assert!(script.contains("if (name === \"openai-curated\") return \"OpenAI插件2(Codex++)\""));
+    assert!(script.contains("if (name === \"openai-curated\") return \"OpenAI插件2(ReCodex)\""));
     assert!(
-        script.contains("if (name === \"openai-primary-runtime\") return \"OpenAI插件3(Codex++)\"")
+        script.contains("if (name === \"openai-primary-runtime\") return \"OpenAI插件3(ReCodex)\"")
     );
     assert!(script.contains("restored === \"openai-api-curated\""));
     assert!(script.contains("restored === \"openai-curated-remote\""));
     assert!(
-        script.contains("if (name === \"openai-curated-remote\") return \"OpenAI插件5(Codex++)\"")
+        script.contains("if (name === \"openai-curated-remote\") return \"OpenAI插件5(ReCodex)\"")
     );
     assert!(script.contains(
         "if (name === \"codex-plus-openai-curated-remote\") return \"openai-curated-remote\""
     ));
-    assert!(script.contains("OpenAI插件1(Codex++)"));
-    assert!(script.contains("OpenAI插件2(Codex++)"));
-    assert!(script.contains("OpenAI插件3(Codex++)"));
+    assert!(script.contains("OpenAI插件1(ReCodex)"));
+    assert!(script.contains("OpenAI插件2(ReCodex)"));
+    assert!(script.contains("OpenAI插件3(ReCodex)"));
     assert!(script.contains("method === \"install-plugin\""));
     assert!(script.contains("plugin_marketplace_response_expanded"));
     assert!(script.contains("plugin_build_flavor_filter_bypassed"));

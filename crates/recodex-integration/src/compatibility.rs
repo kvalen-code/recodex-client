@@ -19,7 +19,7 @@ pub fn check(version: &str, minimum: &str) -> Result<Compatibility, AdapterError
     Ok(Compatibility {
         supported,
         minimum_version: minimum.to_owned(),
-        reason: (!supported).then(|| format!("Codex++ {version} is older than {minimum}")),
+        reason: (!supported).then(|| format!("ReCodex {version} is older than {minimum}")),
     })
 }
 

@@ -852,7 +852,7 @@
       /* Dark theme overrides for delete-confirm dialogs.
          Triggered either by Codex applying a "dark" class / data-theme="dark"
          on its document root, or by the OS-level prefers-color-scheme hint.
-         Palette matches the existing Codex++ dark modal (.codex-plus-modal-content). */
+         Palette matches the existing ReCodex dark modal (.codex-plus-modal-content). */
       html.dark .codex-delete-confirm-overlay,
       html[data-theme="dark"] .codex-delete-confirm-overlay,
       :root[data-theme="dark"] .codex-delete-confirm-overlay {
@@ -3795,11 +3795,11 @@
   }
 
   function displayNameForPluginMarketplaceName(name, fallback) {
-    if (name === "openai-bundled") return "OpenAI插件1(Codex++)";
-    if (name === "openai-curated") return "OpenAI插件2(Codex++)";
-    if (name === "openai-primary-runtime") return "OpenAI插件3(Codex++)";
-    if (name === "openai-api-curated") return "OpenAI插件4(Codex++)";
-    if (name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
+    if (name === "openai-bundled") return "OpenAI插件1(ReCodex)";
+    if (name === "openai-curated") return "OpenAI插件2(ReCodex)";
+    if (name === "openai-primary-runtime") return "OpenAI插件3(ReCodex)";
+    if (name === "openai-api-curated") return "OpenAI插件4(ReCodex)";
+    if (name === "openai-curated-remote") return "OpenAI插件5(ReCodex)";
     return fallback;
   }
 
@@ -7021,7 +7021,7 @@
     if (!trigger) return false;
     const payload = upstreamWorktreePayloadFromSelection(trigger) || upstreamWorktreeNativePayloadFromElement(trigger);
     if (!payload) {
-      showToast("无法安全识别 Codex 原生 worktree 表单，请使用 Codex++ 菜单创建。", null);
+      showToast("无法安全识别 Codex 原生 worktree 表单，请使用 ReCodex 菜单创建。", null);
       return false;
     }
     event.preventDefault();

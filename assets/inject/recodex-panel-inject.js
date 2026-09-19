@@ -876,7 +876,7 @@
     scanOfficialAccountUi();
   }
 
-  // ── 增强开关(Codex++ 增强,经 /settings 桥,与 recodex 登录无关)──
+  // ── 增强开关(客户端增强功能,经 /settings 桥,与 recodex 登录无关)──
   // 键名必须与后端设置一致(camelCase);snake_case 会被服务端静默忽略,表现为「点了没反应」。
   const ENH = [
     ["codexAppSessionDelete", "会话删除"],
