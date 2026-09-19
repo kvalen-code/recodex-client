@@ -316,6 +316,10 @@ pub struct BackendSettings {
     pub codex_app_image_overlay_fit_mode: String,
     #[serde(rename = "codexGoalsEnabled", default)]
     pub codex_goals_enabled: bool,
+    // recodex-overlay: 手机远程「跟随账号自动连接」开关(phone_remote)。开 = 启动时自动接入手机
+    // + 开机自启;只经 /remote/* 桥写,不进 merge_known_setting_fields(/settings/set 改不了它)。
+    #[serde(rename = "phoneRemoteFollowAccount", default)]
+    pub phone_remote_follow_account: bool,
     #[serde(rename = "weixinConnectEnabled", default)]
     pub weixin_connect_enabled: bool,
     #[serde(
@@ -401,6 +405,7 @@ impl Default for BackendSettings {
             codex_app_image_overlay_opacity: default_image_overlay_opacity(),
             codex_app_image_overlay_fit_mode: default_image_overlay_fit_mode(),
             codex_goals_enabled: false,
+            phone_remote_follow_account: false,
             weixin_connect_enabled: false,
             weixin_connect_base_url: default_weixin_connect_base_url(),
             weixin_connect_token: String::new(),

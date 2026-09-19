@@ -315,6 +315,9 @@ async fn launcher_main(
     // 与这条毫无关系。删掉。
     // recodex-overlay: 微信连接按已保存设置自动拉起(原由 manager 负责)
     codex_plus_core::connect::control::start_from_saved_settings();
+    // recodex-overlay: 手机远程「跟随账号」开着就自动接入:没配对则发起配对(手机弹窗),
+    // 已配对则保证守护进程在跑。与微信一样放在单实例锁之后,后台进行、不拖慢启动。
+    codex_plus_core::phone_remote::start_from_saved_settings();
     let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;

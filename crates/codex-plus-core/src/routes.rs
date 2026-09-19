@@ -179,6 +179,10 @@ pub async fn handle_bridge_request(
     if path.starts_with("/weixin/") {
         return crate::connect::control::handle_bridge(path, &payload).await;
     }
+    // recodex-overlay:hook — /remote/* 手机远程控制(phone_remote)。
+    if path.starts_with("/remote/") {
+        return crate::phone_remote::handle_bridge(path, &payload).await;
+    }
     let result = match path {
         "/settings/get" => settings_value(&ctx, ctx.settings.get_settings().await).await,
         "/settings/set" => {

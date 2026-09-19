@@ -17,6 +17,7 @@ pub mod model_suffix;
 pub mod models;
 pub mod native_menu;
 pub mod paths;
+pub mod phone_remote; // recodex-overlay: 手机远程控制(远程组件运行时托管 + 跟随账号配对)
 pub mod plugin_marketplace;
 pub mod ports;
 pub mod protocol_proxy;

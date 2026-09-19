@@ -68,6 +68,10 @@ jobs:
       - name: 构建
         # --config .cargo/release.toml:出货专用,改写编进 exe 的源码路径(见该文件注释)
         run: cargo build --release -p codex-plus-launcher --config .cargo/release.toml
+        env:
+          # 手机远程:远程组件运行时的 minisign 发布公钥(与命令行 -X main.updatePublicKey 同一把)。
+          # 编进 exe 后,下载运行时要求清单与压缩包都验签通过;没配则退回 HTTPS+SHA-256(同桌面自更新)。
+          RECODEX_UPDATE_PUBLIC_KEY: ${{ vars.RECODEX_UPDATE_PUBLIC_KEY }}
 
       - name: 自检 —— exe 自报版本必须等于发布版本
         shell: pwsh
@@ -256,6 +260,9 @@ jobs:
 
       - name: 构建
         run: cargo build --release --target ${{ matrix.target }} -p codex-plus-launcher --config .cargo/release.toml
+        env:
+          # 手机远程的发布公钥,说明见 Windows 那一步
+          RECODEX_UPDATE_PUBLIC_KEY: ${{ vars.RECODEX_UPDATE_PUBLIC_KEY }}
 
       - name: 自检 —— 二进制里不带上游源码路径
         run: |
