@@ -457,7 +457,7 @@
   const codexDispatcherPatchVersion = "9";
   const codexAppServerRequestPatchVersion = "6";
   const codexRemoteSessionRecoveryVersion = "4";
-  const codexPluginMarketplaceUnlockVersion = "15";
+  const codexPluginMarketplaceUnlockVersion = "16";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -3168,33 +3168,49 @@
     return restored === "openai-bundled" || restored === "openai-curated" || restored === "openai-primary-runtime" || restored === "openai-api-curated" || restored === "openai-curated-remote";
   }
 
-  function isCodexPluginBuildFlavorFilter(callback, sample) {
-    if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
+  // Array.prototype.filter 被全局包了一层,每次 filter 都会走到这里 —— 回调源码只取一次、
+  // 按回调缓存(WeakMap 不挡 GC);普通 filter 在 installPluginBuildFlavorFilterPatch 里
+  // 就被「没过滤掉任何元素」快速放行,根本到不了取源码这一步。
+  const codexPluginFilterSourceCache = new WeakMap();
+
+  function codexPluginFilterCallbackSource(callback) {
+    if (codexPluginFilterSourceCache.has(callback)) {
+      return codexPluginFilterSourceCache.get(callback);
+    }
     let source = "";
     try {
       source = Function.prototype.toString.call(callback);
     } catch {
-      return false;
     }
-    const isKnownFilterSource = source.includes("!u(e.marketplaceName)||e.marketplaceName===r")
-      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n")
-      || source.includes("!Eu(e.marketplaceName)||e.marketplaceName===n");
-    if (!isKnownFilterSource) return false;
-    if (!sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName))) return false;
-    return sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName) && !callback(plugin));
+    codexPluginFilterSourceCache.set(callback, source);
+    return source;
   }
 
-  function isCodexPluginMarketplaceHiddenFilter(callback, sample) {
+  // 构建版本(buildFlavor)过滤器的源码形状:`!X(e.marketplaceName)||e.marketplaceName===Y`。
+  // X/Y 是压缩后的名字,每个 Codex 版本都会变(u/r、ne/n、Eu/n,26.915 是 ri/n),
+  // 所以按结构匹配,不按名字匹配。
+  const codexPluginBuildFlavorFilterSourcePattern = /!\s*[\w$]+\(\s*e\.marketplaceName\s*\)\s*\|\|\s*e\.marketplaceName\s*===\s*[\w$]+/;
+
+  function isCodexPluginBuildFlavorFilterSource(source) {
+    return codexPluginBuildFlavorFilterSourcePattern.test(String(source || ""));
+  }
+
+  function isCodexPluginBuildFlavorFilter(callback, sample, filtered = null) {
     if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
-    let source = "";
-    try {
-      source = Function.prototype.toString.call(callback);
-    } catch {
-      return false;
-    }
-    if (!source.includes("!t.includes(e.name)")) return false;
+    if (!sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName))) return false;
+    const source = codexPluginFilterCallbackSource(callback);
+    if (!source || !isCodexPluginBuildFlavorFilterSource(source)) return false;
+    return sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName)
+      && (Array.isArray(filtered) ? !filtered.includes(plugin) : !callback(plugin)));
+  }
+
+  function isCodexPluginMarketplaceHiddenFilter(callback, sample, filtered = null) {
+    if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
     if (!sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name))) return false;
-    return sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name) && !callback(marketplace));
+    const source = codexPluginFilterCallbackSource(callback);
+    if (!source || !source.includes("!t.includes(e.name)")) return false;
+    return sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name)
+      && (Array.isArray(filtered) ? !filtered.includes(marketplace) : !callback(marketplace)));
   }
 
   function installPluginBuildFlavorFilterPatch() {
@@ -3214,15 +3230,19 @@
       return;
     }
     const patchedFilter = function codexPluginBuildFlavorFilterPatch(callback, thisArg) {
-      if (isCodexPluginBuildFlavorFilter(callback, this)) {
+      // 先跑原生 filter:什么都没滤掉(绝大多数调用)就直接返回,不做任何源码检查;
+      // 滤掉了东西才判断是不是那两个要放行的过滤器,判断时复用这次的结果,不再二次调用回调。
+      const filtered = originalFilter.call(this, callback, thisArg);
+      if (filtered.length === this.length) return filtered;
+      if (isCodexPluginBuildFlavorFilter(callback, this, filtered)) {
         sendCodexPlusDiagnostic("plugin_build_flavor_filter_bypassed", { pluginCount: this.length });
         return Array.from(this);
       }
-      if (isCodexPluginMarketplaceHiddenFilter(callback, this)) {
+      if (isCodexPluginMarketplaceHiddenFilter(callback, this, filtered)) {
         sendCodexPlusDiagnostic("plugin_marketplace_hidden_filter_bypassed", { marketplaceCount: this.length });
         return Array.from(this);
       }
-      return originalFilter.call(this, callback, thisArg);
+      return filtered;
     };
     patchedFilter.__codexPluginBuildFlavorPatched = codexPluginMarketplaceUnlockVersion;
     Array.prototype.filter = patchedFilter;
@@ -3541,6 +3561,9 @@
       localFallback: localPluginMarketplaceFallbackResult,
       remoteOnlyFallback: remoteOnlyPluginMarketplaceFallbackResult,
       requestProfile: pluginMarketplaceRequestProfile,
+      isBuildFlavorFilter: isCodexPluginBuildFlavorFilter,
+      isBuildFlavorFilterSource: isCodexPluginBuildFlavorFilterSource,
+      isHiddenMarketplaceFilter: isCodexPluginMarketplaceHiddenFilter,
       setCodexAppVersion: (version) => {
         codexPlusBackendSettings.codexAppVersion = String(version || "");
       },
