@@ -111,8 +111,33 @@ fn normalize_path_text(value: &str) -> String {
 }
 
 /// `text`(注册表值、快捷方式字段)指的是不是 `path` 这个文件。
+///
+/// 先按文本比;不相等再落到文件系统上比一次。后者是必需的:同一个文件在
+/// Windows 上能有多种写法,最常见的是 8.3 短名 —— 用户名超过 8 个字符时
+/// `C:\Users\Administrator\…` 会以 `C:\Users\ADMINI~1\…` 的形式出现在
+/// 快捷方式字段里。只比文本会把它判成"不是我们的 exe",于是旧快捷方式的
+/// 目标不会被改指新程序,升级后点它就打不开(CI 的 Windows runner 正是
+/// `runneradmin` / `RUNNER~1` 这一对,把这个漏洞暴露了出来)。
+///
+/// 两边都要能在磁盘上解析才比较,解析不了就维持文本结论:这条路径只用于
+/// "要不要改写",拿不准时不动比误改安全。
 pub fn same_file_path(text: &str, path: &Path) -> bool {
-    !text.trim().is_empty() && normalize_path_text(text) == normalize_path_text(&path.to_string_lossy())
+    let text = text.trim().trim_matches('"');
+    if text.is_empty() {
+        return false;
+    }
+    if normalize_path_text(text) == normalize_path_text(&path.to_string_lossy()) {
+        return true;
+    }
+    let canon = |p: &Path| {
+        std::fs::canonicalize(p)
+            .ok()
+            .map(|c| normalize_path_text(&c.to_string_lossy()))
+    };
+    match (canon(Path::new(text)), canon(path)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// 决定一个 .lnk 要怎么改。
@@ -1337,6 +1362,30 @@ mod tests {
 
     fn p(value: &str) -> PathBuf {
         PathBuf::from(value)
+    }
+
+    /// 同一个文件换个写法也要认出来。
+    ///
+    /// 真实场景是 Windows 的 8.3 短名(`C:\Users\ADMINI~1\…`),测试里造不出来,
+    /// 就用同样绕过纯文本比较的 `.` 段代替:两者都只有落到文件系统上解析才相等。
+    /// 只比文本的旧实现在这里必然为假。
+    #[test]
+    fn same_file_path_resolves_a_second_spelling_of_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("recodex.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let spelled_differently = dir.path().join(".").join("recodex.exe");
+        assert_ne!(
+            normalize_path_text(&spelled_differently.to_string_lossy()),
+            normalize_path_text(&exe.to_string_lossy()),
+            "这条用例要的就是文本不等、实际同一个文件"
+        );
+        assert!(same_file_path(&spelled_differently.to_string_lossy(), &exe));
+        // 另一个不存在的文件不能因为"都解析不了"就算相等。
+        assert!(!same_file_path(
+            &dir.path().join("other.exe").to_string_lossy(),
+            &exe
+        ));
     }
 
     /// 用本平台的路径形态造安装目录,测试在 mac/linux 上也成立(那边 `\` 不是分隔符)。
