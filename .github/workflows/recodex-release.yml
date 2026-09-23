@@ -171,8 +171,10 @@ jobs:
           # 老客户端不认识这个字段,照常只换主程序。
           $sidecar = "dist/windows/app/recodex-lease.exe"
           if (Test-Path $sidecar) {
+            # 只写文件名:客户端相对主程序 url 解析。主程序 url 由构建机的
+            # publish-desktop.sh 改成绝对地址,它不认识 sidecar 字段 —— 相对写法不依赖它。
             $manifest.sidecar = [ordered]@{
-              url    = "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/recodex-lease.exe"
+              url    = "recodex-lease.exe"
               sha256 = (Get-FileHash -LiteralPath $sidecar -Algorithm SHA256).Hash.ToLowerInvariant()
             }
             Copy-Item $sidecar "dist/upload/$v/"
@@ -220,7 +222,7 @@ jobs:
           if ($m.sidecar) {
             $localSidecar = (Get-FileHash "dist/upload/$v/recodex-lease.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($m.sidecar.sha256 -ne $localSidecar) { throw "线上 manifest 的 sidecar sha256 与本地不一致" }
-            Invoke-WebRequest -Uri $m.sidecar.url -Method Head -UseBasicParsing -TimeoutSec 30 | Out-Null
+            Invoke-WebRequest -Uri "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/recodex-lease.exe" -Method Head -UseBasicParsing -TimeoutSec 30 | Out-Null
           }
           Write-Host "回读校验通过:manifest 与包体公网可取"
 

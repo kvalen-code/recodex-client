@@ -44,6 +44,12 @@ pub struct UpdateManifest {
 /// 附带文件的下载地址与哈希。安全要求与主程序完全相同:https + sha256 + 可执行格式。
 #[derive(Debug, Clone, Deserialize)]
 pub struct SidecarAsset {
+    /// 可以是绝对地址,也可以是**相对主程序 url** 的地址(CI 写的就是文件名 `recodex-lease.exe`)。
+    ///
+    /// 为什么允许相对:CI 没配 RECODEX_CLIENT_BASE_URL,清单里的地址本来就是相对的,
+    /// 由构建机的 publish-desktop.sh 把**主程序的** url 改写成绝对地址 —— 它不知道
+    /// sidecar 这个字段。相对主程序解析,就不用去改一台共享构建机上的发布脚本,
+    /// 而且 sidecar 与主程序永远在同一个版本目录里。解析结果仍然必须是 https。
     pub url: String,
     pub sha256: String,
 }
@@ -146,11 +152,28 @@ pub async fn download_verified(manifest: &UpdateManifest) -> anyhow::Result<Vec<
 }
 
 /// 下载并校验 sidecar。规矩与主程序一样。
-pub async fn download_sidecar_verified(asset: &SidecarAsset) -> anyhow::Result<Vec<u8>> {
+pub async fn download_sidecar_verified(
+    manifest: &UpdateManifest,
+    asset: &SidecarAsset,
+) -> anyhow::Result<Vec<u8>> {
     if asset.sha256.trim().is_empty() {
         anyhow::bail!("sidecar 缺少 sha256,拒绝安装");
     }
-    download_checked(&asset.url, &asset.sha256, "sidecar").await
+    let url = resolve_sidecar_url(&manifest.url, &asset.url)?;
+    download_checked(&url, &asset.sha256, "sidecar").await
+}
+
+/// sidecar 地址相对主程序地址解析(见 `SidecarAsset::url`)。结果必须是 https。
+pub fn resolve_sidecar_url(main_url: &str, sidecar_url: &str) -> anyhow::Result<String> {
+    let sidecar_url = sidecar_url.trim();
+    let resolved = match url::Url::parse(sidecar_url) {
+        Ok(absolute) => absolute,
+        Err(url::ParseError::RelativeUrlWithoutBase) => require_https(main_url, "安装包")?
+            .join(sidecar_url)
+            .map_err(|error| anyhow::anyhow!("sidecar 地址无效:{error}"))?,
+        Err(error) => anyhow::bail!("sidecar 地址无效:{error}"),
+    };
+    Ok(require_https(resolved.as_str(), "sidecar")?.to_string())
 }
 
 async fn download_checked(url: &str, sha256: &str, what: &str) -> anyhow::Result<Vec<u8>> {
@@ -357,6 +380,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// CI 写的是文件名;构建机只把主程序 url 改成绝对地址 —— sidecar 要跟着它走。
+    #[test]
+    fn sidecar_url_resolves_against_the_main_url() {
+        let main = "https://oss.jzspace.cn/client/1.3.9/recodex.exe";
+        assert_eq!(
+            resolve_sidecar_url(main, "recodex-lease.exe").unwrap(),
+            "https://oss.jzspace.cn/client/1.3.9/recodex-lease.exe"
+        );
+        assert_eq!(
+            resolve_sidecar_url(main, "https://cdn.example/x/recodex-lease.exe").unwrap(),
+            "https://cdn.example/x/recodex-lease.exe"
+        );
+        // 解析结果仍必须是 https:明文地址、相对地址落到明文主地址上,一律拒。
+        assert!(resolve_sidecar_url(main, "http://evil.example/recodex-lease.exe").is_err());
+        assert!(resolve_sidecar_url("http://oss.example/1.3.9/recodex.exe", "recodex-lease.exe").is_err());
+        assert!(resolve_sidecar_url("/1.3.9/recodex.exe", "recodex-lease.exe").is_err(), "主地址本身还是相对的时候不能瞎拼");
     }
 
     /// 老清单没有 sidecar 字段:必须照常解析(老服务端配置 + 新客户端)。

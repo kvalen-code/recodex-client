@@ -775,7 +775,7 @@ async fn update_sidecar_best_effort(
     let Some(dir) = exe.parent() else {
         return "no_dir";
     };
-    let outcome = match crate::selfupdate::download_sidecar_verified(asset).await {
+    let outcome = match crate::selfupdate::download_sidecar_verified(manifest, asset).await {
         Ok(bytes) => match crate::selfupdate::stage_sidecar(
             &dir.join(crate::selfupdate::sidecar_file_name()),
             &bytes,
