@@ -110,6 +110,8 @@ jobs:
       - name: 取租约直连 sidecar(可选)
         if: vars.RECODEX_LEASE_SIDECAR != 'off'
         shell: pwsh
+        env:
+          RECODEX_UPDATE_PUBLIC_KEY: ${{ vars.RECODEX_UPDATE_PUBLIC_KEY }}
         run: |
           $base = "${{ vars.RECODEX_LEASE_SIDECAR_BASE || 'https://oss.jzspace.cn/client/cli/latest' }}"
           try {
@@ -122,6 +124,20 @@ jobs:
           $got = (Get-FileHash sidecar.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           if ([string]::IsNullOrWhiteSpace($want) -or $want.ToLowerInvariant() -ne $got) {
             Write-Warning "sidecar 哈希与 SHA256SUMS 对不上(want=$want got=$got),本包不捆绑"; exit 0
+          }
+          # 验 minisign 签名,**在执行它之前**。SHA256SUMS 与二进制在同一个 OSS 目录,拿到写权限的人能一起换;
+          # 签名私钥不在 OSS 上。没配公钥或验不过一律不捆(fail closed),不让发布失败。
+          if ([string]::IsNullOrWhiteSpace($env:RECODEX_UPDATE_PUBLIC_KEY)) {
+            Write-Warning "没配 RECODEX_UPDATE_PUBLIC_KEY,无法验 sidecar 签名,本包不捆绑"; exit 0
+          }
+          try {
+            Invoke-WebRequest -Uri "$base/recodex.exe.minisig" -OutFile sidecar.minisig -UseBasicParsing -TimeoutSec 60
+          } catch {
+            Write-Warning "取不到 sidecar 签名,本包不捆绑:$($_.Exception.Message)"; exit 0
+          }
+          cargo run --release -q -p codex-plus-core --example verify_minisign -- sidecar.exe sidecar.minisig
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "sidecar 签名验不过,本包不捆绑"; exit 0
           }
           # 关进临时目录跑:绝不碰 runner 的真用户目录。空 stdin = 没有令牌,新版必答 no_token。
           # stdin 必须真是空的(经 cmd 的 < NUL):PowerShell 往原生程序管道里写 '' 时
@@ -335,6 +351,8 @@ jobs:
       # 对哈希、真跑一次认得 `lease desktop-follow` 才捆;任何一道不过只跳过、不让发布失败。
       - name: 取租约直连 sidecar(可选)
         if: vars.RECODEX_LEASE_SIDECAR != 'off'
+        env:
+          RECODEX_UPDATE_PUBLIC_KEY: ${{ vars.RECODEX_UPDATE_PUBLIC_KEY }}
         run: |
           set -uo pipefail
           base="${{ vars.RECODEX_LEASE_SIDECAR_BASE || 'https://oss.jzspace.cn/client/cli/latest' }}"
@@ -348,6 +366,16 @@ jobs:
           got="$(shasum -a 256 sidecar.bin | awk '{print $1}')"
           if [ -z "$want" ] || [ "$want" != "$got" ]; then
             echo "::warning::sidecar 哈希与 SHA256SUMS 对不上(want=$want got=$got),本包不捆绑"; exit 0
+          fi
+          # 验 minisign 签名,在执行它之前(理由见 Windows 那一步)。
+          if [ -z "${RECODEX_UPDATE_PUBLIC_KEY:-}" ]; then
+            echo "::warning::没配 RECODEX_UPDATE_PUBLIC_KEY,无法验 sidecar 签名,本包不捆绑"; exit 0
+          fi
+          if ! curl -fsSL --max-time 60 -o sidecar.minisig "$base/$name.minisig"; then
+            echo "::warning::取不到 sidecar 签名,本包不捆绑"; exit 0
+          fi
+          if ! cargo run --release -q -p codex-plus-core --example verify_minisign -- sidecar.bin sidecar.minisig; then
+            echo "::warning::sidecar 签名验不过,本包不捆绑"; exit 0
           fi
           chmod +x sidecar.bin
           sbx="$(mktemp -d)"
