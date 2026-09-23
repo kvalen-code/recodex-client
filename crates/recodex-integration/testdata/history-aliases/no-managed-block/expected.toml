@@ -1,0 +1,4 @@
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://x.invalid/v1"
