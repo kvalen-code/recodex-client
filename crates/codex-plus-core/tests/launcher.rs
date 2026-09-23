@@ -2198,6 +2198,59 @@ async fn protocol_proxy_port_wait_gives_the_previous_helper_time_to_let_go() {
 }
 
 #[test]
+fn bridge_health_reinjects_only_after_consecutive_unhealthy_results() {
+    use codex_plus_core::launcher::{
+        should_reinject_after_health_result, BridgeWatchdogOutcome, BRIDGE_HEALTH_FAILURE_THRESHOLD,
+    };
+
+    // 暂不动手也算可用:不能因为一次「先看看」就开始退避。
+    assert!(BridgeWatchdogOutcome::Deferred.bridge_is_usable());
+
+    // 一次不健康不重注入,连续两次才动手(上游 2e5da00)。
+    let mut failures = 0;
+    assert!(!should_reinject_after_health_result(Some(false), false, &mut failures));
+    assert_eq!(failures, 1);
+    assert!(should_reinject_after_health_result(Some(false), false, &mut failures));
+    assert_eq!(failures, BRIDGE_HEALTH_FAILURE_THRESHOLD);
+
+    // 健康一次就清零。
+    assert!(!should_reinject_after_health_result(Some(true), false, &mut failures));
+    assert_eq!(failures, 0);
+
+    // 结论不确定(页面忙)既不动手,也把计数清零。
+    failures = 1;
+    assert!(!should_reinject_after_health_result(None, false, &mut failures));
+    assert_eq!(failures, 0);
+
+    // 浏览器换代:旧桥必然不在了,第一次就重注入。
+    assert!(should_reinject_after_health_result(Some(false), true, &mut failures));
+
+    // 重注入后仍不健康(比如根本没开 CDP):计数不回落,每跳都会继续尝试,
+    // 失败累积到退避与重启自愈的路径不受影响。
+    let mut failures = BRIDGE_HEALTH_FAILURE_THRESHOLD;
+    assert!(should_reinject_after_health_result(Some(false), false, &mut failures));
+}
+
+#[test]
+fn only_a_busy_renderer_makes_the_health_probe_indeterminate() {
+    use codex_plus_core::launcher::health_probe_error_is_indeterminate;
+
+    // 命令发出去了、页面没空回:桥的真实状态看渲染层心跳,不因此重注入。
+    assert!(health_probe_error_is_indeterminate(
+        "timed out waiting for CDP command Runtime.evaluate id 3 response after 5s"
+    ));
+    // 调试端口本身有问题:必须照旧算失败,否则「Codex 没开 CDP」永远发现不了,
+    // 连续失败后的重启自愈就废了。
+    for error in [
+        "tcp connect error: Connection refused (os error 10061)",
+        "timed out connecting CDP websocket after 5s",
+        "No injectable Codex page target",
+    ] {
+        assert!(!health_probe_error_is_indeterminate(error), "{error}");
+    }
+}
+
+#[test]
 fn bridge_watchdog_only_backs_off_when_the_bridge_stays_broken() {
     use codex_plus_core::launcher::BridgeWatchdogOutcome;
 

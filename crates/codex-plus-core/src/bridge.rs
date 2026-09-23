@@ -110,6 +110,9 @@ pub fn build_bridge_script(binding_name: &str) -> String {
     }});
   }}
   window.__codexSessionDeleteCallbacks = new Map();
+  // 记下注入时刻:刚注入的 5 秒内渲染层心跳还没来得及跑,看门狗照此算健康(上游 2e5da00)。
+  window.__codexPlusBridgeHealth = window.__codexPlusBridgeHealth || {{}};
+  window.__codexPlusBridgeHealth.lastInjectionAt = Date.now();
   // 序号**不归零**:上一代桥迟到的响应带的是旧 id,归零后会撞上新请求的同号 id,
   // 把别人的结果塞给新请求。
   window.__codexSessionDeleteSeq = Number.isFinite(window.__codexSessionDeleteSeq)
@@ -140,16 +143,25 @@ pub fn build_bridge_script(binding_name: &str) -> String {
 pub fn bridge_health_check_script() -> &'static str {
     r#"
 (() => {
+  // 被动心跳(上游 2e5da00 + d3ec578):渲染层自己的后端心跳把真实的桥接结果写进
+  // __codexPlusBridgeHealth,这里只读,同步返回,不再另起一次桥接请求。原来那种
+  // 「调一次 /backend/status、2 秒没回就判死」在页面忙时必然超时,看门狗随即重注入
+  // 整份脚本 —— 反复重注入就是整页刷新循环。
   const bridge = window.__codexSessionDeleteBridge;
-  if (typeof bridge !== "function") return false;
-  try {
-    return Promise.race([
-      Promise.resolve(bridge("/backend/status", {})).then((result) => !!result && result.status === "ok"),
-      new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
-    ]);
-  } catch (error) {
-    return false;
-  }
+  const health = window.__codexPlusBridgeHealth;
+  if (typeof bridge !== "function" || !health) return false;
+  const now = Date.now();
+  const lastSuccessAt = Number(health.lastSuccessAt) || 0;
+  const lastInjectionAt = Number(health.lastInjectionAt) || 0;
+  const lastAttemptAt = Number(health.lastAttemptAt) || 0;
+  if (lastInjectionAt > 0 && now - lastInjectionAt <= 5000) return true;
+  if (lastSuccessAt > 0 && now - lastSuccessAt <= 15000) return true;
+  // 页面忙时状态请求会超时,但心跳仍在调用桥接,最近一次尝试也算活着(上游 d3ec578)。
+  // 和上游不同:只在最近 60 秒内真的成功过时才这么算。桥真死了(比如和 Codex 的 CDP
+  // 会话断了)每次调用也都是超时,「最近尝试」会一直刷新 —— 不设这个上限,看门狗就
+  // 永远认为它活着、永远不修。页面忙一阵子能扛,死透了 60 秒后照样会被发现。
+  return lastAttemptAt > 0 && now - lastAttemptAt <= 15000
+    && lastSuccessAt > 0 && now - lastSuccessAt <= 60000;
 })()
 "#
 }
@@ -834,6 +846,58 @@ fn next_message_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 被动心跳健康判定:用 node 跑真正的脚本,逐个场景喂 window.__codexPlusBridgeHealth。
+    #[test]
+    fn passive_bridge_health_check_tolerates_busy_pages_but_not_dead_bridges() {
+        let script = bridge_health_check_script();
+        let harness = format!(
+            r#"
+globalThis.window = globalThis;
+const now = Date.now();
+const check = (health, hasBridge = true) => {{
+  window.__codexSessionDeleteBridge = hasBridge ? () => {{}} : undefined;
+  window.__codexPlusBridgeHealth = health;
+  return ({script});
+}};
+console.log(JSON.stringify({{
+  justInjected: check({{ lastInjectionAt: now - 1000 }}),
+  recentSuccess: check({{ lastInjectionAt: now - 60000, lastSuccessAt: now - 3000 }}),
+  busyButRecentlyOk: check({{ lastSuccessAt: now - 30000, lastAttemptAt: now - 2000 }}),
+  deadBridgeKeepsTimingOut: check({{ lastSuccessAt: now - 120000, lastAttemptAt: now - 2000 }}),
+  deadFromTheStart: check({{ lastInjectionAt: now - 20000, lastAttemptAt: now - 2000 }}),
+  stale: check({{ lastSuccessAt: now - 20000 }}),
+  noHealthYet: check(undefined),
+  bridgeMissing: check({{ lastSuccessAt: now - 1000 }}, false),
+}}));
+"#
+        );
+        let output = match std::process::Command::new("node")
+            .arg("-e")
+            .arg(&harness)
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => {
+                eprintln!("跳过:没有 node");
+                return;
+            }
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["justInjected"], true, "刚注入的 5 秒宽限:{value}");
+        assert_eq!(value["recentSuccess"], true, "{value}");
+        assert_eq!(value["busyButRecentlyOk"], true, "页面忙一阵子不能判死:{value}");
+        assert_eq!(value["deadBridgeKeepsTimingOut"], false, "桥死了只剩超时,不能永远算活着:{value}");
+        assert_eq!(value["deadFromTheStart"], false, "一注入就是死桥:{value}");
+        assert_eq!(value["stale"], false, "{value}");
+        assert_eq!(value["noHealthYet"], false, "{value}");
+        assert_eq!(value["bridgeMissing"], false, "{value}");
+    }
 
     /// 重新注入时:挂着的请求以失败了结(不是永久 pending),序号接着往上数。
     /// 用 node 真跑一遍脚本;机器上没有 node 就跳过(只做字符串断言的那条在

@@ -1653,6 +1653,8 @@ impl LaunchHooks for DefaultLaunchHooks {
             // 默认还会把积压的 tick 补发 —— 等于对着一个死端口连续不断地打 HTTP,
             // 顺带把本地诊断日志刷成上万条。退避让「死透了」的代价降到每分钟一次。
             let mut consecutive_failures: u32 = 0;
+            // 连续探测不健康的次数(跨跳保留),到 BRIDGE_HEALTH_FAILURE_THRESHOLD 才重注入。
+            let mut health_failures: u8 = 0;
             loop {
                 // 先睡再查,和原来的 interval 不同:tokio 的 interval 首跳是**立即**
                 // 返回的。而看门狗恰好是在 ensure_injection 成功之后才启动的,
@@ -1680,6 +1682,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                                 helper_port,
                                 identity_changed,
                                 bridge_reinjector.clone(),
+                                &mut health_failures,
                             ),
                         );
                         // 只有「断了而且没修回来」才退避。桥健康(什么都没做)
@@ -3177,13 +3180,55 @@ pub enum BridgeWatchdogOutcome {
     Reinjected,
     /// 桥断了,重注入也失败 —— 只有这一种该退避。
     Failed,
+    /// 这一跳没动手:探测结果不确定(页面忙、CDP 命令超时),或者不健康但还没连续
+    /// 达到 [`BRIDGE_HEALTH_FAILURE_THRESHOLD`] 次。按可用处理,不退避,5 秒后再看。
+    Deferred,
 }
 
 impl BridgeWatchdogOutcome {
-    /// 这一跳算不算「桥当前是可用的」。健康和刚修好都算。
+    /// 这一跳算不算「桥当前是可用的」。健康、刚修好、暂不动手都算。
     pub fn bridge_is_usable(self) -> bool {
         !matches!(self, Self::Failed)
     }
+}
+
+/// 连续几次探测不健康才重注入(上游 2e5da00)。一次不健康就重注入整份脚本,
+/// 页面一忙就会反复重注入 —— 那就是整页刷新循环。
+pub const BRIDGE_HEALTH_FAILURE_THRESHOLD: u8 = 2;
+
+/// 健康探测出错时,哪些错误只说明「这次没问出来」而不代表桥坏了。
+///
+/// 只认 CDP 命令等回复超时:连上了、命令也发了,是渲染进程忙着没空答 —— 桥的真实
+/// 状态由渲染层心跳记着,不该因此重注入。「连不上 / 没有页面 / 连 WebSocket 超时」
+/// 说明调试端口本身有问题,必须照旧算失败,否则看门狗就再也发现不了「Codex 没开
+/// CDP」,连续失败后的重启自愈也就废了 —— 这是和上游不同的地方,上游把 CDP 超时
+/// 一律算不确定。
+pub fn health_probe_error_is_indeterminate(error: &str) -> bool {
+    error.contains("timed out waiting for CDP command")
+}
+
+/// 根据这一跳的探测结论决定要不要重注入,并维护连续不健康计数。
+/// `None` = 结论不确定:不动手,计数清零(上游 2e5da00 同款)。
+pub fn should_reinject_after_health_result(
+    healthy: Option<bool>,
+    browser_identity_changed: bool,
+    health_failures: &mut u8,
+) -> bool {
+    let Some(healthy) = healthy else {
+        *health_failures = 0;
+        return false;
+    };
+    if healthy {
+        *health_failures = 0;
+        return false;
+    }
+    if browser_identity_changed {
+        // 浏览器换了一代,旧桥必然不在了,不用等第二次。
+        *health_failures = BRIDGE_HEALTH_FAILURE_THRESHOLD;
+    } else {
+        *health_failures = health_failures.saturating_add(1);
+    }
+    *health_failures >= BRIDGE_HEALTH_FAILURE_THRESHOLD
 }
 
 /// 看门狗下一跳的间隔:健康时 5 秒(桥抖一下要马上补回来),连续失败就退避到每分钟。
@@ -3396,28 +3441,41 @@ async fn check_and_reinject_bridge(
     helper_port: u16,
     browser_identity_changed: bool,
     bridge_reinjector: Option<BridgeReinjector>,
+    health_failures: &mut u8,
 ) -> BridgeWatchdogOutcome {
     let healthy = if browser_identity_changed {
-        false
+        Some(false)
     } else {
         match bridge_health_ok(debug_port).await {
-            Ok(healthy) => healthy,
+            Ok(healthy) => Some(healthy),
             Err(error) => {
+                let message = error.to_string();
+                // 用完整错误链判定({:#}):以后有人在中间多包一层 context,关键字也不会被挡住。
+                let indeterminate = health_probe_error_is_indeterminate(&format!("{error:#}"));
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "bridge.health_check_failed",
                     serde_json::json!({
                         "debug_port": debug_port,
                         "helper_port": helper_port,
-                        "kind": classify_cdp_failure(&error.to_string()),
-                        "message": error.to_string()
+                        "kind": classify_cdp_failure(&message),
+                        "indeterminate": indeterminate,
+                        "message": message
                     }),
                 );
-                false
+                if indeterminate {
+                    None
+                } else {
+                    Some(false)
+                }
             }
         }
     };
-    if healthy {
+    if healthy == Some(true) {
+        *health_failures = 0;
         return BridgeWatchdogOutcome::Healthy;
+    }
+    if !should_reinject_after_health_result(healthy, browser_identity_changed, health_failures) {
+        return BridgeWatchdogOutcome::Deferred;
     }
 
     let _ = crate::diagnostic_log::append_diagnostic_log(

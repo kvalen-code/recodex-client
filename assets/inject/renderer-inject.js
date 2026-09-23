@@ -191,7 +191,10 @@
       try {
         if (window.sessionStorage.getItem(localeReloadStorageKey) === marker) return;
         window.sessionStorage.setItem(localeReloadStorageKey, marker);
+        // 标记写不进去就不要刷新，否则下次加载读不到标记，会再次刷新（移植自上游 d3ec578）。
+        if (window.sessionStorage.getItem(localeReloadStorageKey) !== marker) return;
       } catch {
+        return;
       }
       window.location.reload();
     };
@@ -398,7 +401,7 @@
   const zedRemoteOpenInMenuVersion = "1";
   const zedRemoteOpenInMenuActivationWindowMs = 600;
   const styleId = "codex-delete-style";
-  const codexDeleteStyleVersion = "14";
+  const codexDeleteStyleVersion = "15";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexDeleteVersion = "7";
@@ -771,6 +774,8 @@
         white-space: nowrap;
       }
       [data-codex-plus-usage-alert-hidden="true"] { display: none !important; }
+      body.codex-plus-hide-usage-alert aside.app-shell-left-panel [role="status"][aria-live="polite"]:has(progress[max="100"]):has(button[aria-label="Dismiss usage alert" i], button[aria-label="关闭使用量提醒"], button[aria-label="關閉用量提示"], button[aria-label="關閉使用量警示"]),
+      body.codex-plus-hide-usage-alert aside.app-shell-left-panel div.w-full:has(> [role="status"][aria-live="polite"]:has(progress[max="100"]):has(button[aria-label="Dismiss usage alert" i], button[aria-label="关闭使用量提醒"], button[aria-label="關閉用量提示"], button[aria-label="關閉使用量警示"])) { display: none !important; }
       .codex-archive-delete-all {
         border: 1px solid #ef4444;
         border-radius: 7px;
@@ -2788,8 +2793,30 @@
   }
 
   let codexPlusUserScripts = { enabled: true, builtin_dir: "", user_dir: "", scripts: [] };
-  let codexPlusBackendStatus = { status: "checking", message: "正在检查后端…" };
+  // 状态挂在 window 上：看门狗重注入后新一代脚本接着显示上一次的结果，不会闪回「检查中」。
+  let codexPlusBackendStatus = window.__codexPlusBackendStatus || { status: "checking", message: "正在检查后端…" };
   let codexPlusBackendCheckSeq = 0;
+  // 桥接健康改为被动心跳（移植自上游 2e5da00 + d3ec578）：渲染层自己的后端心跳把
+  // 「最近成功 / 最近尝试」写到 window.__codexPlusBridgeHealth，看门狗只读这个状态，
+  // 不再另起一次 2 秒超时的探测——页面一忙那次探测就超时，看门狗便把整份脚本重注入，
+  // 反复重注入就是刷新循环。每次注入代次 +1，旧代次的闭包不再写健康状态。
+  const codexPlusBackendGeneration = (Number(window.__codexPlusBackendGeneration) || 0) + 1;
+  window.__codexPlusBackendGeneration = codexPlusBackendGeneration;
+
+  function recordCodexPlusBridgeHealth(field) {
+    if (codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+    const health = window.__codexPlusBridgeHealth || (window.__codexPlusBridgeHealth = {});
+    health[field] = Date.now();
+  }
+
+  function recordCodexPlusBridgeSuccess() {
+    recordCodexPlusBridgeHealth("lastSuccessAt");
+  }
+
+  // 状态请求超时说明页面忙，但心跳仍在调用桥接——这也算活着。
+  function recordCodexPlusBridgeAttempt() {
+    recordCodexPlusBridgeHealth("lastAttemptAt");
+  }
 
   function setCodexPlusTriggerLabel(trigger) {
     if (!trigger) return;
@@ -2844,8 +2871,8 @@
   async function checkBackendStatus() {
     const seq = ++codexPlusBackendCheckSeq;
     const nextStatus = await withBackendTimeout(postJson("/backend/status", {}));
-    if (seq !== codexPlusBackendCheckSeq) return;
-    codexPlusBackendStatus = nextStatus;
+    if (seq !== codexPlusBackendCheckSeq || codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+    codexPlusBackendStatus = window.__codexPlusBackendStatus = nextStatus;
     if (nextStatus?.status === "ok" && typeof nextStatus.hideOfficialUsageAlert === "boolean") {
       window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus.hideOfficialUsageAlert;
       refreshOfficialUsageAlertVisibility();
@@ -2870,7 +2897,13 @@
   }
 
   function scheduleBackendHeartbeat() {
-    if (window.__codexPlusBackendHeartbeat) return;
+    // 心跳按代次重建：重注入后旧定时器还在跑旧闭包，而旧代次不再写健康状态，
+    // 不换掉它，新一代就永远记不到成功，15 秒后看门狗又判死、又重注入。
+    if (codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+    if (window.__codexPlusBackendHeartbeat &&
+        window.__codexPlusBackendHeartbeatGeneration === codexPlusBackendGeneration) return;
+    if (window.__codexPlusBackendHeartbeat) clearInterval(window.__codexPlusBackendHeartbeat);
+    window.__codexPlusBackendHeartbeatGeneration = codexPlusBackendGeneration;
     window.__codexPlusBackendHeartbeat = setInterval(checkBackendStatus, 5000);
     checkBackendStatus();
   }
@@ -4056,7 +4089,23 @@
         if (safeKey) pruned[safeKey] = value;
       });
     window.__codexThreadScrollEntries = pruned;
-    localStorage.setItem(codexThreadScrollKey, JSON.stringify({ version: codexThreadScrollVersion, entries: pruned }));
+    const payload = JSON.stringify({ version: codexThreadScrollVersion, entries: pruned });
+    try {
+      localStorage.setItem(codexThreadScrollKey, payload);
+    } catch {
+      // 本地存储配额已满时不能把异常抛到页面全局，否则滚动保存会把渲染进程打进刷新循环
+      // （移植自上游 d3ec578）。降级为只保存最新一条；再不行就放弃持久化，内存副本仍可用。
+      try {
+        const newestKey = Object.keys(pruned)[0];
+        const emergency = Object.create(null);
+        if (newestKey) emergency[newestKey] = pruned[newestKey];
+        window.__codexThreadScrollEntries = emergency;
+        localStorage.removeItem(codexThreadScrollKey);
+        localStorage.setItem(codexThreadScrollKey, JSON.stringify({ version: codexThreadScrollVersion, entries: emergency }));
+      } catch {
+        try { localStorage.removeItem(codexThreadScrollKey); } catch { /* 放弃持久化 */ }
+      }
+    }
   }
 
   function currentThreadScroller() {
@@ -4640,8 +4689,14 @@
     try {
       if (path === "/backend/status") {
         const result = await bridgeWithBackendTimeout(path, payload);
-        if (result?.status === "ok") return result;
-        if (result?.timeout) sendCodexPlusDiagnostic("backend_bridge_timeout", { path });
+        if (result?.status === "ok") {
+          recordCodexPlusBridgeSuccess();
+          return result;
+        }
+        if (result?.timeout) {
+          recordCodexPlusBridgeAttempt();
+          sendCodexPlusDiagnostic("backend_bridge_timeout", { path });
+        }
         const fallback = await fetchBackendStatusFromHelper(path, payload);
         if (fallback?.status === "ok") {
           sendCodexPlusDiagnostic("backend_status_bridge_failed_http_fallback_ok", {
@@ -6843,6 +6898,8 @@
     return window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ === true;
   }
 
+  const officialUsageAlertDismissLabelRe = /dismiss usage alert|关闭使用量提醒|關閉用量提示|關閉使用量警示/i;
+
   function officialUsageAlertCards(scope = document) {
     const root = scope?.querySelectorAll ? scope : document;
     return Array.from(root.querySelectorAll('aside.app-shell-left-panel [role="status"][aria-live="polite"]')).filter((card) => {
@@ -6850,27 +6907,113 @@
       const progress = card.querySelector('progress[max="100"]');
       if (!progress) return false;
       const dismissButton = Array.from(card.querySelectorAll("button")).find((button) =>
-        /dismiss usage alert|关闭使用量提醒/i.test(button.getAttribute("aria-label") || ""),
+        officialUsageAlertDismissLabelRe.test(button.getAttribute("aria-label") || ""),
       );
       return !!dismissButton;
     });
   }
 
+  // ── 新版 Codex(26.915 起)的额度提示是输入框上方的横幅,没有进度条和关闭按钮,
+  //    只能靠标题识别(移植自上游 de08221)。不能「有标题就藏」,否则会误伤别的提示
+  //    (比如 Sandbox ready、Ultra 多智能代理提醒);所以标题要同时命中「Codex/模型/使用」
+  //    「额度/用量/限额」和「已用完/即将/超出」三组词,英文则按官方句式匹配。
+  function normalizeUsageAlertText(text) {
+    return String(text || "").replace(/[\s ]+/g, " ").trim();
+  }
+
+  function isOfficialUsageAlertHeading(text) {
+    const value = normalizeUsageAlertText(text);
+    if (!value || value.length > 48) return false;
+    if (/agents|智能代理|智慧体|子智能/.test(value)) return false;
+    if (/^(?:you(?:['’]re| are)|you['’]ve)\b/i.test(value) && /\b(?:usage|limit|messages)\b/i.test(value) && /\b(?:out of|used all|reached|approaching|hit)\b/i.test(value)) {
+      return true;
+    }
+    if (/^(?:this|selected) model is out of usage\.?$/i.test(value)) return true;
+    if (!/(Codex|模型|使用)/.test(value)) return false;
+    if (!/(额度|額度|用量|限额|限額|上限)/.test(value)) return false;
+    return /(已用完|已用尽|已用盡|已耗尽|已耗盡|已达|已達|即将|即將|超出|用罄|用完|用尽|用盡)/.test(value);
+  }
+
+  function composerUsageAlertBanners(scope = document) {
+    const root = scope?.querySelectorAll ? scope : document;
+    return Array.from(root.querySelectorAll("[data-codex-composer-root] aside")).filter((aside) => {
+      if (!(aside instanceof HTMLElement)) return false;
+      const heading = aside.querySelector("h1, h2, h3, h4, h5, [role='heading']");
+      return isOfficialUsageAlertHeading(heading?.textContent || "");
+    });
+  }
+
   function officialUsageAlertContainer(card) {
     const parent = card.parentElement;
-    return parent?.children.length === 1 && parent.matches("div.w-full") ? parent : card;
+    if (parent?.children.length === 1) {
+      // 旧版左下角卡片的外壳。
+      if (parent.matches?.("div.w-full")) return parent;
+      // 新版输入框横幅的外壳：只包它一个、且在输入框根节点内（不能是根节点、表单或主区本身）。
+      if (
+        parent.closest?.("[data-codex-composer-root]") &&
+        !parent.matches?.("[data-codex-composer-root], form, main")
+      ) {
+        return parent;
+      }
+    }
+    return card;
+  }
+
+  function markOfficialUsageAlertTarget(targets, node) {
+    if (!node || node === document.body || node === document.documentElement) return;
+    targets.add(node);
   }
 
   function refreshOfficialUsageAlertVisibility() {
     const hidden = officialUsageAlertHidden();
-    document.querySelectorAll('[data-codex-plus-usage-alert-hidden="true"]').forEach((container) => {
-      delete container.dataset.codexPlusUsageAlertHidden;
-    });
-    if (!hidden) return;
+    // 旧版左下角卡片有稳定的进度条和关闭按钮，body class 让 CSS 在首帧就挡住；
+    // 新版输入框横幅只能靠标题识别，在下面逐个打标记。
+    document.body?.classList.toggle("codex-plus-hide-usage-alert", hidden);
+    if (!hidden) {
+      document.querySelectorAll("[data-codex-plus-usage-alert-hidden]").forEach((el) => {
+        delete el.dataset.codexPlusUsageAlertHidden;
+      });
+      return;
+    }
+    const targets = new Set();
     officialUsageAlertCards().forEach((card) => {
-      const container = officialUsageAlertContainer(card);
-      container.dataset.codexPlusUsageAlertHidden = "true";
+      markOfficialUsageAlertTarget(targets, card);
+      markOfficialUsageAlertTarget(targets, officialUsageAlertContainer(card));
     });
+    composerUsageAlertBanners().forEach((banner) => {
+      markOfficialUsageAlertTarget(targets, banner);
+      markOfficialUsageAlertTarget(targets, officialUsageAlertContainer(banner));
+    });
+    // 只动我们自己打过标记的节点：不再是额度提示的撤掉标记，是的补上。
+    document.querySelectorAll("[data-codex-plus-usage-alert-hidden]").forEach((el) => {
+      if (!targets.has(el)) delete el.dataset.codexPlusUsageAlertHidden;
+    });
+    targets.forEach((el) => {
+      if (el.dataset.codexPlusUsageAlertHidden !== "true") el.dataset.codexPlusUsageAlertHidden = "true";
+    });
+  }
+
+  function nodeMayContainUsageAlert(node) {
+    if (!node || node.nodeType !== 1) return false;
+    const host = node.matches?.("aside, [role='status']")
+      ? node
+      : node.closest?.("aside, [role='status']");
+    if (host) return !!host.closest?.("[data-codex-composer-root], aside.app-shell-left-panel");
+    return !!node.querySelector?.("[data-codex-composer-root] aside, aside.app-shell-left-panel [role='status'][aria-live='polite']");
+  }
+
+  function mutationTouchesUsageAlert(mutations) {
+    if (!mutations) return false;
+    for (const mutation of mutations) {
+      if (nodeMayContainUsageAlert(mutation.target)) return true;
+      for (const node of mutation.addedNodes || []) {
+        if (nodeMayContainUsageAlert(node)) return true;
+      }
+      for (const node of mutation.removedNodes || []) {
+        if (nodeMayContainUsageAlert(node)) return true;
+      }
+    }
+    return false;
   }
 
   let zedRemoteStatusPromise = null;
@@ -7560,6 +7703,12 @@
   function scheduleScan(mutations) {
     window.__codexSessionDeleteLastMutations = mutations;
     scheduleZedRemoteMenuRefresh(mutations);
+    // 全量 scan 有 200ms 防抖。额度横幅要在这次变更绘制前就藏掉，所以这里同步识别。
+    if (officialUsageAlertHidden() && mutationTouchesUsageAlert(mutations)) {
+      try {
+        refreshOfficialUsageAlertVisibility();
+      } catch {}
+    }
     if (!shouldScheduleScan(mutations)) return;
     if (window.__codexSessionDeleteScanPending) return;
     window.__codexSessionDeleteScanPending = true;
