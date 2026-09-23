@@ -8,6 +8,7 @@ pub mod gateway_probe; // recodex-overlay: 在本机测网关延迟(服务端那
 pub mod config_health; // recodex-overlay: 启动时验 config.toml 能不能被读进去
 pub mod diagnostics_flush; // recodex-overlay: 本地诊断日志自动上报(启动失败/连不上也能看到)
 pub mod remote_pair; // recodex-overlay: 手机远程控制的跟随账号配对接口(电脑侧)
+pub mod lease_sidecar; // recodex-overlay: 租约直连本机代理 sidecar(Go)的调用
 mod error;
 mod install_id;
 mod ui;
@@ -423,6 +424,12 @@ impl<T: Transport> Adapter<T> {
         }
         self.access_token = Some(token);
         Ok(())
+    }
+
+    /// 当前会话令牌。**只**用来交给租约直连的本机代理(sidecar,经 stdin),
+    /// 不许打日志、不许拼进错误信息 —— 与 transport 错误不带令牌是同一条纪律。
+    pub fn session_token(&self) -> Option<&str> {
+        self.access_token.as_deref()
     }
 
     pub fn clear_access_token(&mut self) {

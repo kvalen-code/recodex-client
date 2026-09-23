@@ -609,6 +609,9 @@ pub fn recodex_refresh_token(state: &ReCodexState) -> Value {
         let _ = state.credentials.as_ref().map(CredentialStore::clear);
         return error("credential_store", "Refreshed token is invalid");
     }
+    drop(guard);
+    // 旧令牌此刻已作废:租约模式下代理手里的那一把也要换。
+    lease_hand_over_rotated_token(state);
     json!({"status":"ready"})
 }
 
@@ -1024,6 +1027,8 @@ pub fn recodex_logout(state: &ReCodexState) -> Value {
     if let Ok(mut pending) = state.pending_device_code.lock() {
         *pending = None;
     }
+    // 租约模式先还原(要用 lease.json 里的端口与本机密钥停代理),再还原托管配置。
+    lease_teardown_for_sign_out();
     // Revert the Codex config we own so Codex stops using ReCodex. Best-effort:
     // a failure here must not block sign-out.
     let _ = crate::codexcfg::restore_all();
@@ -1432,6 +1437,75 @@ pub fn lease_mode_active() -> bool {
 pub fn lease_mode_active_in(codex_dir: &std::path::Path, config: &str) -> bool {
     codex_dir.join("recodex").join("lease.json").is_file()
         && crate::codexcfg::managed_base_url(config).is_some_and(|base| is_loopback_url(&base))
+}
+
+/// 启动期跟随服务端的租约直连设置(任务板 Q9)。**必须在拉起 Codex 之前**调用:
+/// 切过去会改 config.toml,而 Codex 只在启动时读一次。
+///
+/// 返回 None 表示这个包没带 sidecar(老包、开发构建)—— 调用方什么都不记。
+/// 其余返回 sidecar 的结果码,调用方写诊断日志(不含令牌)。
+///
+/// 服务端没把账号设成租约直连时,这一步是一次很快被拒的请求(服务端第二步读账号模式就拒,
+/// 不碰上游),config.toml 一个字节都不动。
+pub fn lease_follow_at_startup(state: &ReCodexState) -> Option<String> {
+    let sidecar = crate::lease_sidecar::sidecar_path()?;
+    let Some((base, token)) = lease_session(state) else {
+        return Some("signed_out".to_owned());
+    };
+    Some(crate::lease_sidecar::follow(
+        &sidecar,
+        &base,
+        &token,
+        crate::lease_sidecar::FOLLOW_TIMEOUT,
+    ))
+}
+
+/// 令牌轮换之后把新令牌交给正在运行的本机代理 —— 刷新会让旧令牌立即作废,不交的话
+/// 代理下一次续租就被拒、退回网关。只在租约模式开着时做;放后台线程,不拖慢面板。
+fn lease_hand_over_rotated_token(state: &ReCodexState) {
+    if !lease_mode_active() {
+        return;
+    }
+    let Some(sidecar) = crate::lease_sidecar::sidecar_path() else {
+        return;
+    };
+    let Some((base, token)) = lease_session(state) else {
+        return;
+    };
+    // 结果不记:本 crate 不写诊断日志(那是 launcher 的事),而交接失败的后果只是
+    // 代理暂回网关 —— 下次启动的 lease_follow_at_startup 会再交一次,并且那一次有日志。
+    std::thread::spawn(move || {
+        let _ = crate::lease_sidecar::follow(
+            &sidecar,
+            &base,
+            &token,
+            crate::lease_sidecar::FOLLOW_TIMEOUT,
+        );
+    });
+}
+
+/// 登出/卸载前把租约模式彻底还原(停代理、撤自启、还原托管块与设备 ID)。
+/// 不还原的话:代理与自启项留着空转,下次登录时 lease.json 残留会让自动跟随判成
+/// 「别的写入方改过」而不再开启。尽力而为 —— 登出不能被它卡住。
+fn lease_teardown_for_sign_out() {
+    let Ok(dir) = crate::codexcfg::codex_dir() else {
+        return;
+    };
+    if !dir.join("recodex").join("lease.json").is_file() {
+        return;
+    }
+    if let Some(sidecar) = crate::lease_sidecar::sidecar_path() {
+        let _ = crate::lease_sidecar::off(&sidecar, crate::lease_sidecar::OFF_TIMEOUT);
+    }
+}
+
+/// 当前会话的控制面地址与令牌。令牌只往 sidecar 的 stdin 里送,不落任何地方。
+fn lease_session(state: &ReCodexState) -> Option<(String, String)> {
+    let guard = state.adapter.lock().ok()?;
+    let adapter = guard.as_ref()?;
+    let token = adapter.session_token()?.to_owned();
+    let base = adapter.base_url().as_str().trim_end_matches('/').to_owned();
+    Some((base, token))
 }
 
 /// 与 Go 侧 cmd/recodex/lease.go 的 isLoopbackURL 同义:主机是 localhost 或回环 IP。

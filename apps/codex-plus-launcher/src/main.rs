@@ -241,6 +241,29 @@ fn record_launch_failure(options: &LaunchOptions, failure: &LauncherFailure) {
 ///
 /// 失败静默(不弹任何 UI),只写诊断日志;每次启动跑一次,没有轮询。
 /// 网络调用是阻塞的(ureq,transport 10s 超时),放到 spawn_blocking 里。
+/// recodex-overlay: 启动时跟随服务端的租约直连设置(任务板 Q9)。
+///
+/// 包里没带 sidecar(recodex-lease)时什么都不做、不记日志。账号没开租约直连时是一次
+/// 很快被拒的请求,config.toml 不动。结果码写进诊断日志;只有故障才带 error 字段、
+/// 被自动上报 —— 「服务端不签」是绝大多数账号的常态,报它只会淹没真问题。
+async fn follow_lease_direct() {
+    let outcome = tokio::task::spawn_blocking(|| {
+        let state = recodex_integration::desktop::ReCodexState::from_env();
+        recodex_integration::desktop::lease_follow_at_startup(&state)
+    })
+    .await;
+    let label = match outcome {
+        Ok(Some(label)) => label,
+        Ok(None) => return,
+        Err(_) => "panicked".to_owned(),
+    };
+    let error = recodex_integration::lease_sidecar::is_failure(&label).then(|| label.clone());
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "launcher.lease_follow",
+        json!({ "outcome": label, "error": error }),
+    );
+}
+
 async fn sync_managed_config_from_server() {
     let outcome = tokio::task::spawn_blocking(|| {
         let state = recodex_integration::desktop::ReCodexState::from_env();
@@ -417,6 +440,9 @@ async fn launcher_main(
     // 顺序固定就不会互相冲掉;而且必须在拉起 Codex **之前**:Codex 是启动时读一次
     // config.toml,后台线程写完时它已经拿着旧配置跑了,用户还得再重启一次。
     sync_managed_config_from_server().await;
+    // 租约直连跟随排在托管配置同步之后:同步先写网关块,跟随再决定要不要切到本机代理。
+    // 顺序反过来的话,同步会把刚切好的代理块冲掉。同样必须在拉起 Codex 之前。
+    follow_lease_direct().await;
     follow_upstream_recommended_model().await;
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
@@ -2193,10 +2219,19 @@ mod managed_config_sync_placement_tests {
             "第一处属于 helper_only 分支(helper 是独立进程,不抢锁)"
         );
         assert!(guard_in_body < flushes[1], "主实例的诊断回传必须在抢锁之后");
-        // 两个 await 之间只允许注释和空白 —— 中间插别的步骤就可能把顺序约束绕开。
+        // 两个 await 之间只允许注释、空白,以及**恰好一步**租约直连跟随 ——
+        // 中间插别的步骤就可能把顺序约束绕开。
+        //
+        // 租约跟随必须夹在这里:排在同步之后,否则同步写的网关块会冲掉刚切好的代理块;
+        // 排在跟随模型之前,否则它重渲染托管块时会把模型那一行丢掉。
         let between = &body[sync..follow];
+        let lease_steps = between.matches("follow_lease_direct().await;").count();
+        assert_eq!(lease_steps, 1, "同步与跟随模型之间应当恰好有一步租约跟随:\n{between}");
         assert!(
-            between.lines().skip(1).all(|l| { let t = l.trim(); t.is_empty() || t.starts_with("//") }),
+            between.lines().skip(1).all(|l| {
+                let t = l.trim();
+                t.is_empty() || t.starts_with("//") || t == "follow_lease_direct().await;"
+            }),
             "同步与跟随模型之间不该有别的语句:\n{between}"
         );
     }
