@@ -1817,8 +1817,12 @@ pub fn restore_all() -> io::Result<()> {
 pub const HISTORY_ALIAS_MARKER: &str =
     "# recodex history provider aliases (old conversations were created with these providers)";
 
-/// Codex 自带、无需 provider 表的 provider。只列官方内置的那个（与 Go 的 builtinModelProviders 一致）。
-const BUILTIN_MODEL_PROVIDERS: &[&str] = &["openai"];
+/// Codex 的保留 provider id，永远不补别名（与 Go 的 reservedModelProviderIDs 一致）。
+/// 照抄 Codex 源码 codex-rs/config/src/config_toml.rs 的 RESERVED_MODEL_PROVIDER_IDS（2026-09-23 核对）：
+/// config.toml 里出现其中任何一张表，Codex 就拒绝整份配置（新对话也打不开）；
+/// bedrock 两个 id 只收 base_url/auth/http_headers/aws，抄过去的 recodex 表同样过不了校验。
+const RESERVED_MODEL_PROVIDER_IDS: &[&str] =
+    &["openai", "amazon-bedrock", "amazon-bedrock-runtime", "ollama", "lmstudio"];
 
 /// 首行读取上限。实测首行中位 22KB、最大 50KB，model_provider 最远在第 49KB
 /// （排在一大段 instructions 后面），所以必须读完整行。
@@ -1930,7 +1934,7 @@ fn defined_providers(content: &str) -> Option<BTreeSet<String>> {
     )
 }
 
-/// 需要补别名的 provider：被对话引用、没有定义、不是内置、形状规整，按字节序排序。
+/// 需要补别名的 provider：被对话引用、没有定义、不是 Codex 保留 id、形状规整，按字节序排序。
 /// 配置读不进来返回 None。
 pub fn history_alias_ids(
     content: &str,
@@ -1941,7 +1945,7 @@ pub fn history_alias_ids(
         .keys()
         .filter(|id| {
             !defined.contains(*id)
-                && !BUILTIN_MODEL_PROVIDERS.contains(&id.as_str())
+                && !RESERVED_MODEL_PROVIDER_IDS.contains(&id.as_str())
                 && history_alias_id_ok(id)
         })
         .cloned()

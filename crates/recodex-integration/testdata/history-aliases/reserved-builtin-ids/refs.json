@@ -1,0 +1,9 @@
+{
+  "amazon-bedrock": 1,
+  "amazon-bedrock-runtime": 1,
+  "custom": 3,
+  "lmstudio": 1,
+  "ollama": 2,
+  "openai": 4,
+  "recodex": 5
+}
