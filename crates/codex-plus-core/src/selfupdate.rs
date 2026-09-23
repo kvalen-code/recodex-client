@@ -32,6 +32,29 @@ pub struct UpdateManifest {
     /// 要回滚时手工在那一版的 manifest.json 里加 `"allow_downgrade": true`。
     #[serde(default)]
     pub allow_downgrade: bool,
+    /// recodex-overlay: 租约直连的本机代理(recodex-lease),与主程序同目录。
+    ///
+    /// 可选:只有当次发布捆了 sidecar 时 CI 才写这个字段。老客户端不认识它、照常只换
+    /// 主程序;新客户端在主程序换好之后**尽力**换它 —— 它失败绝不让整次更新失败,
+    /// 没有它时桌面端一切照旧走网关。
+    #[serde(default)]
+    pub sidecar: Option<SidecarAsset>,
+}
+
+/// 附带文件的下载地址与哈希。安全要求与主程序完全相同:https + sha256 + 可执行格式。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SidecarAsset {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// sidecar 在安装目录里的文件名。与 recodex_integration::lease_sidecar 一致。
+pub fn sidecar_file_name() -> &'static str {
+    if cfg!(windows) {
+        "recodex-lease.exe"
+    } else {
+        "recodex-lease"
+    }
 }
 
 fn require_https(url: &str, what: &str) -> anyhow::Result<url::Url> {
@@ -119,7 +142,19 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 /// 下载并校验包体。校验不过直接报错,**不落地任何文件**。
 pub async fn download_verified(manifest: &UpdateManifest) -> anyhow::Result<Vec<u8>> {
-    let url = require_https(&manifest.url, "安装包")?;
+    download_checked(&manifest.url, &manifest.sha256, "安装包").await
+}
+
+/// 下载并校验 sidecar。规矩与主程序一样。
+pub async fn download_sidecar_verified(asset: &SidecarAsset) -> anyhow::Result<Vec<u8>> {
+    if asset.sha256.trim().is_empty() {
+        anyhow::bail!("sidecar 缺少 sha256,拒绝安装");
+    }
+    download_checked(&asset.url, &asset.sha256, "sidecar").await
+}
+
+async fn download_checked(url: &str, sha256: &str, what: &str) -> anyhow::Result<Vec<u8>> {
+    let url = require_https(url, what)?;
     let client = crate::http_client::proxied_client(&format!("ReCodex/{}", crate::version::VERSION))?;
     let bytes = client
         .get(url)
@@ -130,9 +165,9 @@ pub async fn download_verified(manifest: &UpdateManifest) -> anyhow::Result<Vec<
         .await?
         .to_vec();
     let actual = hex_digest(&bytes);
-    let expected = manifest.sha256.trim().to_ascii_lowercase();
+    let expected = sha256.trim().to_ascii_lowercase();
     if actual != expected {
-        anyhow::bail!("安装包校验失败(期望 {expected},实际 {actual}),已丢弃");
+        anyhow::bail!("{what}校验失败(期望 {expected},实际 {actual}),已丢弃");
     }
     Ok(bytes)
 }
@@ -250,17 +285,122 @@ pub fn stage_replacement(exe: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
     Ok(old_path)
 }
 
+/// 把新的 sidecar 就位到 `target`(与主程序同目录)。
+///
+/// 与 `stage_replacement` 的区别只有一处:目标可以**不存在**(老包装上来的机器没有它,
+/// 这正是要靠自更新补上的情况)。存在时同样先改名成 `.old` —— 常驻代理可能正跑着它,
+/// Windows 上运行中的 exe 不能覆盖、只能改名。旧进程继续用改名后的文件跑,
+/// 下次桌面端启动时发现版本不同会把它换掉(Go 侧 desktop-follow)。
+pub fn stage_sidecar(target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    ensure_executable_payload(bytes)?;
+    let new_path = with_extension(target, ".new");
+    let old_path = with_extension(target, ".old");
+
+    let mut file = std::fs::File::create(&new_path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&new_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    if target.exists() {
+        let _ = std::fs::remove_file(&old_path);
+        if let Err(error) = std::fs::rename(target, &old_path) {
+            let _ = std::fs::remove_file(&new_path);
+            return Err(error.into());
+        }
+    }
+    if let Err(error) = std::fs::rename(&new_path, target) {
+        // 放回旧的:宁可留着旧版 sidecar,也不能让它凭空消失
+        let _ = std::fs::rename(&old_path, target);
+        let _ = std::fs::remove_file(&new_path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 /// 启动时清理上一轮更新留下的 `.old`(那时它已不再被占用)。
+///
+/// sidecar 的 `.old` 可能还被常驻代理的旧进程占着 —— 删不掉就留到下次,不报错。
 pub fn cleanup_previous_update() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(with_extension(&exe, ".old"));
         let _ = std::fs::remove_file(with_extension(&exe, ".new"));
+        if let Some(dir) = exe.parent() {
+            let sidecar = dir.join(sidecar_file_name());
+            let _ = std::fs::remove_file(with_extension(&sidecar, ".old"));
+            let _ = std::fs::remove_file(with_extension(&sidecar, ".new"));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_native_exe() -> Vec<u8> {
+        let mut bytes = vec![0u8; 70 * 1024];
+        let magic: &[u8] = match std::env::consts::OS {
+            "windows" => b"MZ",
+            "macos" => &[0xcf, 0xfa, 0xed, 0xfe],
+            _ => b"\x7fELF",
+        };
+        bytes[..magic.len()].copy_from_slice(magic);
+        bytes
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rcx-selfupdate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 老清单没有 sidecar 字段:必须照常解析(老服务端配置 + 新客户端)。
+    #[test]
+    fn manifest_without_sidecar_still_parses() {
+        let manifest: UpdateManifest =
+            serde_json::from_str(r#"{"version":"1.3.9","url":"https://x/recodex.exe","sha256":"ab"}"#).unwrap();
+        assert!(manifest.sidecar.is_none());
+        let manifest: UpdateManifest = serde_json::from_str(
+            r#"{"version":"1.3.9","url":"https://x/recodex.exe","sha256":"ab","sidecar":{"url":"https://x/recodex-lease.exe","sha256":"cd"}}"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.sidecar.unwrap().sha256, "cd");
+    }
+
+    /// 老包装上来的机器上没有 sidecar:自更新要能把它**新放**进去。
+    #[test]
+    fn stage_sidecar_installs_when_absent_and_replaces_when_present() {
+        let dir = scratch_dir("sidecar");
+        let target = dir.join(sidecar_file_name());
+        let first = fake_native_exe();
+        stage_sidecar(&target, &first).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), first);
+        assert!(!with_extension(&target, ".new").exists(), "不该留下 .new");
+
+        let mut second = fake_native_exe();
+        second[100] = 7;
+        stage_sidecar(&target, &second).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), second);
+        assert_eq!(std::fs::read(with_extension(&target, ".old")).unwrap(), first, "旧版应改名留着");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// sidecar 同样不能被换成一个不是可执行文件的东西(清单填错地址的老坑)。
+    #[test]
+    fn stage_sidecar_rejects_non_executables_without_touching_the_old_one() {
+        let dir = scratch_dir("sidecar-bad");
+        let target = dir.join(sidecar_file_name());
+        let good = fake_native_exe();
+        stage_sidecar(&target, &good).unwrap();
+        assert!(stage_sidecar(&target, br#"{"version":"1.3.9"}"#).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), good, "拒绝后旧的必须原样留着");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn non_https_urls_are_rejected() {

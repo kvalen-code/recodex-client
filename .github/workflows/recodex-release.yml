@@ -166,6 +166,17 @@ jobs:
             sha256  = $sha
           }
           New-Item -ItemType Directory -Force "dist/upload/$v" | Out-Null
+          # 租约直连 sidecar:只有这次捆了(上面那一步三道闸都过了)才写进清单。
+          # 自更新只换清单里列出的文件 —— 不写的话,靠自更新升级的老用户永远拿不到它。
+          # 老客户端不认识这个字段,照常只换主程序。
+          $sidecar = "dist/windows/app/recodex-lease.exe"
+          if (Test-Path $sidecar) {
+            $manifest.sidecar = [ordered]@{
+              url    = "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/recodex-lease.exe"
+              sha256 = (Get-FileHash -LiteralPath $sidecar -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+            Copy-Item $sidecar "dist/upload/$v/"
+          }
           # UTF8 无 BOM:BOM 会让部分 JSON 解析器把首字符当非法字符
           [System.IO.File]::WriteAllText(
             "dist/upload/$v/manifest.json",
@@ -205,7 +216,13 @@ jobs:
           if ($m.version -ne $v) { throw "线上 manifest 版本号不对:$($m.version)" }
           Invoke-WebRequest -Uri $m.url -Method Head -UseBasicParsing -TimeoutSec 30 | Out-Null
           Invoke-WebRequest -Uri "${{ vars.RECODEX_CLIENT_BASE_URL }}/$v/ReCodex-$v-windows-x64-setup.exe" -Method Head -UseBasicParsing -TimeoutSec 30 | Out-Null
-          Write-Host "回读校验通过:manifest 与两个包体公网可取"
+          # sidecar 写进了清单就必须真取得到:取不到的话每个用户更新时都会记一条下载失败
+          if ($m.sidecar) {
+            $localSidecar = (Get-FileHash "dist/upload/$v/recodex-lease.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($m.sidecar.sha256 -ne $localSidecar) { throw "线上 manifest 的 sidecar sha256 与本地不一致" }
+            Invoke-WebRequest -Uri $m.sidecar.url -Method Head -UseBasicParsing -TimeoutSec 30 | Out-Null
+          }
+          Write-Host "回读校验通过:manifest 与包体公网可取"
 
       # 官网下载页读的就是这个指针。放在 windows job 的最后:
       # mac 的 DMG 由 macos job 各自上传,这里只需要把地址算出来 ——

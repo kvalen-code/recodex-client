@@ -125,6 +125,9 @@ Section "Uninstall"
   Delete "$INSTDIR\codex-plus-plus.exe.old"
   Delete "$INSTDIR\codex-plus-plus.exe.new"
   Delete "$INSTDIR\codex-plus-plus.exe.migrating"
+  ; sidecar 自更新的残留(与 codex-plus-core 的 uninstall.rs 同一张单子)
+  Delete "$INSTDIR\recodex-lease.exe.old"
+  Delete "$INSTDIR\recodex-lease.exe.new"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 

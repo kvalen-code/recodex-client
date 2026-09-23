@@ -124,6 +124,32 @@ fn schedule_delete_after_exit(exe: &Path, extra: &[PathBuf], remove_dir: Option<
     Ok(())
 }
 
+/// 经 sidecar 还原租约直连(`recodex-lease lease desktop-off`),并兜底撤掉它的开机自启项。
+/// 没有 sidecar 时返回 "absent"。与 ReCodex.nsi 卸载段做的是同一件事。
+#[cfg(windows)]
+fn lease_sidecar_teardown(dir: &Path) -> &'static str {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let sidecar = dir.join("recodex-lease.exe");
+    if !sidecar.is_file() {
+        return "absent";
+    }
+    let restored = std::process::Command::new(&sidecar)
+        .args(["lease", "desktop-off"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|status| status.success());
+    // sidecar 起不来时至少别让开机自启继续指着一个即将被删掉的文件
+    let _ = crate::windows_integration::delete_current_user_value(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        "ReCodexLease",
+    );
+    if restored { "restored" } else { "restore_failed" }
+}
+
 /// `recodex.exe --legacy-uninstall`:「程序和功能」里卸载 1.3.4 之前装的 ReCodex。
 ///
 /// 卸载项的 UninstallString 由 legacy_install 在迁移时改指这里(见
@@ -169,6 +195,10 @@ pub fn run_legacy_uninstall() -> anyhow::Result<()> {
     }
     crate::watcher::stop_launcher_processes_and_wait();
     detail["remote"] = json!(crate::phone_remote::uninstall_cleanup());
+    // 租约直连的 sidecar:老安装本来没有它,但自更新会补装。卸载前先经它把
+    // config.toml 与设备 ID 还原、停掉常驻代理并撤自启 —— 不做的话 Codex 会指着一个
+    // 随程序一起被删掉的本机代理,装回去之前完全用不了。尽力而为。
+    detail["lease"] = json!(lease_sidecar_teardown(&dir));
     // 与 ReCodex.nsi 卸载段同一张单子:自更新(.old/.new)与旧名接班(.migrating)的残留,
     // 不清的话最后那步删不掉安装目录
     let extra = [
@@ -180,6 +210,9 @@ pub fn run_legacy_uninstall() -> anyhow::Result<()> {
         dir.join("codex-plus-plus.exe.old"),
         dir.join("codex-plus-plus.exe.new"),
         dir.join("codex-plus-plus.exe.migrating"),
+        dir.join("recodex-lease.exe"),
+        dir.join("recodex-lease.exe.old"),
+        dir.join("recodex-lease.exe.new"),
     ];
     let scheduled = schedule_delete_after_exit(&exe, &extra, Some(&dir));
     if let Err(error) = &scheduled {

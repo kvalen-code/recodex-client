@@ -750,13 +750,50 @@ async fn self_update_value(manifest_url: String) -> Value {
         Ok(_) => {
             // 控制面板「程序和功能」里的版本号原先永远停在安装包那一版
             crate::legacy_install::record_installed_version(&manifest.version);
+            let sidecar = update_sidecar_best_effort(&manifest, &exe).await;
             json!({
                 "status": "ok",
-                "message": format!("已更新到 {},正在重启…", manifest.version)
+                "message": format!("已更新到 {},正在重启…", manifest.version),
+                "sidecar": sidecar,
             })
         }
         Err(error) => json!({"status":"failed","message":format!("替换程序文件失败:{error}")}),
     }
+}
+
+/// recodex-overlay: 主程序换好之后,顺带换租约直连的 sidecar(清单里有才做)。
+///
+/// **尽力而为**:主程序已经就位,这一步任何失败都只记下来、不影响更新结果 ——
+/// 没有 sidecar 时桌面端一切照旧走网关,下一次更新还会再试。
+async fn update_sidecar_best_effort(
+    manifest: &crate::selfupdate::UpdateManifest,
+    exe: &std::path::Path,
+) -> &'static str {
+    let Some(asset) = manifest.sidecar.as_ref() else {
+        return "absent";
+    };
+    let Some(dir) = exe.parent() else {
+        return "no_dir";
+    };
+    let outcome = match crate::selfupdate::download_sidecar_verified(asset).await {
+        Ok(bytes) => match crate::selfupdate::stage_sidecar(
+            &dir.join(crate::selfupdate::sidecar_file_name()),
+            &bytes,
+        ) {
+            Ok(()) => "updated",
+            Err(_) => "stage_failed",
+        },
+        Err(_) => "download_failed",
+    };
+    // 失败才带 error 字段(会被自动上报);成功只留本地记录。
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.sidecar_update",
+        json!({
+            "outcome": outcome,
+            "error": (outcome != "updated").then_some(outcome),
+        }),
+    );
+    outcome
 }
 
 fn backend_status_value(
