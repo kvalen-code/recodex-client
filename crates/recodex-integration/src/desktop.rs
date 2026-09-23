@@ -383,6 +383,12 @@ fn route_codex_through_gateway(endpoint: &str) -> Option<String> {
     if !crate::codexcfg::base_url_is_safe(&base) {
         return Some("网关地址含有不能写进配置的字符".to_string());
     }
+    // 租约模式下托管块指着本机代理,换网关不能把它改写回网关形态 —— 那等于把用户
+    // 静默踢出租约直连(G1)。服务端的选择已经生效,代理回退网关时用的地址由
+    // `recodex lease` 管,这里只提示、不写。
+    if lease_mode_active() {
+        return Some("租约直连模式已开启,本机配置由代理管理;新网关在 `recodex lease off` 后生效".to_string());
+    }
     // 官方模式下不能碰活配置 —— 否则「用最快网关」会把官方模式悄悄破坏掉:
     // 面板还显示官方模式,Codex 下次启动却已经走回 ReCodex 网关。
     // 记进快照,切回 ReCodex 时自动生效。
@@ -1266,7 +1272,30 @@ fn gateway_root_from_managed_config() -> Option<String> {
     let content = crate::codexcfg::config_path()
         .and_then(std::fs::read_to_string)
         .ok()?;
-    crate::codexcfg::managed_base_url(&content).map(|base| gateway_root(&base))
+    let base = crate::codexcfg::managed_base_url(&content)?;
+    if !is_loopback_url(&base) {
+        return Some(gateway_root(&base));
+    }
+    // 租约模式:托管块指着本机代理。拿网关 Key 去探它只会被拒(代理只认本机密钥、
+    // 也不转发 /v1/key/billing),于是自诊断把一把好好的 Key 报成「需要重新登录」。
+    // 要问的是代理回退时用的那个网关 —— 它记在 lease.json 里。读不到就不探。
+    lease_gateway_base()
+        .filter(|base| !is_loopback_url(base) && crate::codexcfg::base_url_is_safe(base))
+        .map(|base| gateway_root(&base))
+}
+
+/// lease.json 里记的回退网关(Go 侧 leaseState.GatewayBaseURL)。**只读**:
+/// 按通用 JSON 取一个字段,不反序列化成结构体,更不写回(见 lease_mode_active)。
+fn lease_gateway_base() -> Option<String> {
+    let path = crate::codexcfg::codex_dir().ok()?.join("recodex").join("lease.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    lease_gateway_base_from(&raw)
+}
+
+fn lease_gateway_base_from(raw: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    let base = value.get("gateway_base_url")?.as_str()?.trim();
+    (!base.is_empty()).then(|| base.to_string())
 }
 
 /// 拿这把 key 打一次网关上最便宜的鉴权接口。只问「认不认」,不拉模型、不碰上游。
@@ -1335,6 +1364,9 @@ pub enum ManagedConfigSync {
     Fetch(AdapterError),
     /// 写入失败。
     Write(String),
+    /// 租约直连模式开着(lease.json 在、托管块指着本机代理):
+    /// **一个字不碰**。见 lease_mode_active 的注释。
+    LeaseActive,
 }
 
 impl ManagedConfigSync {
@@ -1349,8 +1381,77 @@ impl ManagedConfigSync {
             Self::Applied => "applied",
             Self::Fetch(_) => "fetch_failed",
             Self::Write(_) => "write_failed",
+            Self::LeaseActive => "lease_active",
         }
     }
+}
+
+/// 租约直连模式是否开着:`<CODEX_HOME>/recodex/lease.json` 存在,**并且**
+/// config.toml 托管块的 base_url 确实指着本机回环(本机代理)。
+///
+/// ## 为什么启动期同步必须在这时收手(租约直连任务板 G1)
+///
+/// 租约模式下 config.toml 的托管块指着本机代理(127.0.0.1)、bearer 是本机密钥;
+/// 回退用的网关地址与 Key 由本机代理自己管(`recodex lease` 与 lease.json)。
+/// 这里若照常把服务端的网关块写回 config.toml,用户每开一次桌面端就被**静默**踢出
+/// 租约模式 —— 不会坏(退回网关),但直连失效且没人知道。Go 侧 CLI 的所有写入方都已
+/// 经 applyManagedBlock 做了同样的收手,两个客户端必须一致,否则会互相冲掉。
+///
+/// ## 为什么只判「文件在不在」、不读它
+///
+/// lease.json 的格式归 Go 侧(cmd/recodex/lease.go 的 leaseState)。这里若反序列化
+/// 成一个只含部分字段的结构体再写回去,**未知字段会被丢掉** —— 其中包括本机密钥,
+/// 丢了之后 config.toml 里写的那一把就对不上,codex 请求全部 403。
+/// 所以桌面端对 lease.json 只读存在性、从不写。
+///
+/// ## 为什么还要看托管块指着哪(只看文件会卡死)
+///
+/// lease.json 可能比「config.toml 指着代理」活得久:桌面端登出/重新登录走的是
+/// apply_login,会照常把托管块写回网关形态,而桌面端不认识、也不删 lease.json。
+/// 若只看文件在不在,此后每次启动同步都判成租约模式而收手 —— 服务端再下发什么
+/// (WS 开关、换网关)都到不了,用户被永久钉在那份网关块上,且无任何提示。
+/// 加上「托管块确实指着回环」这一条,两种状态就不会互相卡住:配置已不指向代理时
+/// 一切照旧同步;残留的 lease.json 由 `recodex lease off` 或本机代理自己处理。
+///
+/// 路径规则与 Go 的 clientcfg.CodexDir 逐字一致(codex_dir 已经保证了这一点),
+/// 两个客户端看到的是同一个文件。
+pub fn lease_mode_active() -> bool {
+    let Ok(dir) = crate::codexcfg::codex_dir() else {
+        return false;
+    };
+    let config = crate::codexcfg::config_path()
+        .and_then(std::fs::read_to_string)
+        .unwrap_or_default();
+    lease_mode_active_in(&dir, &config)
+}
+
+/// lease_mode_active 的纯函数版,目录与配置内容由调用方给。
+///
+/// 拆出来是为了测试:本 crate 的用例一律显式传路径、从不改 CODEX_HOME ——
+/// set_var 是进程级的,而 Rust 测试是多线程并行跑的,改了会让别的用例读到错的目录、随机失败。
+pub fn lease_mode_active_in(codex_dir: &std::path::Path, config: &str) -> bool {
+    codex_dir.join("recodex").join("lease.json").is_file()
+        && crate::codexcfg::managed_base_url(config).is_some_and(|base| is_loopback_url(&base))
+}
+
+/// 与 Go 侧 cmd/recodex/lease.go 的 isLoopbackURL 同义:主机是 localhost 或回环 IP。
+fn is_loopback_url(raw: &str) -> bool {
+    let raw = raw.trim();
+    let Some(rest) = raw.strip_prefix("http://").or_else(|| raw.strip_prefix("https://")) else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // 带用户信息的一律不认:本机代理的地址从不带,出现了就不是我们写的。
+    if authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(host, _port)| host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// 把服务端当前应下发的托管块与凭据装回本机。
@@ -1381,6 +1482,11 @@ pub fn sync_managed_config(state: &ReCodexState, respect_official_mode: bool) ->
         },
         Err(_) => return ManagedConfigSync::StateUnavailable,
     };
+    // 租约模式:托管块指着本机代理,不能被服务端的网关块冲掉(见 lease_mode_active)。
+    // 放在拉配置**之前**:既然不写,就不必多打一次请求。
+    if lease_mode_active() {
+        return ManagedConfigSync::LeaseActive;
+    }
     let managed = match worker.managed_config() {
         Ok(value) => value,
         Err(adapter_error) => return ManagedConfigSync::Fetch(adapter_error),
@@ -1421,6 +1527,14 @@ pub fn recodex_doctor_fix(state: &ReCodexState) -> Value {
         ManagedConfigSync::NoConfig => return error("doctor", "服务端没有下发配置，无法重装"),
         ManagedConfigSync::Fetch(adapter_error) => return adapter_failure("doctor", &adapter_error),
         ManagedConfigSync::Write(message) => return error("doctor", message),
+        // 租约模式下「修复」也不能把托管块改回网关形态 —— 那会让 lease.json 与 config.toml
+        // 对不上(CLI 以为还在租约模式、配置却已是网关)。明确告诉用户怎么退出。
+        ManagedConfigSync::LeaseActive => {
+            return json!({
+                "status": "lease_active",
+                "message": "租约直连模式已开启,托管配置由本机代理管理。要改回网关请运行 `recodex lease off`。",
+            })
+        }
         // respect_official_mode = false 时不会出现 Staged;真出现也按已修复处理。
         ManagedConfigSync::Staged | ManagedConfigSync::Applied => {}
     }
@@ -1462,7 +1576,10 @@ pub fn handle_bridge(state: &ReCodexState, path: &str, payload: &Value) -> Value
 
 #[cfg(test)]
 mod config_writer_tests {
-    use super::{classify_key_probe, gateway_root, KeyProbe};
+    use super::{
+        classify_key_probe, gateway_root, is_loopback_url, lease_gateway_base_from, lease_mode_active_in,
+        KeyProbe,
+    };
 
     /// 写 `~/.codex` 的入口必须只有两个,而且各自带着官方模式的策略。
     ///
@@ -1502,6 +1619,89 @@ mod config_writer_tests {
         }
         assert!(matches!(classify_key_probe(401, "not json"), KeyProbe::Rejected(_)));
         assert!(matches!(classify_key_probe(502, ""), KeyProbe::Unreachable(_)));
+    }
+
+    /// 一份托管块指着 `base` 的 config.toml(用真渲染器与真标记,不手写)。
+    fn managed_config_pointing_at(base: &str) -> String {
+        use crate::codexcfg::{render_sub2api_block, END_MARKER, START_MARKER};
+        format!("{START_MARKER}\n{}\n{END_MARKER}\n", render_sub2api_block(base, true))
+    }
+
+    /// 租约模式 = lease.json 在 **且** 托管块指着回环(G1)。
+    /// 行为测试:真的建/删文件,而不是读源码找字符串 —— 后者常是假守卫。
+    #[test]
+    fn lease_mode_active_tracks_lease_json() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rcx-lease-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("recodex")).unwrap();
+
+        let proxied = managed_config_pointing_at("http://127.0.0.1:41234/backend-api/codex");
+        let gateway = managed_config_pointing_at("https://hz.gw.recodex.dev/backend-api/codex");
+
+        assert!(!lease_mode_active_in(&dir, &proxied), "没有 lease.json 时不该判为租约模式");
+
+        let lease = dir.join("recodex").join("lease.json");
+        std::fs::write(&lease, "{}").unwrap();
+        assert!(
+            lease_mode_active_in(&dir, &proxied),
+            "lease.json 在且托管块指着本机代理,必须判为租约模式,否则启动期同步会把它冲掉"
+        );
+        // 卡死场景:托管块已被写回网关(桌面端重新登录),lease.json 却还在。
+        // 这时必须**不**算租约模式,否则启动同步永远收手、服务端下发什么都到不了。
+        assert!(
+            !lease_mode_active_in(&dir, &gateway),
+            "托管块已指回网关时不该再判为租约模式"
+        );
+        assert!(!lease_mode_active_in(&dir, ""), "没有托管块(官方模式)时不该判为租约模式");
+
+        // 同名的是个目录而不是文件:不能误判(is_file 而不是 exists)。
+        std::fs::remove_file(&lease).unwrap();
+        std::fs::create_dir_all(&lease).unwrap();
+        assert!(!lease_mode_active_in(&dir, &proxied), "lease.json 是目录时不该判为租约模式");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lease_gateway_base_reads_only_the_fallback_gateway() {
+        // 字段名与 Go 侧 leaseState 的 json tag 一致;别的字段(含本机密钥)一律不取。
+        let raw = r#"{"port":41234,"local_secret":"s","gateway_base_url":"https://hz.gw.recodex.dev","gateway_supports_ws":true}"#;
+        assert_eq!(lease_gateway_base_from(raw).as_deref(), Some("https://hz.gw.recodex.dev"));
+        assert_eq!(lease_gateway_base_from(r#"{"gateway_base_url":"  "}"#), None);
+        assert_eq!(lease_gateway_base_from(r#"{"port":1}"#), None);
+        assert_eq!(lease_gateway_base_from("not json"), None);
+        // 探针根要落到网关根,不带 /backend-api/codex。
+        assert_eq!(gateway_root("https://hz.gw.recodex.dev"), "https://hz.gw.recodex.dev");
+    }
+
+    #[test]
+    /// 与 Go 的 isLoopbackURL 同义,只在带用户信息时更严(Go 会认 `evil@127.0.0.1`)。
+    fn loopback_detection() {
+        for yes in [
+            "http://127.0.0.1:41234/backend-api/codex",
+            "http://localhost:8080",
+            "http://LOCALHOST/x",
+            "http://[::1]:9/backend-api/codex",
+            "http://127.9.9.9:1",
+        ] {
+            assert!(is_loopback_url(yes), "{yes} 应判为回环");
+        }
+        for no in [
+            "https://hz.gw.recodex.dev/backend-api/codex",
+            "http://127.0.0.1.evil.example/x",
+            "http://evil@127.0.0.1:1/",
+            "http://10.0.0.1:1",
+            "ftp://127.0.0.1/",
+            "",
+        ] {
+            assert!(!is_loopback_url(no), "{no:?} 不该判为回环");
+        }
     }
 
     #[test]
