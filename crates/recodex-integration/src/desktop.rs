@@ -371,7 +371,9 @@ fn install_login_config(
     crate::codexcfg::apply_login(config, auth_json, env_key, env_value)
 }
 
-fn route_codex_through_gateway(endpoint: &str) -> Option<String> {
+/// `leave_lease` 只有「租约模式下代理这一侧坏了、要把用户救回网关」时为 true（见 rescue_lease_mode）；
+/// 面板上的换网关一律 false —— 那不该把用户静默踢出租约直连。
+fn route_codex_through_gateway(endpoint: &str, leave_lease: bool) -> Option<String> {
     let endpoint = endpoint.trim().trim_end_matches('/');
     if endpoint.is_empty() {
         return None;
@@ -386,7 +388,7 @@ fn route_codex_through_gateway(endpoint: &str) -> Option<String> {
     // 租约模式下托管块指着本机代理,换网关不能把它改写回网关形态 —— 那等于把用户
     // 静默踢出租约直连(G1)。服务端的选择已经生效,代理回退网关时用的地址由
     // `recodex lease` 管,这里只提示、不写。
-    if lease_mode_active() {
+    if lease_mode_active() && !leave_lease {
         return Some("租约直连模式已开启,本机配置由代理管理;新网关在 `recodex lease off` 后生效".to_string());
     }
     // 官方模式下不能碰活配置 —— 否则「用最快网关」会把官方模式悄悄破坏掉:
@@ -702,7 +704,7 @@ pub fn recodex_select_gateway(state: &ReCodexState, id: String) -> Value {
     let adapter = adapter.fork();
     drop(worker);
     match adapter.select_gateway(&id) {
-        Ok(gateway) => match route_codex_through_gateway(&gateway.endpoint) {
+        Ok(gateway) => match route_codex_through_gateway(&gateway.endpoint, false) {
             Some(warning) => json!({"status":"ready", "data":{"selected_gateway":gateway}, "warning":{"code":"codex_config","message":warning}}),
             None => json!({"status":"ready", "data":{"selected_gateway":gateway}}),
         },
@@ -730,7 +732,7 @@ pub fn recodex_use_fastest_gateway(state: &ReCodexState) -> Value {
     let adapter = adapter.fork();
     drop(guard);
     match adapter.use_fastest_gateway() {
-        Ok(gateway) => match route_codex_through_gateway(&gateway.endpoint) {
+        Ok(gateway) => match route_codex_through_gateway(&gateway.endpoint, false) {
             Some(warning) => json!({"status":"ready", "data":{"selected_gateway":gateway}, "warning":{"code":"codex_config","message":warning}}),
             None => json!({"status":"ready", "data":{"selected_gateway":gateway}}),
         },
@@ -1435,7 +1437,11 @@ pub fn lease_mode_active() -> bool {
 /// 拆出来是为了测试:本 crate 的用例一律显式传路径、从不改 CODEX_HOME ——
 /// set_var 是进程级的,而 Rust 测试是多线程并行跑的,改了会让别的用例读到错的目录、随机失败。
 pub fn lease_mode_active_in(codex_dir: &std::path::Path, config: &str) -> bool {
-    codex_dir.join("recodex").join("lease.json").is_file()
+    // 要求 lease.json **能解析**：写一半的文件让 Go 侧的代理起不来（解析失败），
+    // 这里若只看文件在不在，就会把一个注定起不来的状态当成租约模式，拒绝一切改配置的补救。
+    std::fs::read_to_string(codex_dir.join("recodex").join("lease.json"))
+        .ok()
+        .is_some_and(|raw| serde_json::from_str::<Value>(&raw).is_ok())
         && crate::codexcfg::managed_base_url(config).is_some_and(|base| is_loopback_url(&base))
 }
 
@@ -1448,7 +1454,23 @@ pub fn lease_mode_active_in(codex_dir: &std::path::Path, config: &str) -> bool {
 /// 服务端没把账号设成租约直连时,这一步是一次很快被拒的请求(服务端第二步读账号模式就拒,
 /// 不碰上游),config.toml 一个字节都不动。
 pub fn lease_follow_at_startup(state: &ReCodexState) -> Option<String> {
-    let sidecar = crate::lease_sidecar::sidecar_path()?;
+    // 官方模式：用户在用自己的 ChatGPT。不开直连；有残留的租约状态（官方模式把配置指走后成了孤儿）
+    // 就让 sidecar 收拾掉 —— 否则设备 ID 一直是池子账号的收敛值，个人号可能与池子账号被关联。
+    // desktop-off 不记「用户不要直连」，切回 ReCodex 后下一次启动照常跟随。
+    if crate::officialmode::is_official_mode() {
+        if lease_json_exists() {
+            if let Some(sidecar) = crate::lease_sidecar::sidecar_path() {
+                let outcome = crate::lease_sidecar::off(&sidecar, crate::lease_sidecar::OFF_TIMEOUT);
+                return Some(format!("official_mode_{outcome}"));
+            }
+        }
+        return None;
+    }
+    let Some(sidecar) = crate::lease_sidecar::sidecar_path() else {
+        // 包里没带 sidecar（或被杀软隔离了）：平时什么都不做；但本机正在租约模式时，
+        // Codex 会指着一个没人拉起的代理 —— 退回网关。
+        return rescue_lease_mode("sidecar_missing");
+    };
     // 服务端明确说本账号没开直连,且本机也没在租约模式:不起 sidecar,省掉一次进程启动
     // 和一次注定被拒的请求。租约模式开着时照旧跑 —— sidecar 要负责把它收回来。
     if lease_hint_says_off() && !lease_mode_active() {
@@ -1457,12 +1479,48 @@ pub fn lease_follow_at_startup(state: &ReCodexState) -> Option<String> {
     let Some((base, token)) = lease_session(state) else {
         return Some("signed_out".to_owned());
     };
-    Some(crate::lease_sidecar::follow(
+    let outcome = crate::lease_sidecar::follow(
         &sidecar,
         &base,
         &token,
         crate::lease_sidecar::FOLLOW_TIMEOUT,
-    ))
+    );
+    // sidecar 自己没能收场（被杀、超时、输出坏了、回滚也失败）而本机仍在租约模式：
+    // Rust 这一侧把托管块写回网关，拉起的 Codex 至少能用。
+    if matches!(
+        outcome.as_str(),
+        "timeout" | "spawn_failed" | "unparsable" | "state_corrupt" | "daemon_down_stuck"
+    ) {
+        if let Some(rescued) = rescue_lease_mode(&outcome) {
+            return Some(rescued);
+        }
+    }
+    Some(outcome)
+}
+
+fn lease_json_exists() -> bool {
+    crate::codexcfg::codex_dir()
+        .map(|dir| dir.join("recodex").join("lease.json").is_file())
+        .unwrap_or(false)
+}
+
+/// 租约模式开着、但代理这一侧救不回来：把托管块写回 lease.json 里记的网关（等价于
+/// `lease off` 的配置部分，不依赖 sidecar）。lease.json 留给下一次 sidecar 当孤儿收拾 ——
+/// Rust 侧从不写 lease.json（整份回写会丢掉 Go 侧的新字段）。
+/// 不在租约模式时返回 None（什么都不用做）。
+fn rescue_lease_mode(reason: &str) -> Option<String> {
+    if !lease_mode_active() {
+        return None;
+    }
+    let gateway = lease_gateway_base()
+        .filter(|base| !is_loopback_url(base) && crate::codexcfg::base_url_is_safe(base));
+    let Some(gateway) = gateway else {
+        return Some(format!("{reason}_stuck"));
+    };
+    match route_codex_through_gateway(&gateway, true) {
+        None => Some(format!("{reason}_rolled_back")),
+        Some(_) => Some(format!("{reason}_stuck")),
+    }
 }
 
 // 托管配置捎来的直连提示(§11-F)。0 = 不知道,1 = 否,2 = 是。
@@ -1499,7 +1557,8 @@ fn lease_hand_over_rotated_token(state: &ReCodexState) {
     // 结果不记:本 crate 不写诊断日志(那是 launcher 的事),而交接失败的后果只是
     // 代理暂回网关 —— 下次启动的 lease_follow_at_startup 会再交一次,并且那一次有日志。
     std::thread::spawn(move || {
-        let _ = crate::lease_sidecar::follow(
+        // 只交令牌、绝不重启代理：此刻 Codex 可能正在跑（重启会切断它的连接）。
+        let _ = crate::lease_sidecar::hand_over(
             &sidecar,
             &base,
             &token,
@@ -1766,6 +1825,10 @@ mod config_writer_tests {
         assert!(!lease_mode_active_in(&dir, &proxied), "没有 lease.json 时不该判为租约模式");
 
         let lease = dir.join("recodex").join("lease.json");
+        // 写一半的 lease.json（断电/崩溃）：Go 侧代理解析失败起不来，不能算租约模式，
+        // 否则启动同步与补救都收手，Codex 就一直指着死端口（审计 L11）。
+        std::fs::write(&lease, "{\"port\": 412").unwrap();
+        assert!(!lease_mode_active_in(&dir, &proxied), "解析不了的 lease.json 不能算租约模式");
         std::fs::write(&lease, "{}").unwrap();
         assert!(
             lease_mode_active_in(&dir, &proxied),

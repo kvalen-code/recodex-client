@@ -69,6 +69,18 @@ pub fn follow(sidecar: &Path, api_base: &str, token: &str, timeout: Duration) ->
     )
 }
 
+/// 只把轮换后的令牌交给正在运行的代理:不重启代理、不收拾孤儿态(Codex 可能正在跑)。
+/// 老版 sidecar 不认识 --handoff-only,会按完整跟随处理 —— 与改动前的行为一致。
+pub fn hand_over(sidecar: &Path, api_base: &str, token: &str, timeout: Duration) -> String {
+    let api_base = api_base.trim().trim_end_matches('/');
+    run(
+        sidecar,
+        &["lease", "desktop-follow", "--api", api_base, "--handoff-only"],
+        Some(token),
+        timeout,
+    )
+}
+
 /// 彻底还原(停代理、撤自启、还原托管块与设备 ID)。不记成「用户不要直连」。
 pub fn off(sidecar: &Path, timeout: Duration) -> String {
     run(sidecar, &["lease", "desktop-off"], None, timeout)
