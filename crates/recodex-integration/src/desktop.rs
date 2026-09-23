@@ -1,7 +1,7 @@
 //! ReCodex desktop bridge：ReCodexState + 命令实现,从 manager 的 Tauri IPC 迁进本 crate,
 //! 供 launcher 的 CDP 桥调用(不再依赖 manager app)。recodex-overlay 核心,逻辑照搬。
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicU8, Ordering},
     Mutex,
 };
 use std::sync::{MutexGuard, TryLockError};
@@ -1449,6 +1449,11 @@ pub fn lease_mode_active_in(codex_dir: &std::path::Path, config: &str) -> bool {
 /// 不碰上游),config.toml 一个字节都不动。
 pub fn lease_follow_at_startup(state: &ReCodexState) -> Option<String> {
     let sidecar = crate::lease_sidecar::sidecar_path()?;
+    // 服务端明确说本账号没开直连,且本机也没在租约模式:不起 sidecar,省掉一次进程启动
+    // 和一次注定被拒的请求。租约模式开着时照旧跑 —— sidecar 要负责把它收回来。
+    if lease_hint_says_off() && !lease_mode_active() {
+        return Some("server_off".to_owned());
+    }
     let Some((base, token)) = lease_session(state) else {
         return Some("signed_out".to_owned());
     };
@@ -1458,6 +1463,25 @@ pub fn lease_follow_at_startup(state: &ReCodexState) -> Option<String> {
         &token,
         crate::lease_sidecar::FOLLOW_TIMEOUT,
     ))
+}
+
+// 托管配置捎来的直连提示(§11-F)。0 = 不知道,1 = 否,2 = 是。
+//
+// 进程级:启动流程里「同步托管配置」与「跟随租约」各自新建 ReCodexState,
+// 状态对象传不过去;两步在同一个进程里先后跑,一个原子变量刚好够。
+static LEASE_HINT: AtomicU8 = AtomicU8::new(0);
+
+fn remember_lease_hint(hint: Option<bool>) {
+    let value = match hint {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    LEASE_HINT.store(value, Ordering::Relaxed);
+}
+
+fn lease_hint_says_off() -> bool {
+    LEASE_HINT.load(Ordering::Relaxed) == 1
 }
 
 /// 令牌轮换之后把新令牌交给正在运行的本机代理 —— 刷新会让旧令牌立即作废,不交的话
@@ -1565,6 +1589,7 @@ pub fn sync_managed_config(state: &ReCodexState, respect_official_mode: bool) ->
         Ok(value) => value,
         Err(adapter_error) => return ManagedConfigSync::Fetch(adapter_error),
     };
+    remember_lease_hint(managed.lease_direct);
     if managed.config.trim().is_empty() {
         return ManagedConfigSync::NoConfig;
     }
@@ -1645,6 +1670,26 @@ pub fn handle_bridge(state: &ReCodexState, path: &str, payload: &Value) -> Value
         "/recodex/official-mode/disable" => recodex_official_mode_disable(),
         "/recodex/prepare-uninstall" => recodex_prepare_uninstall(state),
         _ => error("not_found", format!("unknown recodex path: {path}")),
+    }
+}
+
+#[cfg(test)]
+mod lease_hint_tests {
+    /// 服务端提示是三态:缺字段 = 不知道,只有明确的 false 才跳过 sidecar(§11-F)。
+    /// 这是本文件里唯一碰 LEASE_HINT 的用例,不会和并行的别的用例互相踩。
+    #[test]
+    fn lease_hint_is_tri_state() {
+        let parse = |s: &str| serde_json::from_str::<crate::ManagedConfig>(s).unwrap().lease_direct;
+        assert_eq!(parse(r#"{"config":"x"}"#), None, "老服务端不带字段 = 不知道");
+        assert_eq!(parse(r#"{"config":"x","lease_direct":false}"#), Some(false));
+        assert_eq!(parse(r#"{"config":"x","lease_direct":true}"#), Some(true));
+
+        super::remember_lease_hint(Some(false));
+        assert!(super::lease_hint_says_off());
+        super::remember_lease_hint(None);
+        assert!(!super::lease_hint_says_off(), "不知道时照旧去试");
+        super::remember_lease_hint(Some(true));
+        assert!(!super::lease_hint_says_off());
     }
 }
 

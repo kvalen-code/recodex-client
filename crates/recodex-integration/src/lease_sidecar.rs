@@ -167,6 +167,7 @@ pub fn is_failure(outcome: &str) -> bool {
         || outcome == "opted_out"
         || outcome == "orphaned"
         || outcome == "signed_out"
+        || outcome == "server_off"
         || outcome.starts_with("not_eligible:"))
 }
 
@@ -257,7 +258,7 @@ mod tests {
 
     #[test]
     fn only_real_failures_are_reported() {
-        for quiet in ["enabled", "active", "opted_out", "orphaned", "signed_out", "not_eligible:lease_direct_disabled", "not_eligible:transport"] {
+        for quiet in ["enabled", "active", "opted_out", "orphaned", "signed_out", "server_off", "not_eligible:lease_direct_disabled", "not_eligible:transport"] {
             assert!(!is_failure(quiet), "{quiet} 不该当故障上报");
         }
         for loud in ["rolled_back", "daemon_down", "handoff_failed", "enabled_handoff_failed", "timeout", "spawn_failed", "no_token", "unparsable", "state_corrupt"] {

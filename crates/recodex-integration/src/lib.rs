@@ -122,6 +122,10 @@ pub struct ManagedConfig {
     pub env_key: String,
     #[serde(default)]
     pub env_value: String,
+    /// 服务端的提示:本账号是否租约直连(§11-F)。**None = 不知道**(老服务端/查询失败),
+    /// 只有明确的 `Some(false)` 才让启动流程跳过 sidecar。
+    #[serde(default)]
+    pub lease_direct: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
