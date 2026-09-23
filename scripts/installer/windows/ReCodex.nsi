@@ -44,9 +44,17 @@ Section "Install"
   ; 文件名,所以升级上来的机器上跑着的仍然是旧名字那个进程。
   nsExec::ExecToLog 'taskkill /IM recodex.exe /F'
   nsExec::ExecToLog 'taskkill /IM codex-plus-plus.exe /F'
+  ; 租约直连的本机代理常驻在后台、占着 recodex-lease.exe,不停掉就写不进新版。
+  ; 停掉无妨:下次打开 ReCodex 时启动器发现它没在跑会重新拉起(lease desktop-follow)。
+  nsExec::ExecToLog 'taskkill /IM recodex-lease.exe /F'
 
   SetOutPath "$INSTDIR"
   File "${ROOT}\dist\windows\app\recodex.exe"
+  ; 租约直连的本机代理(Go,与命令行同一份代码)。**可选**:CI 只在取到的命令行版本
+  ; 支持 `lease desktop-follow` 时才放进来;没有它时桌面端一切照旧走网关。
+  !if /FileExists "${ROOT}\dist\windows\app\recodex-lease.exe"
+    File "${ROOT}\dist\windows\app\recodex-lease.exe"
+  !endif
 
   ; 旧名字的 exe 必须删掉。不删的话同一个目录里躺着两个可执行文件,而用户
   ; 桌面上那个旧快捷方式还指着旧的 —— 从此他每次点开的都是不再更新的老版本。
@@ -94,10 +102,20 @@ Section "Uninstall"
   ; recodex.exe 起不来时的兜底:至少别让开机自启继续指着它
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "ReCodexRemote"
 
+  ; 租约直连:停本机代理、撤自启、把 config.toml 与设备 ID 还原回开启前。
+  ; 不做的话 Codex 会指着一个随程序一起被删掉的代理 —— 装回去之前完全用不了。
+  ; 必须在删 exe 之前(要借它还原)。
+  IfFileExists "$INSTDIR\recodex-lease.exe" 0 +2
+    nsExec::ExecToLog '"$INSTDIR\recodex-lease.exe" lease desktop-off'
+  ; 兜底:sidecar 起不来时至少别让开机自启继续指着一个不存在的文件
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "ReCodexLease"
+
   nsExec::ExecToLog 'taskkill /IM recodex.exe /F'
   nsExec::ExecToLog 'taskkill /IM codex-plus-plus.exe /F'
+  nsExec::ExecToLog 'taskkill /IM recodex-lease.exe /F'
 
   Delete "$INSTDIR\recodex.exe"
+  Delete "$INSTDIR\recodex-lease.exe"
   ; 旧名字也清掉:从改名前的版本升上来的机器上,它可能还躺在这儿
   Delete "$INSTDIR\codex-plus-plus.exe"
   ; 自更新(.old/.new)与旧名接班(.migrating)留下的残留:不清的话 RMDir 删不掉目录

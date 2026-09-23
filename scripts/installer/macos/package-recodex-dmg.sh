@@ -70,7 +70,20 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# 租约直连的本机代理(Go,与命令行同一份代码)。**可选**:CI 只在取到的命令行版本
+# 支持 `lease desktop-follow` 时才放到 $BINARY_DIR/recodex-lease;没有它时一切照旧走网关。
+# 放在 Contents/MacOS/ 与本体同目录 —— 启动器按「与自己同目录」找它。
+SIDECAR="$BINARY_DIR/recodex-lease"
+if [ -f "$SIDECAR" ]; then
+  cp "$SIDECAR" "$APP_DIR/Contents/MacOS/recodex-lease"
+  chmod +x "$APP_DIR/Contents/MacOS/recodex-lease"
+fi
+
 # ad-hoc 签名。先签可执行文件再签 bundle —— 顺序反了 bundle 签名会失效。
+# sidecar 也是 bundle 里的可执行文件,同样要先签,否则 bundle 签名校验不过。
+if [ -f "$APP_DIR/Contents/MacOS/recodex-lease" ]; then
+  codesign --force --sign - "$APP_DIR/Contents/MacOS/recodex-lease"
+fi
 codesign --force --sign - "$APP_DIR/Contents/MacOS/ReCodex"
 codesign --force --sign - "$APP_DIR"
 
@@ -78,6 +91,16 @@ codesign --force --sign - "$APP_DIR"
 plutil -lint "$APP_DIR/Contents/Info.plist" >/dev/null
 test -x "$APP_DIR/Contents/MacOS/ReCodex"
 codesign -dv "$APP_DIR" >/dev/null 2>&1
+# 带了 sidecar 就要真能跑:签名坏了或架构不对,用户那边只会静默退回网关、没人知道。
+if [ -f "$APP_DIR/Contents/MacOS/recodex-lease" ]; then
+  codesign --verify --strict "$APP_DIR" >/dev/null
+  sandbox="$(mktemp -d)"
+  # 控制面指到回环空端口:自检绝不能连到生产。
+  got="$(HOME="$sandbox" CODEX_HOME="$sandbox/.codex" RECODEX_API=http://127.0.0.1:9 \
+    "$APP_DIR/Contents/MacOS/recodex-lease" lease desktop-follow --api http://127.0.0.1:9 </dev/null)"
+  rm -rf "$sandbox"
+  [ "$got" = '{"outcome":"no_token"}' ] || { echo "error: sidecar 自检输出不对: $got" >&2; exit 1; }
+fi
 # 版本号必须与传入的一致,否则装完客户端自报旧版本会永远提示有更新
 got="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist")"
 [ "$got" = "$VERSION" ] || { echo "error: Info.plist 版本 $got != $VERSION" >&2; exit 1; }

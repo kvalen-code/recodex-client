@@ -98,6 +98,47 @@ jobs:
             throw "exe 里还有 $hits 处 codex-plus 源码路径 —— .cargo/release.toml 的 remap 没生效(构建命令漏了 --config,或 CI 里设了 RUSTFLAGS?)"
           }
 
+      # 租约直连的本机代理(sidecar)。Go 写的,与命令行同一份代码 —— 这个仓库是公开的、
+      # Go 源码不在这里,所以不在这里编,而是取**已发布、已签名**的命令行包,改名放进安装包。
+      #
+      # 三道闸,任何一道不过都只是**跳过捆绑**(警告),不让发布失败:
+      #   ① 与 SHA256SUMS 对得上;
+      #   ② 真能跑,且认识 `lease desktop-follow`(老版命令行没有这个子命令 —— 捆进去只会
+      #      让每次启动都记一条「看不懂的输出」);
+      #   ③ 仓库变量 RECODEX_LEASE_SIDECAR 不是 off(一键不捆,回滚用)。
+      # 没捆的包与今天完全一样:启动器找不到 sidecar 就什么都不做、一切走网关。
+      - name: 取租约直连 sidecar(可选)
+        if: vars.RECODEX_LEASE_SIDECAR != 'off'
+        shell: pwsh
+        run: |
+          $base = "${{ vars.RECODEX_LEASE_SIDECAR_BASE || 'https://oss.jzspace.cn/client/cli/latest' }}"
+          try {
+            Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile sidecar.sums -UseBasicParsing -TimeoutSec 60
+            Invoke-WebRequest -Uri "$base/recodex.exe" -OutFile sidecar.exe -UseBasicParsing -TimeoutSec 120
+          } catch {
+            Write-Warning "取不到 sidecar,本包不捆绑:$($_.Exception.Message)"; exit 0
+          }
+          $want = (Get-Content sidecar.sums | Where-Object { $_ -match '\s\*?recodex\.exe$' } | Select-Object -First 1) -replace '\s.*$',''
+          $got = (Get-FileHash sidecar.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ([string]::IsNullOrWhiteSpace($want) -or $want.ToLowerInvariant() -ne $got) {
+            Write-Warning "sidecar 哈希与 SHA256SUMS 对不上(want=$want got=$got),本包不捆绑"; exit 0
+          }
+          # 关进临时目录跑:绝不碰 runner 的真用户目录。空 stdin = 没有令牌,新版必答 no_token。
+          # stdin 必须真是空的(经 cmd 的 < NUL):PowerShell 往原生程序管道里写 '' 时
+          # 可能带 BOM,新版会剥掉,但老版会把它当令牌拿去打一次生产控制面。
+          # 另外把控制面指到回环的空端口,万一哪版判断失误也连不到生产。
+          $sbx = Join-Path $env:RUNNER_TEMP "sidecar-sbx"
+          New-Item -ItemType Directory -Force $sbx | Out-Null
+          $env:USERPROFILE = $sbx; $env:HOME = $sbx; $env:CODEX_HOME = (Join-Path $sbx ".codex")
+          $env:RECODEX_API = "http://127.0.0.1:9"
+          $out = (cmd /c ".\sidecar.exe lease desktop-follow --api http://127.0.0.1:9 < NUL 2> NUL" | Out-String).Trim()
+          if ($out -ne '{"outcome":"no_token"}') {
+            Write-Warning "已发布的命令行还不支持 lease desktop-follow(输出:$out),本包不捆绑"; exit 0
+          }
+          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
+          Copy-Item sidecar.exe dist/windows/app/recodex-lease.exe
+          Write-Host "已捆绑 sidecar(sha256 $got)"
+
       - name: 装 NSIS
         run: choco install nsis -y --no-progress
 
@@ -270,6 +311,35 @@ jobs:
             echo "二进制里还有 codex-plus 源码路径 —— .cargo/release.toml 的 remap 没生效(构建命令漏了 --config,或 CI 里设了 RUSTFLAGS?)"
             exit 1
           fi
+
+      # 租约直连 sidecar,规矩与 Windows 那一步相同(见其注释):取已发布的命令行包、
+      # 对哈希、真跑一次认得 `lease desktop-follow` 才捆;任何一道不过只跳过、不让发布失败。
+      - name: 取租约直连 sidecar(可选)
+        if: vars.RECODEX_LEASE_SIDECAR != 'off'
+        run: |
+          set -uo pipefail
+          base="${{ vars.RECODEX_LEASE_SIDECAR_BASE || 'https://oss.jzspace.cn/client/cli/latest' }}"
+          name="recodex-darwin-$([ "${{ matrix.arch }}" = "arm64" ] && echo arm64 || echo amd64)"
+          dest="$PWD/target/${{ matrix.target }}/release/recodex-lease"
+          if ! curl -fsSL --max-time 60 -o sidecar.sums "$base/SHA256SUMS" \
+             || ! curl -fsSL --max-time 120 -o sidecar.bin "$base/$name"; then
+            echo "::warning::取不到 sidecar,本包不捆绑"; exit 0
+          fi
+          want="$(awk -v n="$name" '$2==n || $2=="*"n {print $1; exit}' sidecar.sums)"
+          got="$(shasum -a 256 sidecar.bin | awk '{print $1}')"
+          if [ -z "$want" ] || [ "$want" != "$got" ]; then
+            echo "::warning::sidecar 哈希与 SHA256SUMS 对不上(want=$want got=$got),本包不捆绑"; exit 0
+          fi
+          chmod +x sidecar.bin
+          sbx="$(mktemp -d)"
+          # 控制面指到回环空端口:自检绝不能连到生产。
+          out="$(HOME="$sbx" CODEX_HOME="$sbx/.codex" RECODEX_API=http://127.0.0.1:9 ./sidecar.bin lease desktop-follow --api http://127.0.0.1:9 </dev/null 2>/dev/null)"
+          rm -rf "$sbx"
+          if [ "$out" != '{"outcome":"no_token"}' ]; then
+            echo "::warning::已发布的命令行还不支持 lease desktop-follow(输出:$out),本包不捆绑"; exit 0
+          fi
+          cp sidecar.bin "$dest"
+          echo "已捆绑 sidecar $name(sha256 $got)"
 
       - name: 打 DMG
         run: |
