@@ -1454,16 +1454,12 @@ pub fn lease_mode_active_in(codex_dir: &std::path::Path, config: &str) -> bool {
 /// 服务端没把账号设成租约直连时,这一步是一次很快被拒的请求(服务端第二步读账号模式就拒,
 /// 不碰上游),config.toml 一个字节都不动。
 pub fn lease_follow_at_startup(state: &ReCodexState) -> Option<String> {
-    // 官方模式：用户在用自己的 ChatGPT。不开直连；有残留的租约状态（官方模式把配置指走后成了孤儿）
-    // 就让 sidecar 收拾掉 —— 否则设备 ID 一直是池子账号的收敛值，个人号可能与池子账号被关联。
-    // desktop-off 不记「用户不要直连」，切回 ReCodex 后下一次启动照常跟随。
+    // 官方模式：用户在用自己的 ChatGPT，不开直连、也**不动**残留的租约状态。
+    // 不能在这里调 desktop-off：官方模式只删了顶层 model_provider，托管块还在、还指着本机代理，
+    // Go 侧会把它当成「配置在代理上」写回网关块（连同 model_provider = "recodex"），官方模式被悄悄破坏；
+    // 快照里的代理块也会在切回时指向一个已被停掉的代理（第二轮审计 1）。
+    // 残留的代价是 Q8 已接受并明示过的设备 ID 关联风险；切回 ReCodex 后照常跟随、自然收拾。
     if crate::officialmode::is_official_mode() {
-        if lease_json_exists() {
-            if let Some(sidecar) = crate::lease_sidecar::sidecar_path() {
-                let outcome = crate::lease_sidecar::off(&sidecar, crate::lease_sidecar::OFF_TIMEOUT);
-                return Some(format!("official_mode_{outcome}"));
-            }
-        }
         return None;
     }
     let Some(sidecar) = crate::lease_sidecar::sidecar_path() else {
@@ -1487,21 +1483,17 @@ pub fn lease_follow_at_startup(state: &ReCodexState) -> Option<String> {
     );
     // sidecar 自己没能收场（被杀、超时、输出坏了、回滚也失败）而本机仍在租约模式：
     // Rust 这一侧把托管块写回网关，拉起的 Codex 至少能用。
+    // 不含 timeout：超时不等于代理坏了（首次运行被杀软扫描、换代时等旧代理退出都可能超过预算），
+    // 按超时补救会把一个正常的租约用户踢回网关、再连带两次启动的反复（第二轮审计 6）。
     if matches!(
         outcome.as_str(),
-        "timeout" | "spawn_failed" | "unparsable" | "state_corrupt" | "daemon_down_stuck"
+        "spawn_failed" | "unparsable" | "state_corrupt" | "daemon_down_stuck"
     ) {
         if let Some(rescued) = rescue_lease_mode(&outcome) {
             return Some(rescued);
         }
     }
     Some(outcome)
-}
-
-fn lease_json_exists() -> bool {
-    crate::codexcfg::codex_dir()
-        .map(|dir| dir.join("recodex").join("lease.json").is_file())
-        .unwrap_or(false)
 }
 
 /// 租约模式开着、但代理这一侧救不回来：把托管块写回 lease.json 里记的网关（等价于
