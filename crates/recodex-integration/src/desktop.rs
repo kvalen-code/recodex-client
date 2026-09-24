@@ -1530,7 +1530,9 @@ fn remember_lease_hint(hint: Option<bool>) {
     LEASE_HINT.store(value, Ordering::Relaxed);
 }
 
-fn lease_hint_says_off() -> bool {
+/// 服务端（托管配置同步时捎来的提示）是否明确说本账号**没开**租约直连。没同步到提示时为 false。
+/// 启动器据此决定缺 sidecar 时要不要等补装完再拉起 Codex。
+pub fn lease_hint_says_off() -> bool {
     LEASE_HINT.load(Ordering::Relaxed) == 1
 }
 

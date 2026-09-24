@@ -247,6 +247,7 @@ fn record_launch_failure(options: &LaunchOptions, failure: &LauncherFailure) {
 /// 很快被拒的请求,config.toml 不动。结果码写进诊断日志;只有故障才带 error 字段、
 /// 被自动上报 —— 「服务端不签」是绝大多数账号的常态,报它只会淹没真问题。
 async fn follow_lease_direct() {
+    repair_missing_sidecar_at_startup().await;
     let outcome = tokio::task::spawn_blocking(|| {
         let state = recodex_integration::desktop::ReCodexState::from_env();
         recodex_integration::desktop::lease_follow_at_startup(&state)
@@ -262,6 +263,51 @@ async fn follow_lease_direct() {
         "launcher.lease_follow",
         json!({ "outcome": label, "error": error }),
     );
+}
+
+/// 本次启动等补装的上限:账号开了直连(或还不知道)时,等它补完才拉起 Codex,本次就能直连。
+const SIDECAR_REPAIR_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 后台补装的上限:账号没开直连,不拖慢启动,补好了下次启动用。
+const SIDECAR_REPAIR_BACKGROUND: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// recodex-overlay: 安装目录缺租约直连的 sidecar 时补装一次(见 selfupdate::repair_missing_sidecar)。
+///
+/// 从 1.3.9 及更早版本自动更新上来的机器都缺它 —— 老的更新程序不认识清单里的 sidecar 字段。
+/// 不补的话直连要等**下一次**更新才生效(2026-09-24 实测:1.3.9→1.3.10 后安装目录里没有 recodex-lease)。
+///
+/// - 服务端明确说本账号没开直连(绝大多数账号):放后台补,不拖慢启动;
+/// - 开了或还不知道:先等它补完(最多 30 秒),本次启动就能直连;超时照常往下走、走网关。
+///
+/// 官方模式不补(那时根本不跑 sidecar)。结果写诊断日志,失败带 error 字段被自动上报。
+async fn repair_missing_sidecar_at_startup() {
+    if recodex_integration::officialmode::is_official_mode()
+        || recodex_integration::lease_sidecar::sidecar_path().is_some()
+    {
+        return;
+    }
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return;
+    };
+    let background = recodex_integration::desktop::lease_hint_says_off();
+    let limit = if background { SIDECAR_REPAIR_BACKGROUND } else { SIDECAR_REPAIR_WAIT };
+    let task = async move {
+        let outcome = tokio::time::timeout(limit, codex_plus_core::selfupdate::repair_missing_sidecar(&dir))
+            .await
+            .unwrap_or("timeout");
+        let failed = !matches!(outcome, "repaired" | "absent");
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.sidecar_repair",
+            json!({ "outcome": outcome, "background": background, "error": failed.then_some(outcome) }),
+        );
+    };
+    if background {
+        tokio::spawn(task);
+    } else {
+        task.await;
+    }
 }
 
 async fn sync_managed_config_from_server() {

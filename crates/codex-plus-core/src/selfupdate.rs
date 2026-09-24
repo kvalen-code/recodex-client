@@ -73,6 +73,14 @@ fn require_https(url: &str, what: &str) -> anyhow::Result<url::Url> {
 }
 
 pub async fn fetch_manifest(manifest_url: &str) -> anyhow::Result<UpdateManifest> {
+    let manifest = fetch_manifest_unchecked(manifest_url).await?;
+    if !manifest.allow_downgrade {
+        reject_non_upgrade(&manifest.version, crate::version::VERSION)?;
+    }
+    Ok(manifest)
+}
+
+async fn fetch_manifest_unchecked(manifest_url: &str) -> anyhow::Result<UpdateManifest> {
     let url = require_https(manifest_url, "更新清单")?;
     let client = crate::http_client::proxied_client(&format!("ReCodex/{}", crate::version::VERSION))?;
     let manifest: UpdateManifest = client
@@ -85,10 +93,55 @@ pub async fn fetch_manifest(manifest_url: &str) -> anyhow::Result<UpdateManifest
     if manifest.sha256.trim().is_empty() {
         anyhow::bail!("更新清单缺少 sha256,拒绝安装");
     }
-    if !manifest.allow_downgrade {
-        reject_non_upgrade(&manifest.version, crate::version::VERSION)?;
-    }
     Ok(manifest)
+}
+
+/// 发布目录的根。每一版的清单固定在 `<根>/<版本>/manifest.json`(publish-desktop.sh 就这么传)。
+const RELEASE_BASE_URL: &str = "https://oss.jzspace.cn/client";
+
+/// 当前这一版自己的发布清单地址。
+pub fn current_version_manifest_url() -> String {
+    format!("{RELEASE_BASE_URL}/{}/manifest.json", crate::version::VERSION)
+}
+
+/// 补装 sidecar 只认**当前这一版**的清单:版本号必须一字不差。
+///
+/// 用别的版本的 sidecar 顶上不安全 —— sidecar 与主程序按同一次发布配套验过(CI 的
+/// desktop-follow 自检),跨版本的组合没人验过。
+fn check_repair_manifest(manifest: &UpdateManifest, current: &str) -> anyhow::Result<()> {
+    if manifest.version.trim() != current.trim() {
+        anyhow::bail!("清单版本 {} 不是当前版本 {current}", manifest.version);
+    }
+    Ok(())
+}
+
+/// 补装缺失的 sidecar(recodex-overlay)。
+///
+/// 1.3.9 及更早的更新程序不认识清单里的 `sidecar` 字段,只换主程序 —— 从它们自动更新上来的
+/// 安装目录里没有 recodex-lease,桌面端照常走网关,直连要等**下一次**更新才装上(2026-09-24
+/// 1.3.9→1.3.10 实测)。启动器发现缺了就按当前版本的清单补一次,校验规矩与更新完全相同
+/// (https + 清单里的 sha256 + 可执行格式)。
+///
+/// 返回结果码写诊断日志:`repaired` / `absent`(这一版没捆 sidecar)/ `manifest_failed` /
+/// `version_mismatch` / `download_failed` / `stage_failed`。
+pub async fn repair_missing_sidecar(dir: &Path) -> &'static str {
+    let manifest = match fetch_manifest_unchecked(&current_version_manifest_url()).await {
+        Ok(value) => value,
+        Err(_) => return "manifest_failed",
+    };
+    if check_repair_manifest(&manifest, crate::version::VERSION).is_err() {
+        return "version_mismatch";
+    }
+    let Some(asset) = manifest.sidecar.as_ref() else {
+        return "absent";
+    };
+    match download_sidecar_verified(&manifest, asset).await {
+        Ok(bytes) => match stage_sidecar(&dir.join(sidecar_file_name()), &bytes) {
+            Ok(()) => "repaired",
+            Err(_) => "stage_failed",
+        },
+        Err(_) => "download_failed",
+    }
 }
 
 /// 拒绝安装一个不比当前新的包。
@@ -380,6 +433,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 补装只认当前这一版的清单;地址固定在发布目录下、带当前版本号、必须是 https。
+    #[test]
+    fn repair_uses_only_the_current_version_manifest() {
+        let url = current_version_manifest_url();
+        assert_eq!(url, format!("https://oss.jzspace.cn/client/{}/manifest.json", crate::version::VERSION));
+        assert!(require_https(&url, "更新清单").is_ok());
+
+        let manifest = |version: &str| UpdateManifest {
+            version: version.to_string(),
+            url: format!("https://oss.jzspace.cn/client/{version}/recodex.exe"),
+            sha256: "ab".repeat(32),
+            allow_downgrade: false,
+            sidecar: None,
+        };
+        assert!(check_repair_manifest(&manifest("1.3.10"), "1.3.10").is_ok());
+        assert!(check_repair_manifest(&manifest(" 1.3.10 "), "1.3.10").is_ok());
+        assert!(check_repair_manifest(&manifest("1.3.11"), "1.3.10").is_err(), "别的版本的 sidecar 没和本版一起验过");
+        assert!(check_repair_manifest(&manifest("1.3.9"), "1.3.10").is_err());
     }
 
     /// CI 写的是文件名;构建机只把主程序 url 改成绝对地址 —— sidecar 要跟着它走。
