@@ -1,0 +1,31 @@
+model = "gpt-5.6-sol"
+
+# >>> recodex managed block, do not edit >>>
+# recodex-previous-model-provider = "custom"
+model_provider = "recodex"
+
+[model_providers.recodex]
+name = "ReCodex"
+base_url = "https://gw.example.dev/backend-api/codex"
+wire_api = "responses"
+experimental_bearer_token = "rk-current"
+supports_websockets = true
+http_headers = { "x-openai-actor-authorization" = "recodex" }
+
+# recodex history provider aliases (old conversations were created with these providers)
+[model_providers.gone]
+name = "ReCodex"
+base_url = "https://gw.example.dev/backend-api/codex"
+wire_api = "responses"
+experimental_bearer_token = "rk-current"
+supports_websockets = true
+http_headers = { "x-openai-actor-authorization" = "recodex" }
+# <<< recodex managed block <<<
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://example.invalid/v1"
+wire_api = "responses"
+
+[mcp_servers.context7]
+command = "npx"

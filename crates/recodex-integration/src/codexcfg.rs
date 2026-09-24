@@ -1064,7 +1064,11 @@ pub fn apply_config_with_key(body: &str, key: &str) -> io::Result<()> {
         key.trim().to_string()
     };
     let body = inline_managed_key(body, &key).unwrap_or_else(|| body.to_string());
-    let next = install_block(&cur, &body);
+    let mut next = install_block(&cur, &body);
+    // 重装块会把上一轮的别名段一起换掉，这里按当前钥匙重新生成（见 with_history_aliases）。
+    if let Ok(dir) = codex_dir() {
+        next = with_history_aliases(&next, &session_provider_refs(&dir));
+    }
     if next == cur {
         return Ok(());
     }
@@ -1792,6 +1796,284 @@ pub fn restore_all() -> io::Result<()> {
     restore_config()?;
     restore_auth()?;
     unset_user_env(SUB2API_ENV_KEY)
+}
+
+// ---------------------------------------------------------------------------
+// 旧对话的 provider 别名。与 Go 侧 internal/clientcfg/history_aliases.go 逐字节一致，
+// 由 testdata/history-aliases 语料锁定 —— 两边都会重装托管块，渲染不一致就会互相把
+// 对方写的别名段当成异物，叠出重复表（Codex 对重复表硬失败，所有配置一起失效）。
+//
+// 为什么要补：Codex 给每个对话记下创建它时用的 model_provider（会话文件首行
+// session_meta，与 state_*.sqlite 的 threads 表一致）。从别家中转、cockpit-tools 的
+// 「API 服务」（codex_local_access）、cc-switch 切过来之后，那些 provider 表没了，
+// 旧对话一打开就是「Model provider `xxx` not found」，而新对话一切正常。
+//
+// 为什么放托管块里：块里的钥匙是内联的，每次登录都会换发。块外的静态拷贝下一次登录
+// 就过期，旧对话从 not found 变成 401；放块里每次重装都按当前钥匙重新生成，
+// 登出删块时一起消失。任何一步没把握都原样返回 —— 绝不能把能用的配置写坏。
+// ---------------------------------------------------------------------------
+
+/// 标出托管块里的别名段，从这一行到块结束标记之前都是生成的。与 Go 侧逐字一致。
+pub const HISTORY_ALIAS_MARKER: &str =
+    "# recodex history provider aliases (old conversations were created with these providers)";
+
+/// Codex 的保留 provider id，永远不补别名（与 Go 的 reservedModelProviderIDs 一致）。
+/// 照抄 Codex 源码 codex-rs/config/src/config_toml.rs 的 RESERVED_MODEL_PROVIDER_IDS（2026-09-23 核对）：
+/// config.toml 里出现其中任何一张表，Codex 就拒绝整份配置（新对话也打不开）；
+/// bedrock 两个 id 只收 base_url/auth/http_headers/aws，抄过去的 recodex 表同样过不了校验。
+const RESERVED_MODEL_PROVIDER_IDS: &[&str] =
+    &["openai", "amazon-bedrock", "amazon-bedrock-runtime", "ollama", "lmstudio"];
+
+/// 首行读取上限。实测首行中位 22KB、最大 50KB，model_provider 最远在第 49KB
+/// （排在一大段 instructions 后面），所以必须读完整行。
+const SESSION_META_MAX_LINE: u64 = 4 << 20;
+
+/// 「会话文件 → provider」缓存，放在 <codex_dir>/recodex/ 下，与 Go 侧共用同一份、同一格式。
+/// 会话文件首行写下后不再变，按相对路径缓存永远正确；实测 460 个会话冷扫 1.96s、
+/// 走缓存约 40ms —— 桌面端每次启动（拉起 Codex 之前）都要走一遍，必须缓存。
+const SESSION_PROVIDER_CACHE_NAME: &str = "session-providers.json";
+
+/// 统计 codex_dir 下每个 provider 被多少个对话引用（含已归档）。
+pub fn session_provider_refs(codex_dir: &Path) -> std::collections::BTreeMap<String, usize> {
+    use std::collections::BTreeMap;
+    let cache_path = codex_dir.join("recodex").join(SESSION_PROVIDER_CACHE_NAME);
+    let cached = load_session_provider_cache(&cache_path);
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let mut fresh = false;
+    let mut refs: BTreeMap<String, usize> = BTreeMap::new();
+    for sub in ["sessions", "archived_sessions"] {
+        let mut stack = vec![codex_dir.join(sub)];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else { continue };
+                if kind.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                    continue;
+                }
+                let Ok(rel) = path.strip_prefix(codex_dir) else { continue };
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                let id = match cached.get(&rel) {
+                    Some(id) => id.clone(),
+                    None => {
+                        // 读不出的不进缓存：可能是刚建的会话首行还没写完，下次再读。
+                        let Some(id) = session_provider_of(&path) else { continue };
+                        fresh = true;
+                        id
+                    }
+                };
+                *refs.entry(id.clone()).or_insert(0) += 1;
+                seen.insert(rel, id);
+            }
+        }
+    }
+    if fresh || seen.len() != cached.len() {
+        save_session_provider_cache(&cache_path, &seen);
+    }
+    refs
+}
+
+fn load_session_provider_cache(path: &Path) -> std::collections::BTreeMap<String, String> {
+    let Ok(raw) = fs::read(path) else { return Default::default() };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else { return Default::default() };
+    if value.get("v").and_then(|v| v.as_i64()) != Some(1) {
+        return Default::default();
+    }
+    let Some(files) = value.get("files").and_then(|f| f.as_object()) else { return Default::default() };
+    files
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
+}
+
+fn save_session_provider_cache(path: &Path, files: &std::collections::BTreeMap<String, String>) {
+    let body = serde_json::json!({ "v": 1, "files": files });
+    let Ok(raw) = serde_json::to_vec(&body) else { return };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = write_atomic_mode(path, &raw, true);
+}
+
+/// 读会话文件首行，返回其中的 model_provider；读不出返回 None。
+fn session_provider_of(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader, Read};
+    let file = fs::File::open(path).ok()?;
+    let mut line = Vec::new();
+    BufReader::with_capacity(64 << 10, file.take(SESSION_META_MAX_LINE))
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&line).ok()?;
+    if value.get("type")?.as_str()? != "session_meta" {
+        return None;
+    }
+    let id = value.get("payload")?.get("model_provider")?.as_str()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// 会被补别名的 id：1–128 个可见 ASCII，不含双引号与反斜杠（与 Go 的 historyAliasIDPattern 一致）。
+fn history_alias_id_ok(id: &str) -> bool {
+    (1..=128).contains(&id.len()) && id.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+}
+
+fn defined_providers(content: &str) -> Option<BTreeSet<String>> {
+    let doc = content.parse::<toml::Value>().ok()?;
+    Some(
+        doc.get("model_providers")
+            .and_then(|v| v.as_table())
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default(),
+    )
+}
+
+/// 需要补别名的 provider：被对话引用、没有定义、不是 Codex 保留 id、形状规整，按字节序排序。
+/// 配置读不进来返回 None。
+pub fn history_alias_ids(
+    content: &str,
+    refs: &std::collections::BTreeMap<String, usize>,
+) -> Option<Vec<String>> {
+    let defined = defined_providers(&strip_history_aliases(content))?;
+    let mut ids: Vec<String> = refs
+        .keys()
+        .filter(|id| {
+            !defined.contains(*id)
+                && !RESERVED_MODEL_PROVIDER_IDS.contains(&id.as_str())
+                && history_alias_id_ok(id)
+        })
+        .cloned()
+        .collect();
+    ids.sort();
+    Some(ids)
+}
+
+/// 在托管块里重建别名段：先剥掉旧的，再按 refs 补上需要的。任何一步没把握就不补。
+pub fn with_history_aliases(content: &str, refs: &std::collections::BTreeMap<String, usize>) -> String {
+    let stripped = strip_history_aliases(content);
+    let Some((s, e)) = marked_block_span(&stripped) else { return stripped };
+    let Some(ids) = history_alias_ids(&stripped, refs) else { return stripped };
+    if ids.is_empty() {
+        return stripped;
+    }
+    let block = &stripped[s..e];
+    let Some(tables) = recodex_provider_tables(block) else { return stripped };
+    let Some(end_line) = end_marker_line_start(block) else { return stripped };
+    let next = format!(
+        "{}{}{}{}{}",
+        &stripped[..s],
+        &block[..end_line],
+        render_history_aliases(&ids, &tables),
+        &block[end_line..],
+        &stripped[e..]
+    );
+    if validate_toml(&next).is_err() {
+        return stripped;
+    }
+    next
+}
+
+/// 托管块里 [model_providers.recodex] 及其子表的正文：(子表后缀, 行)，主表后缀为空。
+/// 整行注释不取 —— 块的结束标记紧贴在 recodex 表后面，抄进别名会留下多余的结束标记。
+fn recodex_provider_tables(block: &str) -> Option<Vec<(String, Vec<String>)>> {
+    let mut tables: Vec<(String, Vec<String>)> = Vec::new();
+    let mut cur: Option<usize> = None;
+    for raw in block.split('\n') {
+        let t = raw.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with('[') {
+            cur = None;
+            if t == "[model_providers.recodex]" {
+                tables.push((String::new(), Vec::new()));
+                cur = Some(tables.len() - 1);
+            } else if let Some(suffix) = t
+                .strip_prefix("[model_providers.recodex.")
+                .and_then(|r| r.strip_suffix(']'))
+            {
+                tables.push((suffix.to_string(), Vec::new()));
+                cur = Some(tables.len() - 1);
+            }
+            continue;
+        }
+        if let Some(i) = cur {
+            tables[i].1.push(raw.trim_end_matches('\r').to_string());
+        }
+    }
+    match tables.first() {
+        Some((suffix, lines)) if suffix.is_empty() && !lines.is_empty() => Some(tables),
+        _ => None,
+    }
+}
+
+fn history_alias_key(id: &str) -> String {
+    if id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        id.to_string()
+    } else {
+        format!("\"{id}\"") // history_alias_id_ok 已排除引号与反斜杠，无需转义
+    }
+}
+
+/// 插在块结束标记之前的别名段（以空行开头，以换行结尾）。格式与 Go 侧逐字节一致。
+fn render_history_aliases(ids: &[String], tables: &[(String, Vec<String>)]) -> String {
+    let mut b = String::new();
+    b.push('\n');
+    b.push_str(HISTORY_ALIAS_MARKER);
+    b.push('\n');
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            b.push('\n');
+        }
+        let key = history_alias_key(id);
+        for (j, (suffix, lines)) in tables.iter().enumerate() {
+            if j > 0 {
+                b.push('\n');
+            }
+            b.push_str("[model_providers.");
+            b.push_str(&key);
+            if !suffix.is_empty() {
+                b.push('.');
+                b.push_str(suffix);
+            }
+            b.push_str("]\n");
+            for l in lines {
+                b.push_str(l);
+                b.push('\n');
+            }
+        }
+    }
+    b
+}
+
+fn end_marker_line_start(block: &str) -> Option<usize> {
+    let i = block.rfind(END_MARKER)?;
+    Some(block[..i].rfind('\n').map(|p| p + 1).unwrap_or(0))
+}
+
+/// 去掉托管块里的别名段，是 with_history_aliases 插入的精确逆操作。
+pub fn strip_history_aliases(content: &str) -> String {
+    let Some((s, e)) = marked_block_span(content) else { return content.to_string() };
+    let block = &content[s..e];
+    let needle = format!("\n{HISTORY_ALIAS_MARKER}\n");
+    let Some(m) = block.find(&needle) else { return content.to_string() };
+    let Some(end_line) = end_marker_line_start(block) else { return content.to_string() };
+    if end_line <= m {
+        return content.to_string();
+    }
+    // 正常情况下 m 指向别名段开头那个空行；有人手删了那个空行时补回换行，
+    // 免得块正文最后一行和结束标记粘成一行。
+    let mut head = block[..m].to_string();
+    if !head.ends_with('\n') {
+        head.push('\n');
+    }
+    format!("{}{}{}{}", &content[..s], head, &block[end_line..], &content[e..])
 }
 
 #[cfg(test)]

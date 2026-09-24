@@ -1,0 +1,27 @@
+# >>> recodex managed block, do not edit >>>
+model_provider = "recodex"
+
+[model_providers.recodex]
+name = "ReCodex"
+base_url = "https://gw.example.dev/backend-api/codex"
+wire_api = "responses"
+experimental_bearer_token = "rk-current"
+supports_websockets = true
+
+[model_providers.recodex.http_headers]
+"x-openai-actor-authorization" = "recodex"
+
+# recodex history provider aliases (old conversations were created with these providers)
+[model_providers.codex_local_access]
+name = "ReCodex"
+base_url = "https://gw.example.dev/backend-api/codex"
+wire_api = "responses"
+experimental_bearer_token = "rk-current"
+supports_websockets = true
+
+[model_providers.codex_local_access.http_headers]
+"x-openai-actor-authorization" = "recodex"
+# <<< recodex managed block <<<
+
+[mcp_servers.context7]
+command = "npx"

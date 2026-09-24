@@ -1,0 +1,15 @@
+# >>> recodex managed block, do not edit >>>
+model_provider = "recodex"
+
+[model_providers.recodex]
+name = "ReCodex"
+base_url = "https://gw.example.dev/backend-api/codex"
+wire_api = "responses"
+experimental_bearer_token = "rk-current"
+supports_websockets = true
+http_headers = { "x-openai-actor-authorization" = "recodex" }
+# <<< recodex managed block <<<
+
+[model_providers.custom]
+name = "Mine"
+base_url = "https://mine.invalid/v1"
