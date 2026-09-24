@@ -396,14 +396,26 @@ fn marked_block_span(content: &str) -> Option<(usize, usize)> {
 /// 托管块里写的 `base_url`(网关的 `/backend-api/codex` 根)。没有托管块时为 None。
 ///
 /// 自诊断要拿它去问网关「这把 key 还认不认」—— 用户看到的 401 只有网关说得清。
+///
+/// **两种块形态都要认**,漏一种就是 G1 那一类坑的复发:
+///
+/// - env_key 形态(网关路径,也是租约的旧形态):provider 表里的 `base_url = "…"`
+/// - 假登录形态(体验对齐 R1,托管块用内置 openai provider):顶层的 `openai_base_url = "…"`
+///
+/// 租约模式的判据是「lease.json 在 **且** 托管块指着回环」。读不出地址 = 判成没开租约,
+/// 于是启动期 `sync_managed_config` 会用网关地址重渲染托管块,把用户从租约模式
+/// **静默**打回网关 —— 行为退回今天、不会坏,但直连失效且没有任何人知道。
+///
+/// Go 侧同判(cmd/recodex/gateway_health.go 的 managedBaseURLPattern):两边必须一起改。
+/// `chatgpt_base_url` 不会被误认:那一行以 `chatgpt_` 开头,两个前缀都对不上。
 pub fn managed_base_url(content: &str) -> Option<String> {
     let (start, end) = marked_block_span(content)?;
     content[start..end].lines().find_map(|line| {
-        let value = line
-            .trim_start()
-            .strip_prefix("base_url")?
-            .trim_start()
-            .strip_prefix('=')?;
+        let rest = line.trim_start();
+        let rest = rest
+            .strip_prefix("openai_base_url")
+            .or_else(|| rest.strip_prefix("base_url"))?;
+        let value = rest.trim_start().strip_prefix('=')?;
         let value = value.trim().trim_matches('"');
         (!value.is_empty()).then(|| value.to_string())
     })

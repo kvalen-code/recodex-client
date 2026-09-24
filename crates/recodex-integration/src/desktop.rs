@@ -1799,6 +1799,55 @@ mod config_writer_tests {
         format!("{START_MARKER}\n{}\n{END_MARKER}\n", render_sub2api_block(base, true))
     }
 
+    /// 假登录形态(体验对齐 R1)的托管块用顶层 `openai_base_url`,不是 provider 表里的
+    /// `base_url`。认不出它 = 判成没开租约 = 启动期同步把用户静默打回网关(G1 复发)。
+    #[test]
+    fn lease_mode_active_recognizes_login_block() {
+        use crate::codexcfg::{END_MARKER, START_MARKER};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rcx-lease-login-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("recodex")).unwrap();
+        std::fs::write(dir.join("recodex").join("lease.json"), "{}").unwrap();
+
+        let login_block = format!(
+            "{START_MARKER}
+model_provider = \"openai\"
+openai_base_url = \"http://127.0.0.1:41234/backend-api/codex\"
+chatgpt_base_url = \"http://127.0.0.1:41234/backend-api\"
+chatgpt_account_is_fedramp = false
+{END_MARKER}
+"
+        );
+        assert_eq!(
+            crate::codexcfg::managed_base_url(&login_block).as_deref(),
+            Some("http://127.0.0.1:41234/backend-api/codex"),
+            "顶层 openai_base_url 没被认出来"
+        );
+        assert!(
+            lease_mode_active_in(&dir, &login_block),
+            "假登录形态的托管块指着本机代理,必须判为租约模式"
+        );
+
+        // chatgpt_base_url 不能被当成主地址(否则 stripCodexSuffix 之类的判断会错位)。
+        let only_chatgpt = format!(
+            "{START_MARKER}
+chatgpt_base_url = \"http://127.0.0.1:41234/backend-api\"
+{END_MARKER}
+"
+        );
+        assert_eq!(
+            crate::codexcfg::managed_base_url(&only_chatgpt),
+            None,
+            "chatgpt_base_url 被误认成了主地址"
+        );
+    }
+
     /// 租约模式 = lease.json 在 **且** 托管块指着回环(G1)。
     /// 行为测试:真的建/删文件,而不是读源码找字符串 —— 后者常是假守卫。
     #[test]
