@@ -358,7 +358,20 @@ where
     let debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
-    let app_dir = match hooks.resolve_app_dir(options.app_dir.as_deref(), &settings) {
+    let mut resolved_app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings);
+    // 真启动器进程里(只有它开了 user_alert)失败先短暂重试:商店版 Codex 更新期间
+    // 包注册会短暂查不到,这时弹「请去商店安装」是误导。测试与 helper 进程不等。
+    if crate::user_alert::is_enabled() {
+        for _ in 0..CODEX_APP_RESOLVE_RETRIES {
+            if resolved_app_dir.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(CODEX_APP_RESOLVE_RETRY_DELAY_MS))
+                .await;
+            resolved_app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings);
+        }
+    }
+    let app_dir = match resolved_app_dir {
         Ok(app_dir) => app_dir,
         Err(error) => {
             // 这一步在下面 `result` 的兜底之外:原来失败了既不弹窗也不写状态,main 只记
@@ -611,6 +624,9 @@ where
         }
     }
 }
+
+const CODEX_APP_RESOLVE_RETRIES: u32 = 2;
+const CODEX_APP_RESOLVE_RETRY_DELAY_MS: u64 = 1500;
 
 /// 找不到官方 Codex 时给用户看的说明:ReCodex 只是启动器,得先有官方桌面版。
 pub fn codex_app_not_found_alert_body() -> &'static str {
@@ -4048,13 +4064,19 @@ async fn is_macos_app_running(app_dir: &Path) -> bool {
     is_macos_app_main_process_running(app_dir).await
 }
 
-/// `pgrep -f` 的模式:bundle 主程序目录前缀,正则元字符全部转义。
+/// `pgrep -f` 的模式:以 bundle 主程序目录开头(`^` 锚定),正则元字符全部转义。
+///
+/// 锚定是为了不把 `~/Applications/Codex.app` 这类同名副本算进
+/// `/Applications/Codex.app`:不锚定时前者的命令行里恰好包含后者整段。
+/// LaunchServices 拉起的主进程 argv[0] 就是绝对路径,锚定不会漏掉它;
+/// 万一真漏了,调用方还有 osascript 兜底,最坏退回改动前的判定。
 pub fn macos_app_main_process_pattern(app_dir: &Path) -> String {
     let prefix = format!(
         "{}/Contents/MacOS/",
         app_dir.to_string_lossy().trim_end_matches('/')
     );
     let mut pattern = String::with_capacity(prefix.len() + 8);
+    pattern.push('^');
     for ch in prefix.chars() {
         if r"\.^$|?*+()[]{}".contains(ch) {
             pattern.push('\\');
@@ -4065,7 +4087,16 @@ pub fn macos_app_main_process_pattern(app_dir: &Path) -> String {
 }
 
 async fn is_macos_app_main_process_running(app_dir: &Path) -> bool {
-    let Ok(status) = Command::new("pgrep")
+    let mut command = Command::new("pgrep");
+    // 只看当前登录用户的进程:快速切换用户后,另一个账户里跑着的 Codex
+    // 不是我们要接管的那个,算进来会让每次启动都白等 20 秒退出。
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid 无参数、不会失败、不触碰任何内存。
+        let uid = unsafe { libc::getuid() };
+        command.arg("-U").arg(uid.to_string());
+    }
+    let Ok(status) = command
         .arg("-f")
         .arg(macos_app_main_process_pattern(app_dir))
         .stdout(Stdio::null())

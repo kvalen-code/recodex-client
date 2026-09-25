@@ -1783,16 +1783,22 @@ fn macos_main_process_pattern_matches_only_the_bundle_main_binary() {
     // 被系统自动改名的副本会写出一个匹配不到自己的模式,判断又退回 osascript 漏判。
     assert_eq!(
         macos_app_main_process_pattern(Path::new("/Applications/Codex.app")),
-        r"/Applications/Codex\.app/Contents/MacOS/"
+        r"^/Applications/Codex\.app/Contents/MacOS/"
     );
     assert_eq!(
         macos_app_main_process_pattern(Path::new("/Users/a b/Downloads/Codex (1).app/")),
-        r"/Users/a b/Downloads/Codex \(1\)\.app/Contents/MacOS/"
+        r"^/Users/a b/Downloads/Codex \(1\)\.app/Contents/MacOS/"
     );
     // Helper 子进程在 Contents/Frameworks 下,不能被这个前缀命中。
     let pattern = macos_app_main_process_pattern(Path::new("/Applications/Codex.app"));
     let helper = "/Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper";
-    assert!(!helper.contains(&pattern.replace('\\', "")));
+    let literal = pattern.trim_start_matches('^').replace('\\', "");
+    assert!(!helper.contains(&literal));
+    // 锚定:同名副本 ~/Applications/Codex.app 的命令行包含整段前缀,但不以它开头。
+    let other_copy = "/Users/me/Applications/Codex.app/Contents/MacOS/Codex";
+    assert!(other_copy.contains(&literal));
+    assert!(!other_copy.starts_with(&literal));
+    assert!("/Applications/Codex.app/Contents/MacOS/Codex".starts_with(&literal));
 }
 
 #[test]

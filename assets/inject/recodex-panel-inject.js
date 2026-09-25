@@ -558,8 +558,12 @@
     }
     // 账号页本来就要这份数据,顺带把状态灯刷新了 —— 用户打开面板时看到的
     // 就是当下的状态,不必等 60 秒轮询
-    rcxStatus = computeStatus(res);
-    applyStatus();
+    // 等满几轮仍是 busy:只在账号页给提示,状态灯不跟着变红 ——
+    // 与 refreshAccountCache 同一口径,busy 不是「连接中断」。
+    if (!isBusyResult(res)) {
+      rcxStatus = computeStatus(res);
+      applyStatus();
+    }
     if (res.status === "signed_out") {
       // 后端可能带回"为什么没登录上"(凭据读不出来 / token 用不了)。
       // 少了这一句,用户看到的就是「明明登录过,重启后变成未登录」且毫无解释 ——
@@ -1484,7 +1488,9 @@
     const res = await bridge("/recodex/status", {});
     // 撞上正在进行的额度刷新(busy)时什么都不改:状态灯和侧边栏账号保持上一次的样子,
     // 下一轮轮询再更新。以前这里把 busy 当「连接中断」—— 灯变红、侧边栏账号被清空。
-    if (isBusyResult(res)) return;
+    // 返回 "busy" 让 ensureAccountSoon 知道「还没拿到答复」、继续快速重试;
+    // 否则首次就撞上 busy 时,灯停在初始绿色、账号为空,要等 60 秒轮询才补上。
+    if (isBusyResult(res)) return "busy";
     rcxStatus = computeStatus(res); // 复用这一次请求算状态灯,不额外发请求
     if (res && res.data && res.data.web_url) rcxWebUrl = res.data.web_url;
     applyStatus();
@@ -1645,14 +1651,14 @@
   // 注入发生在 document-start:此时 CDP 桥未就绪、侧边栏也还没渲染,首次取号必然失败。
   // 所以要快速重试到拿着数据为止,不能把首屏依赖在 60 秒的保底轮询上(那会让用户干等一分钟)。
   async function ensureAccountSoon(attempt) {
-    await refreshAccountCache();
+    const busy = (await refreshAccountCache()) === "busy";
     scanOfficialAccountUi();
     // 只在**还没拿到答复**时重试(桥没就绪 → 状态灯是 off)。
     // 原条件是"没拿到 email",于是未登录的用户每次启动都会把 40 次重试跑满 ——
     // 30 秒里往服务端打 40 发,而每发在服务端要拉账号+额度+网关三份数据。
     // 「未登录」是个确定答复,不是"还没准备好",没有重试的意义。
     const noAnswerYet = rcxStatus.cls === "off";
-    const stillWaiting = noAnswerYet || (rcxAccount && !rcxAccount.email);
+    const stillWaiting = busy || noAnswerYet || (rcxAccount && !rcxAccount.email);
     if (stillWaiting && (attempt || 0) < 40) {
       setTimeout(() => ensureAccountSoon((attempt || 0) + 1), 750);
     }
