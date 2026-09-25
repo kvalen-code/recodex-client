@@ -68,6 +68,8 @@
   // 覆盖面板全部文案 + 我们注入到官方 UI 上的文字(如「7 天用量」)。
   const I18N = {
     tw: {
+      "正在刷新额度,请稍候…": "正在重新整理額度,請稍候…",
+      "额度刷新仍在进行,请稍后点重试": "額度重新整理仍在進行,請稍後點重試",
       "桥正常,但这条命令超时了,请稍后重试": "橋正常,但這條命令逾時了,請稍後再試",
       "ReCodex 桥未响应,请重启 ReCodex 客户端": "ReCodex 橋未回應,請重新啟動 ReCodex 用戶端",
       "请登录你购买服务的网站,在「设备」页点「输入验证码授权设备」,输入验证码:": "請登入你購買服務的網站,在「裝置」頁點「輸入驗證碼授權裝置」,輸入驗證碼:",
@@ -179,6 +181,8 @@
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ 白名單為 *:任何人給該微信號發訊息都能在本機執行 Codex。",
     },
     ru: {
+      "正在刷新额度,请稍候…": "Обновляем лимиты, подождите…",
+      "额度刷新仍在进行,请稍后点重试": "Обновление лимитов ещё идёт, нажмите «Повторить» чуть позже",
       "桥正常,但这条命令超时了,请稍后重试": "Мост работает, но эта команда не ответила вовремя, попробуйте позже",
       "ReCodex 桥未响应,请重启 ReCodex 客户端": "Мост ReCodex не отвечает, перезапустите клиент ReCodex",
       "请登录你购买服务的网站,在「设备」页点「输入验证码授权设备」,输入验证码:": "Войдите на сайт, где вы купили услугу, откройте «Устройства», нажмите «Авторизовать устройство по коду» и введите код:",
@@ -525,9 +529,33 @@
     });
   }
 
+  // 点「刷新额度」要打上游,可能好几秒;这期间读状态会撞上同一把快照锁,后端等 2 秒
+  // 仍拿不到就回 code=busy。那只是「刷新还没做完」,不是故障 —— 以前面板把后端那句
+  // 英文 "A ReCodex status refresh is already in progress" 直接用红字画出来,
+  // 用户以为出错了(线上 1.3.12 实测:refresh-usage busy 之后 2 秒紧跟一条 status busy)。
+  // 现在显示「正在刷新」,隔一会儿自己再读;最多等 STATUS_BUSY_MAX_RETRIES 轮,
+  // 真卡住了才给出可读的提示和重试按钮。
+  const STATUS_BUSY_RETRY_MS = Number(window.__recodexStatusBusyRetryMs) || 1500;
+  const STATUS_BUSY_MAX_RETRIES = 6;
+  let renderSeq = 0;
+  function isBusyResult(res) {
+    return !!(res && res.status === "error" && res.error && res.error.code === "busy");
+  }
+
   async function render() {
+    const seq = ++renderSeq;
     body().innerHTML = `<div class="rcx-muted">${t("加载中…")}</div>`;
-    const res = await bridge("/recodex/status", {});
+    let res = await bridge("/recodex/status", {});
+    for (let tries = 0; isBusyResult(res) && tries < STATUS_BUSY_MAX_RETRIES; tries += 1) {
+      body().innerHTML = `<div class="rcx-muted">${t("正在刷新额度,请稍候…")}</div>`;
+      await new Promise((resolve) => setTimeout(resolve, STATUS_BUSY_RETRY_MS));
+      // 等待期间用户可能切了页签或又点了一次刷新,那次 render 会接管这块区域。
+      if (seq !== renderSeq) return;
+      res = await bridge("/recodex/status", {});
+    }
+    if (isBusyResult(res)) {
+      res = { status: "error", error: { code: "busy", message: t("额度刷新仍在进行,请稍后点重试") } };
+    }
     // 账号页本来就要这份数据,顺带把状态灯刷新了 —— 用户打开面板时看到的
     // 就是当下的状态,不必等 60 秒轮询
     rcxStatus = computeStatus(res);
@@ -1454,6 +1482,9 @@
       try { localStorage.setItem("recodex.officialMode", mode.data.official ? "1" : "0"); } catch (e) {}
     }
     const res = await bridge("/recodex/status", {});
+    // 撞上正在进行的额度刷新(busy)时什么都不改:状态灯和侧边栏账号保持上一次的样子,
+    // 下一轮轮询再更新。以前这里把 busy 当「连接中断」—— 灯变红、侧边栏账号被清空。
+    if (isBusyResult(res)) return;
     rcxStatus = computeStatus(res); // 复用这一次请求算状态灯,不额外发请求
     if (res && res.data && res.data.web_url) rcxWebUrl = res.data.web_url;
     applyStatus();
