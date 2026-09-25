@@ -68,6 +68,8 @@
   // 覆盖面板全部文案 + 我们注入到官方 UI 上的文字(如「7 天用量」)。
   const I18N = {
     tw: {
+      "正在刷新额度,请稍候…": "正在重新整理額度,請稍候…",
+      "额度刷新仍在进行,请稍后点重试": "額度重新整理仍在進行,請稍後點重試",
       "桥正常,但这条命令超时了,请稍后重试": "橋正常,但這條命令逾時了,請稍後再試",
       "ReCodex 桥未响应,请重启 ReCodex 客户端": "ReCodex 橋未回應,請重新啟動 ReCodex 用戶端",
       "请登录你购买服务的网站,在「设备」页点「输入验证码授权设备」,输入验证码:": "請登入你購買服務的網站,在「裝置」頁點「輸入驗證碼授權裝置」,輸入驗證碼:",
@@ -179,6 +181,8 @@
       "⚠ 白名单为 *:任何人给该微信号发消息都能在本机运行 Codex。": "⚠ 白名單為 *:任何人給該微信號發訊息都能在本機執行 Codex。",
     },
     ru: {
+      "正在刷新额度,请稍候…": "Обновляем лимиты, подождите…",
+      "额度刷新仍在进行,请稍后点重试": "Обновление лимитов ещё идёт, нажмите «Повторить» чуть позже",
       "桥正常,但这条命令超时了,请稍后重试": "Мост работает, но эта команда не ответила вовремя, попробуйте позже",
       "ReCodex 桥未响应,请重启 ReCodex 客户端": "Мост ReCodex не отвечает, перезапустите клиент ReCodex",
       "请登录你购买服务的网站,在「设备」页点「输入验证码授权设备」,输入验证码:": "Войдите на сайт, где вы купили услугу, откройте «Устройства», нажмите «Авторизовать устройство по коду» и введите код:",
@@ -525,13 +529,41 @@
     });
   }
 
+  // 点「刷新额度」要打上游,可能好几秒;这期间读状态会撞上同一把快照锁,后端等 2 秒
+  // 仍拿不到就回 code=busy。那只是「刷新还没做完」,不是故障 —— 以前面板把后端那句
+  // 英文 "A ReCodex status refresh is already in progress" 直接用红字画出来,
+  // 用户以为出错了(线上 1.3.12 实测:refresh-usage busy 之后 2 秒紧跟一条 status busy)。
+  // 现在显示「正在刷新」,隔一会儿自己再读;最多等 STATUS_BUSY_MAX_RETRIES 轮,
+  // 真卡住了才给出可读的提示和重试按钮。
+  const STATUS_BUSY_RETRY_MS = Number(window.__recodexStatusBusyRetryMs) || 1500;
+  const STATUS_BUSY_MAX_RETRIES = 6;
+  let renderSeq = 0;
+  function isBusyResult(res) {
+    return !!(res && res.status === "error" && res.error && res.error.code === "busy");
+  }
+
   async function render() {
+    const seq = ++renderSeq;
     body().innerHTML = `<div class="rcx-muted">${t("加载中…")}</div>`;
-    const res = await bridge("/recodex/status", {});
+    let res = await bridge("/recodex/status", {});
+    for (let tries = 0; isBusyResult(res) && tries < STATUS_BUSY_MAX_RETRIES; tries += 1) {
+      body().innerHTML = `<div class="rcx-muted">${t("正在刷新额度,请稍候…")}</div>`;
+      await new Promise((resolve) => setTimeout(resolve, STATUS_BUSY_RETRY_MS));
+      // 等待期间用户可能切了页签或又点了一次刷新,那次 render 会接管这块区域。
+      if (seq !== renderSeq) return;
+      res = await bridge("/recodex/status", {});
+    }
+    if (isBusyResult(res)) {
+      res = { status: "error", error: { code: "busy", message: t("额度刷新仍在进行,请稍后点重试") } };
+    }
     // 账号页本来就要这份数据,顺带把状态灯刷新了 —— 用户打开面板时看到的
     // 就是当下的状态,不必等 60 秒轮询
-    rcxStatus = computeStatus(res);
-    applyStatus();
+    // 等满几轮仍是 busy:只在账号页给提示,状态灯不跟着变红 ——
+    // 与 refreshAccountCache 同一口径,busy 不是「连接中断」。
+    if (!isBusyResult(res)) {
+      rcxStatus = computeStatus(res);
+      applyStatus();
+    }
     if (res.status === "signed_out") {
       // 后端可能带回"为什么没登录上"(凭据读不出来 / token 用不了)。
       // 少了这一句,用户看到的就是「明明登录过,重启后变成未登录」且毫无解释 ——
@@ -1454,6 +1486,11 @@
       try { localStorage.setItem("recodex.officialMode", mode.data.official ? "1" : "0"); } catch (e) {}
     }
     const res = await bridge("/recodex/status", {});
+    // 撞上正在进行的额度刷新(busy)时什么都不改:状态灯和侧边栏账号保持上一次的样子,
+    // 下一轮轮询再更新。以前这里把 busy 当「连接中断」—— 灯变红、侧边栏账号被清空。
+    // 返回 "busy" 让 ensureAccountSoon 知道「还没拿到答复」、继续快速重试;
+    // 否则首次就撞上 busy 时,灯停在初始绿色、账号为空,要等 60 秒轮询才补上。
+    if (isBusyResult(res)) return "busy";
     rcxStatus = computeStatus(res); // 复用这一次请求算状态灯,不额外发请求
     if (res && res.data && res.data.web_url) rcxWebUrl = res.data.web_url;
     applyStatus();
@@ -1614,14 +1651,14 @@
   // 注入发生在 document-start:此时 CDP 桥未就绪、侧边栏也还没渲染,首次取号必然失败。
   // 所以要快速重试到拿着数据为止,不能把首屏依赖在 60 秒的保底轮询上(那会让用户干等一分钟)。
   async function ensureAccountSoon(attempt) {
-    await refreshAccountCache();
+    const busy = (await refreshAccountCache()) === "busy";
     scanOfficialAccountUi();
     // 只在**还没拿到答复**时重试(桥没就绪 → 状态灯是 off)。
     // 原条件是"没拿到 email",于是未登录的用户每次启动都会把 40 次重试跑满 ——
     // 30 秒里往服务端打 40 发,而每发在服务端要拉账号+额度+网关三份数据。
     // 「未登录」是个确定答复,不是"还没准备好",没有重试的意义。
     const noAnswerYet = rcxStatus.cls === "off";
-    const stillWaiting = noAnswerYet || (rcxAccount && !rcxAccount.email);
+    const stillWaiting = busy || noAnswerYet || (rcxAccount && !rcxAccount.email);
     if (stillWaiting && (attempt || 0) < 40) {
       setTimeout(() => ensureAccountSoon((attempt || 0) + 1), 750);
     }

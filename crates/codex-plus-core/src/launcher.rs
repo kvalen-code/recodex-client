@@ -261,6 +261,11 @@ pub trait LaunchHooks: Send + Sync {
                 // 线上那几台只报「连不上」,分不清是哪种,只能靠猜。这里花一次
                 // bind/close 换掉那个猜测 —— 只在彻底放弃时做一次,不进重试循环。
                 "debug_port_free": crate::ports::can_bind_loopback_port(debug_port),
+                // Codex 主进程此刻在不在跑(Windows 数 Codex.exe/ChatGPT.exe,mac 用 pgrep)。
+                // 与 debug_port_free=true 合看:进程在、端口没人听 = Codex 不是我们带参数
+                // 起的(`open -a` 把参数丢给了已在运行的实例);进程不在 = 根本没起来。
+                // 2026-09-25 那台 mac 只能靠另一个模块的日志反推这一点。
+                "codex_process_count": crate::watcher::find_session_index_cleanup_blocking_processes().len(),
                 // 同上:字段名用 error,这条终态才会被上报挑中。
                 "error": last_error
             }),
@@ -353,7 +358,36 @@ where
     let debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
-    let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
+    let mut resolved_app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings);
+    // 真启动器进程里(只有它开了 user_alert)失败先短暂重试:商店版 Codex 更新期间
+    // 包注册会短暂查不到,这时弹「请去商店安装」是误导。测试与 helper 进程不等。
+    if crate::user_alert::is_enabled() {
+        for _ in 0..CODEX_APP_RESOLVE_RETRIES {
+            if resolved_app_dir.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(CODEX_APP_RESOLVE_RETRY_DELAY_MS))
+                .await;
+            resolved_app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings);
+        }
+    }
+    let app_dir = match resolved_app_dir {
+        Ok(app_dir) => app_dir,
+        Err(error) => {
+            // 这一步在下面 `result` 的兜底之外:原来失败了既不弹窗也不写状态,main 只记
+            // 一条 launcher.failed 就退出。Windows 版是无控制台程序、mac 从 Dock 启动也
+            // 看不到输出 —— 用户看到的就是「点了没反应」(线上 7 天 6 台设备)。
+            // 阻塞版 + spawn_blocking 的理由同下面「ReCodex 启动失败」那处。
+            let _ = tokio::task::spawn_blocking(|| {
+                crate::user_alert::alert_once_blocking(
+                    "没有找到 Codex",
+                    codex_app_not_found_alert_body(),
+                )
+            })
+            .await;
+            return Err(error);
+        }
+    };
     let status_store = options.status_store.clone();
     let mut helper_started = false;
     let mut launched = None;
@@ -588,6 +622,26 @@ where
             hooks.write_status("failed").await;
             Err(error)
         }
+    }
+}
+
+const CODEX_APP_RESOLVE_RETRIES: u32 = 2;
+const CODEX_APP_RESOLVE_RETRY_DELAY_MS: u64 = 1500;
+
+/// 找不到官方 Codex 时给用户看的说明:ReCodex 只是启动器,得先有官方桌面版。
+pub fn codex_app_not_found_alert_body() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "ReCodex 需要先安装官方 Codex 桌面版才能启动。
+
+请从 OpenAI 官网下载 Codex,并拖进「应用程序」文件夹,然后重新打开 ReCodex。
+
+已经装了仍看到这条,请联系客服。"
+    } else {
+        "ReCodex 需要先安装官方 Codex 桌面版才能启动。
+
+请在微软商店搜索「Codex」安装,然后重新打开 ReCodex。
+
+已经装了仍看到这条,请联系客服。"
     }
 }
 
@@ -3984,10 +4038,78 @@ fn macos_app_dir_from_open_command(command: &[String]) -> Option<PathBuf> {
     command.get(app_index + 1).map(PathBuf::from)
 }
 
+/// 「这个 .app 的主进程在不在跑」—— osascript 与 pgrep 任一说在跑就算在跑。
+///
+/// 只靠 osascript 的 `application "<名字>" is running` 会漏判:按 .app 文件名去找应用,
+/// 改过名、osascript 本身出错/超时、LaunchServices 还没登记时都会回 false。漏判的后果
+/// 很重:启动决策走 LaunchNew,`open -a … --args --remote-debugging-port=…` 对一个
+/// **已经在跑**的应用只会把它激活,参数整个被丢掉,调试端口永远不监听,注入空等
+/// 120 次后弹「增强功能未启动」。
+///
+/// 线上 1.3.12(2026-09-25)实测:同一台 mac 三次出现这个弹窗,每次启动时清理模块
+/// (用 pgrep)都报了 Codex 在运行,而接管路径的降级事件(带 error、必上报)一条都没有 ——
+/// 说明判断走的是「没在跑 → 新启动」。
+///
+/// pgrep 用 `<app>/Contents/MacOS/` 路径匹配,只命中这个 bundle 的主进程,
+/// 不会被别处同名的 Codex、也不会被 `Contents/Frameworks/*Helper*` 子进程带偏。
+/// 退出等待循环也走这里:osascript 已经说不在了、主进程却还没退干净时继续等,
+/// 否则紧接着的 `open -a` 同样会把参数丢给那个正在退出的实例。
 async fn is_macos_app_running(app_dir: &Path) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
     }
+    if is_macos_app_running_by_osascript(app_dir).await {
+        return true;
+    }
+    is_macos_app_main_process_running(app_dir).await
+}
+
+/// `pgrep -f` 的模式:以 bundle 主程序目录开头(`^` 锚定),正则元字符全部转义。
+///
+/// 锚定是为了不把 `~/Applications/Codex.app` 这类同名副本算进
+/// `/Applications/Codex.app`:不锚定时前者的命令行里恰好包含后者整段。
+/// LaunchServices 拉起的主进程 argv[0] 就是绝对路径,锚定不会漏掉它;
+/// 万一真漏了,调用方还有 osascript 兜底,最坏退回改动前的判定。
+pub fn macos_app_main_process_pattern(app_dir: &Path) -> String {
+    let prefix = format!(
+        "{}/Contents/MacOS/",
+        app_dir.to_string_lossy().trim_end_matches('/')
+    );
+    let mut pattern = String::with_capacity(prefix.len() + 8);
+    pattern.push('^');
+    for ch in prefix.chars() {
+        if r"\.^$|?*+()[]{}".contains(ch) {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern
+}
+
+async fn is_macos_app_main_process_running(app_dir: &Path) -> bool {
+    let mut command = Command::new("pgrep");
+    // 只看当前登录用户的进程:快速切换用户后,另一个账户里跑着的 Codex
+    // 不是我们要接管的那个,算进来会让每次启动都白等 20 秒退出。
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid 无参数、不会失败、不触碰任何内存。
+        let uid = unsafe { libc::getuid() };
+        command.arg("-U").arg(uid.to_string());
+    }
+    let Ok(status) = command
+        .arg("-f")
+        .arg(macos_app_main_process_pattern(app_dir))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+    else {
+        return false;
+    };
+    status.success()
+}
+
+async fn is_macos_app_running_by_osascript(app_dir: &Path) -> bool {
     let app_name = app_dir
         .file_stem()
         .and_then(|value| value.to_str())

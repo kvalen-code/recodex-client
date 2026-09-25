@@ -23,7 +23,9 @@ impl codex_plus_core::routes::RecodexBridge for LauncherRecodexBridge {
         // recodex-overlay:diag-flush — 任何 ReCodex 操作失败(登录/选网关/刷新额度…)都留一条
         // 诊断,后台 flush 会传回服务器。事件名带上操作(select-gateway/login-start…)方便聚合,
         // detail 里带 path、错误码和网关 id —— 连接类故障才分得清是哪条线。
-        if result.get("status").and_then(Value::as_str) == Some("error") {
+        if result.get("status").and_then(Value::as_str) == Some("error")
+            && !is_expected_bridge_contention(&result)
+        {
             let op = path.rsplit('/').next().unwrap_or("unknown");
             let error = result.get("error").cloned().unwrap_or(Value::Null);
             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -38,6 +40,17 @@ impl codex_plus_core::routes::RecodexBridge for LauncherRecodexBridge {
         }
         result
     }
+}
+
+/// `busy` = 另一次额度刷新正占着快照锁(见 recodex-integration desktop.rs 的
+/// acquire_snapshot_lock)。这是预期内的并发拒绝,面板会等刷新做完再读,不是故障;
+/// 上报它只会占掉诊断额度、把后台的错误排行冲乱(线上 7 天 21 台设备 65 条)。
+fn is_expected_bridge_contention(result: &Value) -> bool {
+    result
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        == Some("busy")
 }
 
 #[derive(Clone)]
