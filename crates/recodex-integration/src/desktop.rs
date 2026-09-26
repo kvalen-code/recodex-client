@@ -386,9 +386,20 @@ fn route_codex_through_gateway(endpoint: &str, leave_lease: bool) -> Option<Stri
         return Some("网关地址含有不能写进配置的字符".to_string());
     }
     // 租约模式下托管块指着本机代理,换网关不能把它改写回网关形态 —— 那等于把用户
-    // 静默踢出租约直连(G1)。服务端的选择已经生效,代理回退网关时用的地址由
-    // `recodex lease` 管,这里只提示、不写。
+    // 静默踢出租约直连(G1)。但新网关要记进 lease.json(经 sidecar,格式归 Go 侧):
+    // 原来这里只提示、什么都不记,于是面板显示「杭州」,代理回退与直连选中继入口时
+    // 用的却还是开启租约时的旧网关(2026-09-26 实测)。
     if lease_mode_active() && !leave_lease {
+        if let Some(sidecar) = crate::lease_sidecar::sidecar_path() {
+            let outcome = crate::lease_sidecar::set_gateway(
+                &sidecar,
+                endpoint,
+                crate::lease_sidecar::GATEWAY_TIMEOUT,
+            );
+            if outcome == "gateway_updated" || outcome == "gateway_unchanged" {
+                return None;
+            }
+        }
         return Some("租约直连模式已开启,本机配置由代理管理;新网关在 `recodex lease off` 后生效".to_string());
     }
     // 官方模式下不能碰活配置 —— 否则「用最快网关」会把官方模式悄悄破坏掉:

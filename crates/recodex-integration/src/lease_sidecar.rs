@@ -86,6 +86,17 @@ pub fn off(sidecar: &Path, timeout: Duration) -> String {
     run(sidecar, &["lease", "desktop-off"], None, timeout)
 }
 
+/// 租约模式下切网关的超时:只读写一个小文件,不联网。
+pub const GATEWAY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 租约模式下用户切了网关:把新网关记进 lease.json(格式归 Go 侧,桌面端不直接写)。
+/// 代理直连选中继入口时据它做偏好;回退网关在代理下次启动时生效。
+/// 结果码:gateway_updated / gateway_unchanged / not_lease / gateway_invalid / state_bad。
+/// 老版 sidecar 不认识这个子命令,返回的不是这几个码 —— 调用方按「没记上」处理即可。
+pub fn set_gateway(sidecar: &Path, endpoint: &str, timeout: Duration) -> String {
+    run(sidecar, &["lease", "desktop-gateway", endpoint.trim()], None, timeout)
+}
+
 fn run(sidecar: &Path, args: &[&str], token: Option<&str>, timeout: Duration) -> String {
     run_in(sidecar, args, token, timeout, &[])
 }
@@ -264,6 +275,15 @@ mod tests {
         assert_eq!(outcome, "no_token");
         let outcome = run_in(&sidecar, &["lease", "desktop-off"], None, OFF_TIMEOUT, &envs);
         assert_eq!(outcome, "not_enabled");
+        // 没开租约时切网关:什么都不记(桌面端照常改写托管块那条路)。
+        let outcome = run_in(
+            &sidecar,
+            &["lease", "desktop-gateway", "https://recodex.owtale.com"],
+            None,
+            GATEWAY_TIMEOUT,
+            &envs,
+        );
+        assert_eq!(outcome, "not_lease");
         assert!(!home.join(".codex").join("recodex").join("lease.json").exists());
         let _ = std::fs::remove_dir_all(&home);
     }
