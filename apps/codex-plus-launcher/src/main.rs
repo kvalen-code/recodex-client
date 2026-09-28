@@ -257,8 +257,10 @@ fn record_launch_failure(options: &LaunchOptions, failure: &LauncherFailure) {
 /// recodex-overlay: 启动时跟随服务端的租约直连设置(任务板 Q9)。
 ///
 /// 包里没带 sidecar(recodex-lease)时什么都不做、不记日志。账号没开租约直连时是一次
-/// 很快被拒的请求,config.toml 不动。结果码写进诊断日志;只有故障才带 error 字段、
-/// 被自动上报 —— 「服务端不签」是绝大多数账号的常态,报它只会淹没真问题。
+/// 很快被拒的请求,config.toml 不动。结果码写进诊断日志,**每次启动都上报一条**
+/// (launcher.lease_follow 在 diagnostics_flush 的 ALWAYS_REPORT 里):2026-09-28 起全部账号
+/// 都开了直连,「这次启动没进直连」的原因几乎全是安静结果码(not_eligible:<码> / signed_out /
+/// orphaned),不传就无从查起。只有故障才带 error 字段,按 error 过滤就能只看真问题。
 async fn follow_lease_direct() {
     repair_missing_sidecar_at_startup().await;
     let outcome = tokio::task::spawn_blocking(|| {
