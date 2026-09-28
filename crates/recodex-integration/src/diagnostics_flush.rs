@@ -227,6 +227,11 @@ const ALWAYS_REPORT: &[&str] = &[
     // 「那 13 个没重新登录的用户到底拿到 WS 开关没有」永远说不清。
     // 每次启动最多一条,dedup 再兜一道。
     "launcher.managed_config_sync",
+    // 启动时跟随租约直连的**结果**(enabled / active / not_eligible:<码> / signed_out / orphaned …)。
+    // 失败那几档带 error 自然会传,但「这次启动没进直连」的常见原因全是安静结果码 ——
+    // 2026-09-28 巡检:一位 1.3.15 用户一天四次启动两次没签租约、整场会话留在网关,
+    // 服务端只能看到「启动了、没申请」,为什么完全无从知道。每次启动最多一条,dedup 再兜一道。
+    "launcher.lease_follow",
     // 「dispatcher 补丁这一层已经放弃了」的唯一信号。
     //
     // 名字里没有 fail/error(它按定义不是一次失败,是**停止重试**这个决定),
@@ -830,6 +835,11 @@ mod tests {
         assert!(is_reportable(
             "launcher.ready",
             &serde_json::json!({ "debug_port": 9229, "enhancements_enabled": true })
+        ));
+        // 跟随租约直连的安静结果码也要传:没进直连的原因几乎都在这些码里。
+        assert!(is_reportable(
+            "launcher.lease_follow",
+            &serde_json::json!({ "outcome": "not_eligible:transport", "error": null })
         ));
         // 「这一层放弃了」的唯一信号。名字里没有 fail/error(它是**停止重试**这个决定,
         // 不是一次失败),detail 里也只有 misses —— 两条既有规则都放不过它。
