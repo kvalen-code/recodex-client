@@ -624,7 +624,7 @@ pub fn recodex_refresh_token(state: &ReCodexState) -> Value {
     }
     drop(guard);
     // 旧令牌此刻已作废:租约模式下代理手里的那一把也要换。
-    lease_hand_over_session_token(state);
+    lease_hand_over_session_token(state, false);
     json!({"status":"ready"})
 }
 
@@ -777,15 +777,6 @@ pub fn recodex_organizations(state: &ReCodexState) -> Value {
     }
 }
 
-/// 把这台设备切到目标组织。
-///
-/// **网关 Key 不进 webview。** 它只在进程内用于写用户环境 —— 送给前端就等于
-/// 把一份长期有效的凭据暴露给任何能开 devtools 的人,而前端拿它也没有用途。
-/// 返回体里只有组织名和套餐名。
-///
-/// 顺序:切换 → 写环境变量 → 回报。写失败必须让整个调用失败:
-/// 服务端已经改了设备归属,本地不写就是「服务端认为你在新组织、Codex 还拿着
-/// 旧组织的 Key」—— 请求照常成功,只是用量记到旧组织,没有任何一处报错。
 /// 消耗一次官方重置额度。
 ///
 /// 不收任何参数:账号由服务端按 (用户, 这台设备的组织) 解析 —— 让客户端指定
@@ -813,8 +804,8 @@ pub fn recodex_reset_quota(state: &ReCodexState) -> Value {
     match adapter.reset_quota() {
         Ok(result) => {
             // 额度刚重置:份额用满时代理被拒签后正按服务端的 Retry-After 等(最多 15 分钟),
-            // 叫醒它立刻重新申请,用户重置完马上回到直连。
-            lease_hand_over_session_token(state);
+            // 叫醒它立刻重新申请,用户重置完马上回到直连(服务端同时丢掉了这个用户的份额缓存)。
+            lease_hand_over_session_token(state, false);
             json!({"status":"ready","data":{
                 "account_id": result.account_id,
                 "remaining": result.remaining,
@@ -825,6 +816,15 @@ pub fn recodex_reset_quota(state: &ReCodexState) -> Value {
     }
 }
 
+/// 把这台设备切到目标组织。
+///
+/// **网关 Key 不进 webview。** 它只在进程内用于写用户环境 —— 送给前端就等于
+/// 把一份长期有效的凭据暴露给任何能开 devtools 的人,而前端拿它也没有用途。
+/// 返回体里只有组织名和套餐名。
+///
+/// 顺序:切换 → 写环境变量 → 叫醒本机代理改道 → 回报。写失败必须让整个调用失败:
+/// 服务端已经改了设备归属,本地不写就是「服务端认为你在新组织、Codex 还拿着
+/// 旧组织的 Key」—— 请求照常成功,只是用量记到旧组织,没有任何一处报错。
 pub fn recodex_switch_org(state: &ReCodexState, org_id: i64) -> Value {
     let worker = match state.adapter.lock() {
         Ok(value) => value,
@@ -878,8 +878,9 @@ pub fn recodex_switch_org(state: &ReCodexState, org_id: i64) -> Value {
     };
 
     // 设备换了组织 = 换了账号:代理手里还是旧组织账号的租约,不叫醒的话直连流量要继续走旧账号
-    // 一个租约周期(6~7 分钟),而网关那边已经换成新组织的 Key。让它立刻按新组织重新申请。
-    lease_hand_over_session_token(state);
+    // 一个租约周期(6~7 分钟),而网关那边已经换成新组织的 Key。reroute:先软切回网关(新请求不再
+    // 走旧账号,在途的不打断)再按新组织重新申请 —— 新组织那次签发即使瞬时失败,也不会继续用旧账号。
+    lease_hand_over_session_token(state, true);
 
     json!({
         "status": "ready",
@@ -1560,9 +1561,10 @@ pub fn lease_hint_says_off() -> bool {
 /// 同一把令牌也一样)。两种时机:
 ///   - 令牌刚轮换:刷新会让旧令牌立即作废,不交的话代理下一次续租就被拒、退回网关;
 ///   - 服务端的判定刚变(自助重置了额度、切了组织):不叫醒的话代理要等到下一次续租,
-///     份额用满被拒签后那一次最多要等 15 分钟(服务端的 Retry-After)。
+///     份额用满被拒签后按服务端的 Retry-After 最多等 15 分钟(能自助重置的最多 2 分钟)。
+/// `reroute` 见 lease_sidecar::hand_over(切组织时为 true)。
 /// 只在租约模式开着时做;放后台线程,不拖慢面板。
-fn lease_hand_over_session_token(state: &ReCodexState) {
+fn lease_hand_over_session_token(state: &ReCodexState, reroute: bool) {
     if !lease_mode_active() {
         return;
     }
@@ -1580,6 +1582,7 @@ fn lease_hand_over_session_token(state: &ReCodexState) {
             &sidecar,
             &base,
             &token,
+            reroute,
             crate::lease_sidecar::FOLLOW_TIMEOUT,
         );
     });
@@ -1755,14 +1758,23 @@ mod lease_nudge_tests {
     /// 自助重置额度、切组织成功后必须叫醒本机代理(交一次会话令牌)。这两个函数要联网、切组织还会写
     /// 系统用户环境变量,没法在单测里真跑 —— 与 config_writer_tests 同一个办法:读自己的源码断言。
     /// 「代理收到令牌就立刻续租」由 Go 侧 TestTokenHandoffWakesRenewDuringRetryAfter 钉住。
+    /// 函数正文:从 `pub fn name(` 到第一个位于行首的 `}`(rustfmt 下函数结尾总是这样)。
     fn function_body(name: &str) -> String {
         let source = include_str!("desktop.rs").replace("\r\n", "\n");
         let start = source
             .find(&format!("pub fn {name}("))
             .unwrap_or_else(|| panic!("找不到 {name}"));
         let rest = &source[start..];
-        let end = rest[1..].find("\npub fn ").map(|i| i + 1).unwrap_or(rest.len());
+        let end = rest.find("\n}\n").map(|i| i + 2).expect("找不到函数结尾");
         rest[..end].to_owned()
+    }
+
+    /// 是否有一行**真的**调用了它(被注释掉的不算)。
+    fn calls(text: &str, call: &str) -> bool {
+        text.lines().any(|line| {
+            let line = line.trim_start();
+            !line.starts_with("//") && line.starts_with(call)
+        })
     }
 
     #[test]
@@ -1774,8 +1786,8 @@ mod lease_nudge_tests {
             .and_then(|s| s.split("Err(adapter_error)").next())
             .expect("找不到成功分支");
         assert!(
-            ok_arm.contains("lease_hand_over_session_token(state);"),
-            "重置成功后要叫醒代理,否则份额用满被拒签的用户要在网关上多等最多 15 分钟"
+            calls(ok_arm, "lease_hand_over_session_token(state, false);"),
+            "重置成功后要叫醒代理(不改道:此刻本来就在网关上)"
         );
     }
 
@@ -1784,9 +1796,17 @@ mod lease_nudge_tests {
         let body = function_body("recodex_switch_org");
         let after_env = body.split("std::env::set_var(").nth(1).expect("找不到写环境变量");
         assert!(
-            after_env.contains("lease_hand_over_session_token(state);"),
-            "切组织成功后要叫醒代理,否则直连流量还会走旧组织的账号一个租约周期"
+            calls(after_env, "lease_hand_over_session_token(state, true);"),
+            "切组织成功后要叫醒代理并改道,否则直连流量还会走旧组织的账号"
         );
+    }
+
+    #[test]
+    fn source_assert_helpers_are_not_fooled() {
+        assert!(!calls("    // lease_hand_over_session_token(state, true);", "lease_hand_over_session_token(state, true);"));
+        assert!(calls("    lease_hand_over_session_token(state, true);", "lease_hand_over_session_token(state, true);"));
+        let body = function_body("recodex_reset_quota");
+        assert!(!body.contains("pub fn recodex_switch_org("), "函数正文越界到下一个函数");
     }
 }
 

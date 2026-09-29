@@ -71,14 +71,20 @@ pub fn follow(sidecar: &Path, api_base: &str, token: &str, timeout: Duration) ->
 
 /// 只把轮换后的令牌交给正在运行的代理:不重启代理、不收拾孤儿态(Codex 可能正在跑)。
 /// 老版 sidecar 不认识 --handoff-only,会按完整跟随处理 —— 与改动前的行为一致。
-pub fn hand_over(sidecar: &Path, api_base: &str, token: &str, timeout: Duration) -> String {
+///
+/// `reroute`:设备刚换了组织 —— 让代理先软切回网关再续租(新请求不再走旧组织的账号,在途的不打断)。
+/// 老 sidecar 不认识 `--reroute` 会当普通交接;sidecar 随桌面端一起打包,版本总是配套的。
+pub fn hand_over(sidecar: &Path, api_base: &str, token: &str, reroute: bool, timeout: Duration) -> String {
     let api_base = api_base.trim().trim_end_matches('/');
-    run(
-        sidecar,
-        &["lease", "desktop-follow", "--api", api_base, "--handoff-only"],
-        Some(token),
-        timeout,
-    )
+    run(sidecar, &hand_over_args(api_base, reroute), Some(token), timeout)
+}
+
+fn hand_over_args(api_base: &str, reroute: bool) -> Vec<&str> {
+    let mut args = vec!["lease", "desktop-follow", "--api", api_base, "--handoff-only"];
+    if reroute {
+        args.push("--reroute");
+    }
+    args
 }
 
 /// 彻底还原(停代理、撤自启、还原托管块与设备 ID)。不记成「用户不要直连」。
@@ -273,6 +279,15 @@ mod tests {
         // 没有像样的令牌:不问服务端、直接报。
         let outcome = run_in(&sidecar, &["lease", "desktop-follow"], Some("has space"), FOLLOW_TIMEOUT, &envs);
         assert_eq!(outcome, "no_token");
+        // 交令牌(切组织时带 --reroute):没开租约时不拉起任何东西,报 orphaned。
+        let outcome = run_in(
+            &sidecar,
+            &["lease", "desktop-follow", "--api", "http://127.0.0.1:1", "--handoff-only", "--reroute"],
+            Some("rct_smoke_token_1234"),
+            FOLLOW_TIMEOUT,
+            &envs,
+        );
+        assert_eq!(outcome, "orphaned");
         let outcome = run_in(&sidecar, &["lease", "desktop-off"], None, OFF_TIMEOUT, &envs);
         assert_eq!(outcome, "not_enabled");
         // 没开租约时切网关:什么都不记(桌面端照常改写托管块那条路)。
@@ -296,6 +311,19 @@ mod tests {
         for loud in ["rolled_back", "daemon_down", "handoff_failed", "enabled_handoff_failed", "timeout", "spawn_failed", "no_token", "unparsable", "state_corrupt"] {
             assert!(is_failure(loud), "{loud} 应当上报");
         }
+    }
+
+    /// 切组织时才带 --reroute(代理据此先软切回网关);重置额度、令牌轮换不带。
+    #[test]
+    fn hand_over_args_carry_reroute_only_when_asked() {
+        assert_eq!(
+            hand_over_args("https://api.x", true),
+            ["lease", "desktop-follow", "--api", "https://api.x", "--handoff-only", "--reroute"]
+        );
+        assert_eq!(
+            hand_over_args("https://api.x", false),
+            ["lease", "desktop-follow", "--api", "https://api.x", "--handoff-only"]
+        );
     }
 
     #[test]
